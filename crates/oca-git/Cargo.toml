@@ -1,0 +1,8 @@
+[package]
+name = "oca-git"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# No external dependency identified yet: git is invoked as a subprocess, not linked.

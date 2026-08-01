@@ -1,0 +1,9 @@
+[package]
+name = "oca-state"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Future: serde and serde_json, because config, refs, intents and journals are serialized state.
+# Not added; T01 adds no logic.

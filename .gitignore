@@ -1,0 +1,6 @@
+/target
+
+# Local consult-protocol state: per-worktree, machine-specific, deliberately not tracked.
+# `.claude/consult.enabled` is tracked repo config and must stay tracked, so this is scoped
+# to the one file rather than to the directory.
+/.claude/consult-ledger.md

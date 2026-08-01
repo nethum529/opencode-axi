@@ -1,0 +1,9 @@
+[package]
+name = "oca-testkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# No external dependency identified yet: the fake server, socket and git fixtures follow
+# whatever the crates they stand in for end up needing.

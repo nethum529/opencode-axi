@@ -1,0 +1,9 @@
+[package]
+name = "oca-opencode"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Future: reqwest, for the generated OpenCode HTTP client and its SSE stream. This is the only
+# crate in the workspace that may depend on reqwest. Not added; T01 adds no logic.

@@ -1,0 +1,14 @@
+[package]
+name = "oca-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "oca"
+path = "src/main.rs"
+
+[dependencies]
+# Future: clap, for the fixed CLI grammar this crate owns.
+# Future: tokio, because the entry point drives oca-core's async operations.
+# Not added; T01 adds no logic.

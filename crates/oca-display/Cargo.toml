@@ -1,0 +1,8 @@
+[package]
+name = "oca-display"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# No external dependency identified yet: herdr and tmux are driven as external processes.

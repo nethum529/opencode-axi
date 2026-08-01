@@ -1,0 +1,9 @@
+[package]
+name = "oca-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Future: tokio, because the typed operations and state machine here are async over the
+# injected seams. Not added; T01 adds no logic.

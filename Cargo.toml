@@ -1,0 +1,11 @@
+[workspace]
+# Resolver 2 is pinned deliberately. Resolver 3 is the edition 2024 default and adds MSRV-aware
+# version selection; with zero dependencies the two behave identically, so revisit this when the
+# first dependencies land.
+resolver = "2"
+members = ["crates/*", "xtask"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
