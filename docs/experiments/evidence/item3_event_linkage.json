@@ -1,0 +1,46 @@
+{
+ "messageID": "msg_fbec00000001oCaT03EchoTest0",
+ "user_frames": [
+  [
+   516,
+   "user",
+   "msg_fbec00000001oCaT03EchoTest0",
+   null
+  ],
+  [
+   537,
+   "user",
+   "msg_fbec00000001oCaT03EchoTest0",
+   null
+  ],
+  [
+   2426,
+   "user",
+   "msg_fbec00000001oCaT03EchoTest0",
+   null
+  ]
+ ],
+ "assistant_frames": [
+  [
+   516,
+   "assistant",
+   "msg_fbec58637001m1i1654qWQIo4m",
+   "msg_fbec00000001oCaT03EchoTest0"
+  ],
+  [
+   2398,
+   "assistant",
+   "msg_fbec58637001m1i1654qWQIo4m",
+   "msg_fbec00000001oCaT03EchoTest0"
+  ],
+  [
+   2415,
+   "assistant",
+   "msg_fbec58637001m1i1654qWQIo4m",
+   "msg_fbec00000001oCaT03EchoTest0"
+  ]
+ ],
+ "assert_user_echo": true,
+ "assert_parent_link": true,
+ "assert_all_link": true
+}

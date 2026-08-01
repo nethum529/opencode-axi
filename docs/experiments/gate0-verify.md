@@ -66,6 +66,25 @@ prompted to run `echo hello-from-bash`.
 Both permission event generations (`permission.asked` and `permission.v2.asked`) were monitored and
 neither fired.
 
+### Behavior — the denied action produces no side effect
+
+Reporting a deny while executing anyway is the worst false pass available here, and the two tests
+above cannot detect it: both read only the reported outcome. Re-run with an observable side effect,
+and with a positive control so the test is known to be capable of detecting execution at all.
+
+Each trial prompts the worker to run `echo SENTINEL > <path>` through bash, then checks the
+filesystem directly.
+
+| Trial | Ruleset | Tool call outcome | Sentinel file |
+|---|---|---|:--:|
+| positive control | `bash *` allow | `status: "completed"` | **created** |
+| blanket deny | `bash *` deny | no tool call attempted | **absent** |
+| pattern-scoped deny | `bash *` allow, `bash echo *` deny | `status: "error"`, rule cited | **absent** |
+
+The positive control created the file, so the assertion can observe execution. Neither deny variant
+produced the side effect, and neither emitted an ask event. **Deny prevents the action, it does not
+merely report having prevented it.**
+
 ### Consequence
 
 T04 and T13 may proceed on the deny-not-ask assumption. Workers dispatched with a restrictive
@@ -88,6 +107,21 @@ message with `id: "msg_oca_t03_idem_0001"` verbatim, and the answering assistant
 
 T24 can therefore reconcile on an id it minted itself, and `parentID` gives exact terminal
 attribution — the property `tui-coexistence.md` case 2 depends on.
+
+### Echo confirmed where attribution actually reads it — the `/event` stream
+
+The response body and `GET /session/{id}/message` are not where `oca f` reads attribution; it
+terminates a follow on the assistant message whose parent is the submitted id, observed over
+`GET /event`. Asserted directly against the event frames, submitting
+`messageID: "msg_fbec00000001oCaT03EchoTest0"`:
+
+- The caller-minted id appears as the user message id in `message.updated` frames on `/event`.
+- Every assistant `message.updated` frame carried `parentID` equal to the caller-minted id — 3 of 3
+  frames, one distinct parent id observed, no unattributed frame.
+- One `session.idle`.
+
+The parent linkage is therefore reliable in the transport the design actually consumes, not only in
+the REST read model.
 
 ### The constraint — ids must sort correctly
 
@@ -183,6 +217,9 @@ These were not on the ticket but fall inside the gate-0 blast radius and are loa
 gate-1 contracts.
 
 ### Two disjoint session runtimes
+
+This is the single root cause of both TUI-coexistence case 5 and case 6. Those cases are not
+independent failures and are not contention failures: one defect, observed twice.
 
 OpenCode 1.18.10 exposes a legacy pipeline and a `next`/v2 pipeline that do not share state.
 `POST /api/session/{id}/prompt` (the only endpoint carrying `delivery: "steer"|"queue"`) generates
