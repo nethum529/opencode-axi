@@ -1,0 +1,33 @@
+{
+ "case3": {
+  "users": [
+   "Reply with exactly: HTTP-0",
+   "Reply with exactly: TUI-0",
+   "Reply with exactly: HTTP-1",
+   "Reply with exactly: TUI-1",
+   "Reply with exactly: HTTP-2",
+   "Reply with exactly: TUI-2"
+  ],
+  "assistants": [
+   "HTTP-0",
+   "TUI-0",
+   "HTTP-1\nTUI-1",
+   "HTTP-2\nTUI-2"
+  ],
+  "lost": [],
+  "monotonic": false
+ },
+ "case4": {
+  "users": [
+   "Reply with exactly: CONC-HTTP",
+   "Reply with exactly: CONC-TUI"
+  ],
+  "assistants": [
+   "CONC-HTTP",
+   "CONC-TUI"
+  ],
+  "idles": 2,
+  "http": 204,
+  "tui": 200
+ }
+}

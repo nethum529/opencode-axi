@@ -1,0 +1,29 @@
+{
+ "control_allow": {
+  "file_created": true,
+  "ask_events": 0,
+  "tools": [
+   [
+    "bash",
+    "completed",
+    "None"
+   ]
+  ]
+ },
+ "deny_blanket": {
+  "file_created": false,
+  "ask_events": 0,
+  "tools": []
+ },
+ "deny_scoped": {
+  "file_created": false,
+  "ask_events": 0,
+  "tools": [
+   [
+    "bash",
+    "error",
+    "The user has specified a rule which prevents you from using this specific tool call. Here "
+   ]
+  ]
+ }
+}

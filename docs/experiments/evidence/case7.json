@@ -1,0 +1,14 @@
+{
+ "follow": {
+  "exited": true,
+  "wait_s": 9.03,
+  "terminal": "session.idle"
+ },
+ "errors": [
+  [
+   19436,
+   "{\"sessionID\": \"ses_0414187aaffe60Iy0M2mmTlSx5\", \"error\": {\"name\": \"MessageAbortedError\", \"data\": {\"message\": \"Aborted\"}}}"
+  ]
+ ],
+ "idles": 2
+}
