@@ -1,0 +1,34 @@
+{
+  "operations": [
+    {
+      "operation_id": "session.create",
+      "method": "POST",
+      "path": "/session"
+    },
+    {
+      "operation_id": "session.prompt_async",
+      "method": "POST",
+      "path": "/session/{sessionID}/prompt_async"
+    },
+    {
+      "operation_id": "session.message",
+      "method": "GET",
+      "path": "/session/{sessionID}/message/{messageID}"
+    },
+    {
+      "operation_id": "session.abort",
+      "method": "POST",
+      "path": "/session/{sessionID}/abort"
+    },
+    {
+      "operation_id": "session.messages",
+      "method": "GET",
+      "path": "/session/{sessionID}/message"
+    },
+    {
+      "operation_id": "event.subscribe",
+      "method": "GET",
+      "path": "/event"
+    }
+  ]
+}

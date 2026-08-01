@@ -3,6 +3,10 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
 
+const DEFAULT_OPENCODE_URL: &str = "http://127.0.0.1:4096";
+const PINNED_OPENCODE_VERSION: &str = "1.18.10";
+const OPENAPI_VERSION: &str = "1.0.0";
+
 #[derive(Debug, PartialEq, Eq)]
 struct RefreshCommand {
     url: String,
@@ -38,8 +42,8 @@ where
     }
 
     Ok(RefreshCommand {
-        url: url.ok_or_else(|| "missing required option --url".to_owned())?,
-        version: version.ok_or_else(|| "missing required option --version".to_owned())?,
+        url: url.unwrap_or_else(|| DEFAULT_OPENCODE_URL.to_owned()),
+        version: version.unwrap_or_else(|| PINNED_OPENCODE_VERSION.to_owned()),
     })
 }
 
@@ -158,12 +162,12 @@ fn refresh_from_document(
 ) -> Result<(), String> {
     validate_version(version)?;
     let canonical = canonicalize_json(document)?;
-    verify_declared_version(&canonical, version)?;
+    verify_declared_version(&canonical, OPENAPI_VERSION)?;
     let surface = resolve_surface(&canonical)?;
     let document: Value = serde_json::from_slice(&canonical).map_err(|error| error.to_string())?;
     let digest = sha256_hex(&canonical);
     let metadata = format!(
-        "version = \"{version}\"\nsha256 = \"{digest}\"\ngenerator = \"cargo xtask refresh-opencode-spec\"\nendpoint_count = {}\n",
+        "version = \"{version}\"\nopenapi_version = \"{OPENAPI_VERSION}\"\nsha256 = \"{digest}\"\ngenerator = \"cargo xtask refresh-opencode-spec\"\nendpoint_count = {}\n",
         endpoint_count(&document)?
     );
     let mut surface = serde_json::to_vec_pretty(&surface).map_err(|error| error.to_string())?;
@@ -238,8 +242,8 @@ fn sort_json(value: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::{
-        RefreshCommand, canonicalize_json, parse_command, refresh_from_document, resolve_surface,
-        sha256_hex, verify_declared_version,
+        DEFAULT_OPENCODE_URL, PINNED_OPENCODE_VERSION, RefreshCommand, canonicalize_json,
+        parse_command, refresh_from_document, resolve_surface, sha256_hex, verify_declared_version,
     };
     use std::{
         env, fs, process,
@@ -343,7 +347,7 @@ mod tests {
             "/session/{sessionID}/message/{messageID}": {"get": {"operationId": "session.message"}},
             "/event": {"get": {"operationId": "event.subscribe"}}
           },
-          "info": {"version": "1.18.8"}
+          "info": {"version": "1.0.0"}
         }
         "#;
         let output_root = env::temp_dir().join(format!(
@@ -385,6 +389,17 @@ mod tests {
             Ok(RefreshCommand {
                 url: "http://127.0.0.1:4096".to_owned(),
                 version: "1.18.8".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_command_uses_the_pinned_local_server_by_default() {
+        assert_eq!(
+            parse_command(["refresh-opencode-spec"]),
+            Ok(RefreshCommand {
+                url: DEFAULT_OPENCODE_URL.to_owned(),
+                version: PINNED_OPENCODE_VERSION.to_owned(),
             })
         );
     }

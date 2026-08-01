@@ -1,0 +1,5 @@
+version = "1.18.10"
+openapi_version = "1.0.0"
+sha256 = "d5a1bc7501cbd57d2fbd3303120a99d5a063346d82865ed0f2c218bd9f8593fc"
+generator = "cargo xtask refresh-opencode-spec"
+endpoint_count = 188
