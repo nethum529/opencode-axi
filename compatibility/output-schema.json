@@ -1,0 +1,106 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://nethum529.github.io/opencode-axi/output-schema.json",
+  "title": "oca output documents",
+  "description": "The JSON twin of oca's TOON-compatible command output.",
+  "oneOf": [
+    { "$ref": "#/$defs/acknowledgement" },
+    { "$ref": "#/$defs/completionRecord" },
+    { "$ref": "#/$defs/listDocument" },
+    { "$ref": "#/$defs/eventPage" },
+    { "$ref": "#/$defs/error" }
+  ],
+  "$defs": {
+    "acknowledgement": {
+      "type": "object",
+      "additionalProperties": false,
+      "maxProperties": 3,
+      "required": ["ref", "state", "model"],
+      "properties": {
+        "ref": { "$ref": "#/$defs/ref" },
+        "state": { "$ref": "#/$defs/nonEmptyString" },
+        "model": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "completionRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "state", "outcome"],
+      "properties": {
+        "ref": { "$ref": "#/$defs/ref" },
+        "state": { "$ref": "#/$defs/nonEmptyString" },
+        "outcome": { "$ref": "#/$defs/nonEmptyString" },
+        "branch": { "$ref": "#/$defs/nonEmptyString" },
+        "commit": { "type": "string", "pattern": "^[0-9a-f]{7,64}$" },
+        "worktree": { "$ref": "#/$defs/nonEmptyString" }
+      },
+      "dependentRequired": {
+        "branch": ["commit", "worktree"],
+        "commit": ["branch", "worktree"],
+        "worktree": ["branch", "commit"]
+      }
+    },
+    "listDocument": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["items", "cursor", "total"],
+      "properties": {
+        "items": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/listItem" }
+        },
+        "cursor": { "$ref": "#/$defs/nonNegativeInteger" },
+        "total": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "listItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "state"],
+      "properties": {
+        "ref": { "$ref": "#/$defs/ref" },
+        "state": { "$ref": "#/$defs/nonEmptyString" },
+        "model": { "$ref": "#/$defs/nonEmptyString" }
+      }
+    },
+    "eventPage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ref", "events", "cursor", "total"],
+      "properties": {
+        "ref": { "$ref": "#/$defs/ref" },
+        "events": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/event" }
+        },
+        "cursor": { "$ref": "#/$defs/nonNegativeInteger" },
+        "total": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "event": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sequence", "kind", "data"],
+      "properties": {
+        "sequence": { "$ref": "#/$defs/nonNegativeInteger" },
+        "kind": { "$ref": "#/$defs/nonEmptyString" },
+        "data": { "type": "string" }
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["error", "code", "help"],
+      "properties": {
+        "error": { "$ref": "#/$defs/nonEmptyString" },
+        "code": { "$ref": "#/$defs/nonEmptyString" },
+        "help": { "$ref": "#/$defs/nonEmptyString" },
+        "ref": { "type": "string" },
+        "retry_after_ms": { "$ref": "#/$defs/nonNegativeInteger" }
+      }
+    },
+    "ref": { "type": "string", "minLength": 1 },
+    "nonEmptyString": { "type": "string", "minLength": 1 },
+    "nonNegativeInteger": { "type": "integer", "minimum": 0 }
+  }
+}

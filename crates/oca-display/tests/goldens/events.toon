@@ -1,0 +1,5 @@
+ref: w00001
+cursor: 7
+total: 8
+events[1]{sequence,kind,data}:
+  7,session.status,completed

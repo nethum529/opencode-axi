@@ -1,0 +1,6 @@
+ref: w00001
+state: completed
+outcome: success
+branch: oca/w00001
+commit: deadbeef
+worktree: /tmp/oca/w00001

@@ -5,4 +5,6 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# No external dependency identified yet: herdr and tmux are driven as external processes.
+oca-core = { path = "../oca-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -624,6 +624,11 @@ dependencies = [
 [[package]]
 name = "oca-display"
 version = "0.1.0"
+dependencies = [
+ "oca-core",
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "oca-git"
