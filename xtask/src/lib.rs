@@ -3,6 +3,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
 
+mod guidance;
+
 const DEFAULT_OPENCODE_URL: &str = "http://127.0.0.1:4096";
 const PINNED_OPENCODE_VERSION: &str = "1.18.10";
 const OPENAPI_VERSION: &str = "1.0.0";
@@ -54,11 +56,35 @@ where
 /// Returns an error when command arguments are invalid, `/doc` cannot be fetched, or the fetched
 /// document cannot be turned into a verified compatibility snapshot.
 pub fn run(arguments: impl IntoIterator<Item = String>) -> Result<(), String> {
-    let command = parse_command(arguments)?;
     let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .ok_or_else(|| "xtask manifest has no workspace parent".to_owned())?;
-    refresh(&command.url, &command.version, workspace_root)
+    run_from_workspace(arguments, workspace_root)
+}
+
+fn run_from_workspace(
+    arguments: impl IntoIterator<Item = String>,
+    workspace_root: &Path,
+) -> Result<(), String> {
+    let arguments: Vec<_> = arguments.into_iter().collect();
+    match arguments.first().map(String::as_str) {
+        Some("generate-guidance") => {
+            if arguments.len() != 1 {
+                return Err("generate-guidance does not accept options".to_owned());
+            }
+            guidance::write_artifacts(workspace_root)
+        }
+        Some("check-drift") => {
+            if arguments.len() != 1 {
+                return Err("check-drift does not accept options".to_owned());
+            }
+            guidance::check_drift(workspace_root)
+        }
+        _ => {
+            let command = parse_command(arguments)?;
+            refresh(&command.url, &command.version, workspace_root)
+        }
+    }
 }
 
 fn refresh(url: &str, version: &str, workspace_root: &Path) -> Result<(), String> {
@@ -241,9 +267,11 @@ fn sort_json(value: Value) -> Value {
 
 #[cfg(test)]
 mod tests {
+    use super::guidance::{check_drift, write_artifacts};
     use super::{
         DEFAULT_OPENCODE_URL, PINNED_OPENCODE_VERSION, RefreshCommand, canonicalize_json,
-        parse_command, refresh_from_document, resolve_surface, sha256_hex, verify_declared_version,
+        parse_command, refresh_from_document, resolve_surface, run_from_workspace, sha256_hex,
+        verify_declared_version,
     };
     use std::{
         env, fs, process,
@@ -402,5 +430,54 @@ mod tests {
                 version: PINNED_OPENCODE_VERSION.to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn drift_check_rejects_each_hand_edited_generated_artifact() {
+        let workspace_root = env::temp_dir().join(format!(
+            "oca-guidance-drift-test-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is after the Unix epoch")
+                .as_nanos()
+        ));
+        write_artifacts(&workspace_root).expect("test artifacts can be generated");
+        check_drift(&workspace_root).expect("freshly generated artifacts are in sync");
+
+        for path in [
+            "skills/oca/SKILL.md",
+            "templates/opencode-plugin.js",
+            "templates/hook.sh",
+        ] {
+            fs::write(workspace_root.join(path), "hand edited\n")
+                .expect("test artifact can be hand edited");
+
+            let error = check_drift(&workspace_root)
+                .expect_err("a hand-edited generated artifact must fail the drift check");
+            assert!(error.contains(path), "error must identify {path}: {error}");
+
+            write_artifacts(&workspace_root).expect("artifact can be restored for the next case");
+        }
+
+        fs::remove_dir_all(workspace_root).expect("test output can be removed");
+    }
+
+    #[test]
+    fn check_drift_command_uses_the_same_workspace_renderer() {
+        let workspace_root = env::temp_dir().join(format!(
+            "oca-guidance-command-test-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time is after the Unix epoch")
+                .as_nanos()
+        ));
+        write_artifacts(&workspace_root).expect("test artifacts can be generated");
+
+        run_from_workspace(["check-drift".to_owned()], &workspace_root)
+            .expect("check-drift accepts a synchronized workspace");
+
+        fs::remove_dir_all(workspace_root).expect("test output can be removed");
     }
 }

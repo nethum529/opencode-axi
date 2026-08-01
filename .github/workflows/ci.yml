@@ -15,3 +15,4 @@ jobs:
           toolchain: "1.97.1" # keep in sync with rust-toolchain.toml
       - run: cargo build --workspace
       - run: cargo test --workspace
+      - run: cargo xtask check-drift
