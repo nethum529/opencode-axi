@@ -1,0 +1,20 @@
+{
+ "users": [
+  "Reply with exactly: HTTP-0",
+  "Reply with exactly: TUI-0",
+  "Reply with exactly: HTTP-1",
+  "Reply with exactly: TUI-1",
+  "Reply with exactly: HTTP-2",
+  "Reply with exactly: TUI-2"
+ ],
+ "asst": [
+  "HTTP-0",
+  "TUI-0",
+  "HTTP-1",
+  "TUI-1",
+  "HTTP-2",
+  "TUI-2"
+ ],
+ "monotonic": true,
+ "idles": 6
+}

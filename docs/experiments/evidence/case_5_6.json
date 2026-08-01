@@ -1,0 +1,46 @@
+{
+ "case5_steer": {
+  "users": [
+   "Write a detailed 500-word essay on the history of the bicycl"
+  ],
+  "n_assistant": 1,
+  "submit": 200,
+  "mark": false,
+  "longest": 3370,
+  "idles": 2,
+  "admission_events": [
+   [
+    14425,
+    "session.next.prompt.admitted",
+    "{\"messageID\": \"msg_fbeb9b8d1001Fy81leU6ASTfji\", \"sessionID\": \"ses_041467f7cffeUF2VZot3phihru\", \"timestamp\": \"2026-08-01T19:07:50.356Z\", \"prompt\": {\"text\": \"STOP"
+   ],
+   [
+    14588,
+    "session.next.prompted",
+    "{\"sessionID\": \"ses_041467f7cffeUF2VZot3phihru\", \"timestamp\": \"2026-08-01T19:07:50.356Z\", \"messageID\": \"msg_fbeb9b8d1001Fy81leU6ASTfji\", \"prompt\": {\"text\": \"STOP"
+   ]
+  ]
+ },
+ "case6_queue": {
+  "users": [
+   "Write a detailed 500-word essay on the history of the bicycl"
+  ],
+  "n_assistant": 2,
+  "submit": 200,
+  "mark": false,
+  "longest": 3715,
+  "idles": 2,
+  "admission_events": [
+   [
+    14405,
+    "session.next.prompt.admitted",
+    "{\"messageID\": \"msg_fbeba8ef8001GqYwAGjhnG3gTY\", \"sessionID\": \"ses_04145a945ffeXj3r1aq52GBuna\", \"timestamp\": \"2026-08-01T19:08:45.177Z\", \"prompt\": {\"text\": \"STOP"
+   ],
+   [
+    14546,
+    "session.next.prompted",
+    "{\"sessionID\": \"ses_04145a945ffeXj3r1aq52GBuna\", \"timestamp\": \"2026-08-01T19:08:45.177Z\", \"messageID\": \"msg_fbeba8ef8001GqYwAGjhnG3gTY\", \"prompt\": {\"text\": \"STOP"
+   ]
+  ]
+ }
+}

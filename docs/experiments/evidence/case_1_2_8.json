@@ -1,0 +1,20 @@
+{
+ "case8": {
+  "sid": "ses_04149e14affedog8WDaEa2H0wa",
+  "events": [],
+  "idle": 0
+ },
+ "case1": {
+  "idle_ms": 2381,
+  "assistants": 1,
+  "tui_displayed": true
+ },
+ "case2": {
+  "idle_ms": 1703,
+  "new": 1,
+  "misattributed": 0,
+  "new_parents": [
+   "msg_fbeb68553001z43E916W3XxWvB"
+  ]
+ }
+}
