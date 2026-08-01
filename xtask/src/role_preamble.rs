@@ -32,7 +32,6 @@ impl RolePreamble {
         &self.name
     }
 
-    #[must_use]
     pub fn fields(&self) -> impl Iterator<Item = &str> {
         self.fields.iter().map(String::as_str)
     }
