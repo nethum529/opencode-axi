@@ -14,6 +14,11 @@ gate-1 contracts freeze on them. Item 1 of the ticket (the TUI coexistence exper
 | Global permission config | `{"*": "allow"}` |
 | Date | 2026-08-01 |
 
+**Every result in this document verifies OpenCode 1.18.10 and does not constitute evidence of
+1.18.8 conformance.** 1.18.8 is not installed on this machine and the ticket forbids substituting
+the fake server. Repointing the spec/T01/T02 pin is escalated to team-lead and tracked outside this
+ticket.
+
 ## Answers
 
 | # | Question | Answer |
@@ -153,7 +158,10 @@ A second, quieter symptom of the same cause: ids that sort *before* existing mes
 ordering rather than looping. See `tui-coexistence.md` "Case 3 — the ordering hazard", where
 low-sorting ids merged six prompts into four turns.
 
-### Binding rule for T24
+### Binding rule for T15 and T24
+
+This rule is **not** escalated and needs no disposition. It is a measured property of OpenCode and
+is written here to be inherited directly by the tickets that mint or reconcile message ids.
 
 A caller-minted `messageID` **must** be time-ordered consistently with OpenCode's own scheme, so
 that it sorts after every existing message in the session and before every message the server will
@@ -163,6 +171,17 @@ and will hang the worker in an unbounded, unterminated generation loop.
 
 This must be covered by a unit contract and by a fake-server replay case. It is a silent,
 expensive failure: no error, no terminal event, unbounded token spend.
+
+Concretely, for the tickets that will inherit it:
+
+- **T15** (ref/id minting) must generate the id from the same monotonic clock source and suffix
+  width as OpenCode's own scheme, so it sorts after every existing message in the session. A
+  readable slug carrying the ref (`msg_oca_<ref>_<n>`) is **forbidden**; it hangs the worker.
+- **T24** (reconciliation) may rely on the id round-tripping and on `parentID` for terminal
+  attribution, both verified above over `/event`, provided T15 satisfies the ordering constraint.
+
+The two failure modes to pin with tests: an id sorting too **high** yields unbounded regeneration
+with no terminal event; an id sorting too **low** yields turn merging and broken ordering.
 
 ---
 
@@ -209,6 +228,12 @@ part of the design may promise the user a behavioral difference between `flash:h
 and no test may assert one. T29's release-time re-measurement should treat a positive result as the
 change, not this negative as the baseline to defend.
 
+This falsifies `spec-risks.md` **assumption #2**. The implication for the mandatory-effort rationale
+on this alias — the design requires an effort at dispatch partly to keep the spend decision
+explicit, and on the free provider that decision buys nothing measurable — is a spec-level question.
+**Escalated to team-lead on 2026-08-01; disposition pending.** It is recorded here as a measurement,
+not resolved as a design change.
+
 ---
 
 ## Additional findings
@@ -227,11 +252,32 @@ text and emits `session.next.*` events, but writes nothing readable through
 `GET /session/{id}/message` and emits no `session.idle`. Full evidence and the comparison table are
 in `tui-coexistence.md` "Cases 5 and 6".
 
-**Escalation note.** `oca s` (steer) as specified in `spec-cli-surface.md` is **not implementable
-on the legacy pipeline**. `delivery=steer` is accepted with HTTP 200 and then silently dropped. T13
-must choose between implementing steer as abort-then-reprompt, or migrating the whole design onto
-the v2 pipeline and giving up `session.idle` and `GET /session/{id}/message`. This is a spec
-conflict and is flagged rather than resolved here, per `CONTEXT.md`.
+**Escalated — disposition pending, not an implementer's choice.** `oca s` (steer) as specified in
+`spec-cli-surface.md` is **not implementable on the legacy pipeline**.
+
+Observed behavior, the part that makes this severe: `delivery=steer` against a legacy in-flight turn
+returns **HTTP 200**, mints an id, and emits `session.next.prompt.admitted` and
+`session.next.prompted` both carrying the `delivery` value — and then nothing is steered. The
+message never appears in `GET /session/{id}/message` and its instruction never takes effect. A
+success response that lies is worse than an error: `oca s` would report success while steering
+nothing, and no caller-side check can distinguish the two.
+
+The two exits are not equivalent and the difference is user-visible:
+
+- **abort-then-reprompt** on the legacy pipeline — destroys in-flight work, which changes what
+  `oca s` *means* to the operator. Steer stops being "redirect this turn" and becomes "discard and
+  restart".
+- **migrate to the v2 pipeline** — keeps steer semantics but gives up `session.idle` and
+  `GET /session/{id}/message`, which the follow and reconciliation designs are built on.
+
+This is a design decision, not an implementation detail, and it gates **T18** (control verbs
+`m`/`s`/`q`/`k`) as well as T13. **Escalated to team-lead on 2026-08-01; disposition pending.** It is
+deliberately not resolved here, per `CONTEXT.md` — where this repo and the spec disagree, flag
+rather than silently resolve. The silent-drop class also warrants a new `spec-risks.md` entry: an
+endpoint returning 200 with an admission event for work it will not perform.
+
+`oca q` (queue) is **not** affected and needs no disposition — `prompt_async` submitted while a turn
+is in flight returns 204, serializes behind the running turn, and executes.
 
 `oca q` (queue) is unaffected: `prompt_async` submitted while a turn is in flight returns 204,
 serializes behind the running turn, and executes.

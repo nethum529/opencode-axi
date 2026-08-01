@@ -36,6 +36,11 @@ Two hazards found that are not TUI-specific and that gate-1 contracts must absor
 | Project dir | `/home/nethum/opencode-axi-worktrees/T03` |
 | Date | 2026-08-01 |
 
+**Every result in this document verifies OpenCode 1.18.10 and does not constitute evidence of
+1.18.8 conformance.** 1.18.8 is not installed on this machine and the ticket forbids substituting
+the fake server. Repointing the spec/T01/T02 pin is escalated to team-lead and tracked outside this
+ticket.
+
 TUI attach used `opencode attach http://127.0.0.1:4733 -s <sessionID>` under a real PTY
 (200x50, `TERM=xterm-256color`). TUI input was injected through the server's own
 `POST /tui/append-prompt` + `POST /tui/submit-prompt`, which dispatch to the attached TUI over its
