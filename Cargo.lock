@@ -789,6 +789,16 @@ dependencies = [
 [[package]]
 name = "oca-server"
 version = "0.1.0"
+dependencies = [
+ "fs2",
+ "oca-opencode",
+ "oca-state",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "url",
+]
 
 [[package]]
 name = "oca-state"
