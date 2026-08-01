@@ -3,6 +3,10 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
 
+mod role_preamble;
+
+pub use role_preamble::{RolePreamble, STYLE_EXEMPTION, render_role_preambles};
+
 const DEFAULT_OPENCODE_URL: &str = "http://127.0.0.1:4096";
 const PINNED_OPENCODE_VERSION: &str = "1.18.10";
 const OPENAPI_VERSION: &str = "1.0.0";
