@@ -81,6 +81,8 @@ pub fn generate_client(snapshot: &Snapshot) -> Result<String, String> {
         .map_err(|error| format!("could not parse pinned OpenCode OpenAPI snapshot: {error}"))?;
     retain_facade_operations(&mut document);
     retain_success_responses(&mut document);
+    remove_event_stream_schema(&mut document);
+    retain_reachable_schemas(&mut document);
     normalize_openapi_31(&mut document);
     preserve_additional_properties(&mut document);
     let specification: openapiv3::OpenAPI = serde_json::from_value(document)
@@ -93,7 +95,97 @@ pub fn generate_client(snapshot: &Snapshot) -> Result<String, String> {
     let syntax = syn::parse2(tokens)
         .map_err(|error| format!("could not parse generated OpenCode client: {error}"))?;
 
-    Ok(prettyplease::unparse(&syntax))
+    Ok(format!(
+        "#[allow(clippy::all, dead_code, renamed_and_removed_lints)]\nmod generated_impl {{\n{}\n}}\npub(crate) use generated_impl::Client;\n",
+        prettyplease::unparse(&syntax)
+    ))
+}
+
+fn remove_event_stream_schema(document: &mut Value) {
+    let Some(paths) = document.get_mut("paths").and_then(Value::as_object_mut) else {
+        return;
+    };
+    for path_item in paths.values_mut() {
+        let Some(path_item) = path_item.as_object_mut() else {
+            continue;
+        };
+        for operation in path_item.values_mut() {
+            let Some(operation) = operation.as_object_mut() else {
+                continue;
+            };
+            if operation.get("operationId").and_then(Value::as_str) != Some("event.subscribe") {
+                continue;
+            }
+            operation
+                .get_mut("responses")
+                .and_then(Value::as_object_mut)
+                .and_then(|responses| responses.get_mut("200"))
+                .and_then(Value::as_object_mut)
+                .and_then(|response| response.get_mut("content"))
+                .and_then(Value::as_object_mut)
+                .and_then(|content| content.get_mut("text/event-stream"))
+                .and_then(Value::as_object_mut)
+                .and_then(|media_type| media_type.remove("schema"));
+        }
+    }
+}
+
+fn retain_reachable_schemas(document: &mut Value) {
+    let references = document
+        .get("paths")
+        .map(schema_references)
+        .unwrap_or_default();
+    let Some(components) = document
+        .get_mut("components")
+        .and_then(Value::as_object_mut)
+        .and_then(|components| components.get_mut("schemas"))
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+
+    let mut retained = references;
+    let mut pending: Vec<_> = retained.iter().cloned().collect();
+    while let Some(name) = pending.pop() {
+        let Some(schema) = components.get(&name) else {
+            continue;
+        };
+        for reference in schema_references(schema) {
+            if retained.insert(reference.clone()) {
+                pending.push(reference);
+            }
+        }
+    }
+    components.retain(|name, _| retained.contains(name));
+}
+
+fn schema_references(value: &Value) -> std::collections::BTreeSet<String> {
+    let mut references = std::collections::BTreeSet::new();
+    collect_schema_references(value, &mut references);
+    references
+}
+
+fn collect_schema_references(value: &Value, references: &mut std::collections::BTreeSet<String>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(name) = object
+                .get("$ref")
+                .and_then(Value::as_str)
+                .and_then(|reference| reference.strip_prefix("#/components/schemas/"))
+            {
+                references.insert(name.to_owned());
+            }
+            for value in object.values() {
+                collect_schema_references(value, references);
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_schema_references(value, references);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn retain_success_responses(value: &mut Value) {
