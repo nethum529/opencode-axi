@@ -61,15 +61,19 @@ fn resolves_the_generated_file_beneath_out_dir() {
 }
 
 #[test]
-fn generates_extra_field_preserving_types() {
+fn generates_only_the_facade_operations() {
     let workspace_directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let snapshot =
         load_pinned_snapshot(&workspace_directory).expect("the committed snapshot loads");
     let generated = generate_client(&snapshot).expect("the OpenAPI client generates");
 
     assert!(
-        generated.contains("#[serde(flatten)]"),
-        "generated client must preserve schema-permitted unknown fields"
+        generated.contains("pub async fn session_prompt_async"),
+        "generated client must retain the facade operations"
+    );
+    assert!(
+        !generated.contains("pub async fn session_prompt<'"),
+        "generated client must omit non-facade operations"
     );
 }
 

@@ -1,4 +1,23 @@
+// Progenitor emits these lints in the pinned generated source. The facade is handwritten and
+// checked normally; generated output is not edited in place.
+#![allow(
+    clippy::default_trait_access,
+    clippy::doc_markdown,
+    clippy::unnecessary_trailing_comma,
+    clippy::unused_self
+)]
+
 use std::{fmt, future::Future};
+
+mod facade;
+#[allow(clippy::all, dead_code, renamed_and_removed_lints)]
+mod generated;
+
+pub use facade::{
+    AbortAccepted, ControlAccepted, CreateSessionRequest, MessageId, MessageWithParts,
+    OpenCodeClient, OpenCodeError, PromptAccepted, PromptRequest, Session, SessionId, Subscription,
+    TextPart,
+};
 
 /// A parsed server-sent event frame.
 #[derive(Debug, Clone, PartialEq, Eq)]
