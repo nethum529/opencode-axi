@@ -1,8 +1,13 @@
+pub mod error;
 pub mod resolver;
 
+pub use error::{
+    ERROR_ENVELOPE_SCHEMA, ErrorCode, ErrorEnvelope, FollowExit, OcaError, error_envelope_schema,
+    exit, parse_error_envelope, validate_error_envelope,
+};
 pub use resolver::{
-    Alias, Catalog, Effort, EffortInput, ErrorCode, ModelCatalog, ModelDefinition, ModelEntry,
-    ModelSpec, OcaError, ResolvedModel, resolve_model,
+    Alias, Catalog, Effort, EffortInput, ModelCatalog, ModelDefinition, ModelEntry, ModelSpec,
+    ResolvedModel, resolve_model,
 };
 
 #[cfg(test)]

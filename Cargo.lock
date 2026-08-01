@@ -248,6 +248,10 @@ version = "0.1.0"
 [[package]]
 name = "oca-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "oca-display"

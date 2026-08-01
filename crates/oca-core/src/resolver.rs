@@ -1,5 +1,7 @@
 use std::{borrow::Borrow, collections::BTreeMap, fmt};
 
+use crate::error::{ErrorCode, OcaError};
+
 /// The canonical effort names understood by the resolver.
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Effort {
@@ -243,64 +245,6 @@ impl From<(Option<String>, Option<String>)> for EffortInput {
     }
 }
 
-/// Stable resolver error codes.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ErrorCode {
-    AliasUnknown,
-    EffortMissing,
-    EffortConflict,
-    EffortUnsupported,
-}
-
-impl ErrorCode {
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::AliasUnknown => "alias_unknown",
-            Self::EffortMissing => "effort_missing",
-            Self::EffortConflict => "effort_conflict",
-            Self::EffortUnsupported => "effort_unsupported",
-        }
-    }
-}
-
-impl fmt::Display for ErrorCode {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-/// The resolver's error envelope. It is deliberately transport-agnostic.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct OcaError {
-    pub code: String,
-    pub error: String,
-    pub help: String,
-}
-
-impl OcaError {
-    fn new(code: ErrorCode, error: impl Into<String>, help: impl Into<String>) -> Self {
-        Self {
-            code: code.to_string(),
-            error: error.into(),
-            help: help.into(),
-        }
-    }
-
-    #[must_use]
-    pub fn code(&self) -> &str {
-        &self.code
-    }
-}
-
-impl fmt::Display for OcaError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.error)
-    }
-}
-
-impl std::error::Error for OcaError {}
-
 /// The fully resolved provider/model/variant tuple.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResolvedModel {
@@ -335,25 +279,24 @@ where
 
     // Alias validation intentionally precedes every effort validation.
     let definition = catalog.get(canonical_alias.as_str()).ok_or_else(|| {
-        OcaError::new(
-            ErrorCode::AliasUnknown,
-            format!("unknown model alias `{}`", canonical_alias.as_str()),
-            "choose one of the configured model aliases",
-        )
+        OcaError::new(ErrorCode::AliasUnknown)
+            .with_error(format!(
+                "unknown model alias `{}`",
+                canonical_alias.as_str()
+            ))
+            .with_help("choose one of the configured model aliases")
     })?;
 
     let effort = effort.into();
     let requested_effort = select_effort(&effort)?;
     let variant = resolve_variant(requested_effort, &definition.ladder).ok_or_else(|| {
         let ladder = definition.ladder.join(", ");
-        OcaError::new(
-            ErrorCode::EffortUnsupported,
-            format!(
+        OcaError::new(ErrorCode::EffortUnsupported)
+            .with_error(format!(
                 "effort `{requested_effort}` is unsupported for `{}`; available ladder: {ladder}",
                 canonical_alias.as_str()
-            ),
-            format!("use one of the available efforts: {ladder}"),
-        )
+            ))
+            .with_help(format!("use one of the available efforts: {ladder}"))
     })?;
 
     Ok(ResolvedModel {
@@ -368,21 +311,17 @@ where
 fn select_effort(input: &EffortInput) -> Result<Effort, OcaError> {
     let (Some(inline), Some(flag)) = (&input.inline, &input.flag) else {
         let Some(value) = input.inline.as_deref().or(input.flag.as_deref()) else {
-            return Err(OcaError::new(
-                ErrorCode::EffortMissing,
-                "model effort is required",
-                "provide an effort after `:` or with `-e`",
-            ));
+            return Err(OcaError::new(ErrorCode::EffortMissing)
+                .with_error("model effort is required")
+                .with_help("provide an effort after `:` or with `-e`"));
         };
         return Effort::parse(value).ok_or_else(|| unsupported_effort(value));
     };
 
     if normalize_effort(inline) != normalize_effort(flag) {
-        return Err(OcaError::new(
-            ErrorCode::EffortConflict,
-            format!("conflicting efforts `{inline}` and `{flag}`"),
-            "provide one effort, or make `:effort` and `-e effort` agree",
-        ));
+        return Err(OcaError::new(ErrorCode::EffortConflict)
+            .with_error(format!("conflicting efforts `{inline}` and `{flag}`"))
+            .with_help("provide one effort, or make `:effort` and `-e effort` agree"));
     }
 
     Effort::parse(inline).ok_or_else(|| unsupported_effort(inline))
@@ -396,11 +335,9 @@ fn normalize_effort(value: &str) -> String {
 }
 
 fn unsupported_effort(value: &str) -> OcaError {
-    OcaError::new(
-        ErrorCode::EffortUnsupported,
-        format!("unsupported effort `{}`", value.trim()),
-        "use one of low, medium, high, xhigh, or max",
-    )
+    OcaError::new(ErrorCode::EffortUnsupported)
+        .with_error(format!("unsupported effort `{}`", value.trim()))
+        .with_help("use one of low, medium, high, xhigh, or max")
 }
 
 fn resolve_variant(requested: Effort, ladder: &[String]) -> Option<String> {
