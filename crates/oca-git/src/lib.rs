@@ -671,6 +671,36 @@ mod tests {
         }
     }
 
+    /// T21 (#21), criterion 1: the post-staging re-check re-runs the zero-byte
+    /// gate, so a manifest file emptied after the scan never reaches commit even
+    /// though the changed-path set never moved.
+    #[test]
+    fn validate_rechecks_after_staging_and_rejects_a_manifest_file_emptied_late() {
+        let repository = TestRepository::new();
+        fs::write(repository.path.join("allowed.txt"), "scanned\n")
+            .expect("the initial changed file should be written");
+        let manager = WorktreeManager::with_after_scan_hook(std::sync::Arc::new(|worktree| {
+            fs::write(worktree.join("allowed.txt"), "")
+                .expect("the injected late truncation should be written");
+        }));
+        let manifest = [RelativePath::new("allowed.txt").expect("the path should be valid")];
+
+        let error = manager
+            .validate(&repository.path, &manifest)
+            .expect_err("the post-stage re-check should catch the late truncation");
+
+        match error {
+            GitError::ZeroByteOutput { paths } => {
+                assert_eq!(
+                    paths,
+                    vec![RelativePath::new("allowed.txt").expect("the path should be valid")]
+                );
+            }
+            other => panic!("expected zero_byte_output, got {other:?}"),
+        }
+        assert!(repository.path.join("allowed.txt").is_file());
+    }
+
     #[test]
     fn validate_rejects_out_of_scope_paths_and_leaves_the_diff_intact() {
         let repository = TestRepository::new();

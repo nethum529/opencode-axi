@@ -755,6 +755,96 @@ mod tests {
         }
     }
 
+    /// A runtime whose installed version and start environment both differ from
+    /// whatever is recorded, recording every warning it is asked to print.
+    #[derive(Default)]
+    struct RecordingWarnRuntime {
+        version: String,
+        environment: String,
+        warnings: RefCell<Vec<String>>,
+    }
+
+    impl RecordingWarnRuntime {
+        fn new(version: &str, environment: &str) -> Self {
+            Self {
+                version: version.to_owned(),
+                environment: environment.to_owned(),
+                warnings: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ServerRuntime for RecordingWarnRuntime {
+        fn opencode_version(&self) -> Result<String, String> {
+            Ok(self.version.clone())
+        }
+
+        fn start_environment_hash(&self) -> String {
+            self.environment.clone()
+        }
+
+        fn port_is_available(&self, _port: u16) -> bool {
+            true
+        }
+
+        fn spawn(&self, _port: u16, _log_path: &Path) -> Result<(), String> {
+            panic!("a warm record must not spawn")
+        }
+
+        fn wait_until_ready(&self, _port: u16, _timeout: Duration) -> bool {
+            panic!("a warm record must not probe")
+        }
+
+        fn warn(&self, message: &str) {
+            self.warnings.borrow_mut().push(message.to_owned());
+        }
+    }
+
+    fn warnings_for_recorded_start(runtime: &RecordingWarnRuntime) -> Vec<String> {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        ConnectOrStart::new(directory.path(), 4096, [], Duration::from_millis(1))
+            .write_record(&ServerRecord::new(4096, "1.18.10", "recorded-environment"))
+            .expect("discovery hint");
+        let mut request = ReadyRequest;
+
+        block_on(
+            ConnectOrStart::new(directory.path(), 4096, [], Duration::from_millis(1))
+                .connect_or_start(runtime, &mut request),
+        )
+        .expect("a mismatch warns but never fails the request");
+
+        runtime.warnings.borrow().clone()
+    }
+
+    /// T14 (#14), criterion 5: a recorded version or start-environment mismatch
+    /// prints one warning line, and the request still goes through.
+    #[test]
+    fn a_recorded_version_or_environment_mismatch_prints_exactly_one_warning_line() {
+        for runtime in [
+            RecordingWarnRuntime::new("1.19.0", "recorded-environment"),
+            RecordingWarnRuntime::new("1.18.10", "current-environment"),
+            RecordingWarnRuntime::new("1.19.0", "current-environment"),
+        ] {
+            let warnings = warnings_for_recorded_start(&runtime);
+
+            assert_eq!(warnings.len(), 1, "one warning line, got {warnings:?}");
+            assert!(
+                warnings[0].contains("version") || warnings[0].contains("environment"),
+                "the warning names what drifted: {}",
+                warnings[0]
+            );
+        }
+    }
+
+    /// T14 (#14), criterion 5: a record that matches the current environment
+    /// warns about nothing, so the warning cannot be unconditional noise.
+    #[test]
+    fn a_matching_server_record_prints_no_warning_line() {
+        let runtime = RecordingWarnRuntime::new("1.18.10", "recorded-environment");
+
+        assert!(warnings_for_recorded_start(&runtime).is_empty());
+    }
+
     fn block_on<T>(future: impl Future<Output = T>) -> T {
         let mut future = std::pin::pin!(future);
         let mut context = Context::from_waker(Waker::noop());
