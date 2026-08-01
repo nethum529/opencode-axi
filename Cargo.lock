@@ -244,6 +244,9 @@ dependencies = [
 [[package]]
 name = "oca-cli"
 version = "0.1.0"
+dependencies = [
+ "oca-core",
+]
 
 [[package]]
 name = "oca-core"

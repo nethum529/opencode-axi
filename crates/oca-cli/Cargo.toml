@@ -9,6 +9,4 @@ name = "oca"
 path = "src/main.rs"
 
 [dependencies]
-# Future: clap, for the fixed CLI grammar this crate owns.
-# Future: tokio, because the entry point drives oca-core's async operations.
-# Not added; T01 adds no logic.
+oca-core = { path = "../oca-core" }
