@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+};
 
 use oca_core::{
     EffortInput, ErrorCode, ModelCatalog, OcaError, RefId, ResolvedModel, resolve_model,
@@ -100,6 +103,7 @@ pub struct AgentGrammar {
 
 const EFFORT_FORMS: &[&str] = &["l", "m", "h", "x", "max", "low", "medium", "high", "xhigh"];
 const DISPATCH_ALIASES: &[&str] = &["opus", "sonnet", "haiku", "flash", "deepseek"];
+static PUBLIC_COMMANDS: OnceLock<Vec<&str>> = OnceLock::new();
 const DISPATCH_OPERANDS: &[OperandGrammar] = &[OperandGrammar {
     name: "prompt",
     form: OperandForm::OneOrMore,
@@ -352,14 +356,19 @@ pub const fn grammar_contract() -> &'static AgentGrammar {
 }
 
 /// The commands published to help, generated schemas, and the agent skill.
-pub fn public_commands() -> impl Iterator<Item = &'static str> {
-    grammar_contract()
-        .commands
-        .iter()
-        .filter_map(|command| match command.kind {
-            AgentCommand::Dispatch => None,
-            AgentCommand::Control(verb) => Some(verb),
+pub fn public_commands() -> &'static [&'static str] {
+    PUBLIC_COMMANDS
+        .get_or_init(|| {
+            grammar_contract()
+                .commands
+                .iter()
+                .filter_map(|command| match command.kind {
+                    AgentCommand::Dispatch => None,
+                    AgentCommand::Control(verb) => Some(verb),
+                })
+                .collect()
         })
+        .as_slice()
 }
 
 /// The concise agent-facing command reference.
@@ -975,10 +984,10 @@ mod tests {
     #[test]
     fn hidden_attach_is_excluded_from_agent_facing_metadata() {
         assert!(!help_text().contains("__attach"));
-        assert!(!public_commands().any(|command| command == "__attach"));
+        assert!(!public_commands().contains(&"__attach"));
         assert_eq!(
-            public_commands().collect::<Vec<_>>(),
-            vec!["m", "q", "f", "k", "ls", "events", "push", "pr"]
+            public_commands(),
+            ["m", "q", "f", "k", "ls", "events", "push", "pr"]
         );
     }
 
