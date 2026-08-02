@@ -193,7 +193,7 @@ impl OpenCodeClient {
     /// Returns an error when `OpenCode` rejects the request or its response is malformed.
     pub async fn prompt_async(
         &self,
-        session: &SessionId,
+        session: &str,
         request: PromptRequest,
     ) -> Result<PromptAccepted, OpenCodeError> {
         self.send_prompt(session, request).await?;
@@ -207,7 +207,7 @@ impl OpenCodeClient {
     /// Returns an error when `OpenCode` rejects the request or its response is malformed.
     pub async fn queue(
         &self,
-        session: &SessionId,
+        session: &str,
         request: PromptRequest,
     ) -> Result<ControlAccepted, OpenCodeError> {
         self.send_prompt(session, request).await?;
@@ -219,7 +219,7 @@ impl OpenCodeClient {
     /// # Errors
     ///
     /// Returns an error when `OpenCode` rejects the request or its response is malformed.
-    pub async fn abort(&self, session: &SessionId) -> Result<AbortAccepted, OpenCodeError> {
+    pub async fn abort(&self, session: &str) -> Result<AbortAccepted, OpenCodeError> {
         let path = format!("session/{session}/abort");
         let aborted: bool = self
             .json(Method::POST, &path, None, None, None, StatusCode::OK)
@@ -232,10 +232,7 @@ impl OpenCodeClient {
     /// # Errors
     ///
     /// Returns an error when `OpenCode` rejects the request or its response is malformed.
-    pub async fn messages(
-        &self,
-        session: &SessionId,
-    ) -> Result<Vec<MessageWithParts>, OpenCodeError> {
+    pub async fn messages(&self, session: &str) -> Result<Vec<MessageWithParts>, OpenCodeError> {
         let path = format!("session/{session}/message");
         self.json(Method::GET, &path, None, None, None, StatusCode::OK)
             .await
@@ -283,7 +280,7 @@ impl OpenCodeClient {
 
     async fn send_prompt(
         &self,
-        session: &SessionId,
+        session: &str,
         request: PromptRequest,
     ) -> Result<(), OpenCodeError> {
         let mut body = Map::new();
