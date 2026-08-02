@@ -218,8 +218,9 @@ impl ErrorCode {
             Self::SessionNotFound => "Start a new session or verify the ref",
             Self::WorkerBusy => "Use `oca q <ref>` to queue a message",
             Self::ServerUnavailable => "Start `opencode serve` and retry",
-            Self::ServerStartTimeout => "Check the OpenCode server and retry",
-            Self::ServerUnreachable => "Check the OpenCode server and retry",
+            Self::ServerStartTimeout | Self::ServerUnreachable => {
+                "Check the OpenCode server and retry"
+            }
             Self::ProtocolMismatch => "Check the OpenCode version and retry",
             Self::RateLimited => "Wait before retrying",
             Self::ContractInvalid => "Review the worker response and retry",
@@ -246,7 +247,8 @@ impl ErrorCode {
             | Self::AliasUnknown
             | Self::EffortMissing
             | Self::EffortConflict
-            | Self::EffortUnsupported => exit::USAGE,
+            | Self::EffortUnsupported
+            | Self::ProtectedBranch => exit::USAGE,
             Self::ServerUnavailable | Self::ServerStartTimeout | Self::ServerUnreachable => {
                 exit::SERVER_UNREACHABLE
             }
@@ -266,9 +268,8 @@ impl ErrorCode {
             | Self::PublishDisabled
             | Self::PublishRemoteMissing
             | Self::PublishFailed
-            | Self::EventsCorrupt => exit::FAILURE,
-            Self::FollowTimeout => exit::FAILURE,
-            Self::ProtectedBranch => exit::USAGE,
+            | Self::EventsCorrupt
+            | Self::FollowTimeout => exit::FAILURE,
         }
     }
 }
