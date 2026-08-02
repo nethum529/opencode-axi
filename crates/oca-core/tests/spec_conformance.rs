@@ -63,7 +63,7 @@ const SPEC_CODES: [(&str, i32); 23] = [
     ("follow_timeout", 4),
 ];
 
-/// FIX14c: aliases are normalized through the public function and every
+/// `FIX14c`: aliases are normalized through the public function and every
 /// catalog/resolver lookup follows the same canonical form.
 #[test]
 fn aliases_are_normalized_without_a_public_wrapper_type() {

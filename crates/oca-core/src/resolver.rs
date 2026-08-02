@@ -253,7 +253,7 @@ where
     // Model-name validation intentionally precedes every effort validation.
     let definition = catalog.get(&canonical_alias).ok_or_else(|| {
         OcaError::new(ErrorCode::AliasUnknown)
-            .with_error(format!("unknown model alias `{}`", canonical_alias))
+            .with_error(format!("unknown model alias `{canonical_alias}`"))
             .with_help("choose one of the configured model aliases")
     })?;
 
@@ -263,8 +263,7 @@ where
         let ladder = definition.ladder.join(", ");
         OcaError::new(ErrorCode::EffortUnsupported)
             .with_error(format!(
-                "effort `{requested_effort}` is unsupported for `{}`; available ladder: {ladder}",
-                canonical_alias
+                "effort `{requested_effort}` is unsupported for `{canonical_alias}`; available ladder: {ladder}"
             ))
             .with_help(format!("use one of the available efforts: {ladder}"))
     })?;
