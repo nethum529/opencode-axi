@@ -57,7 +57,6 @@ fn prompt_request() -> PromptRequest {
             text: "Implement the facade".to_owned(),
         }],
         output_schema: None,
-        permission: None,
     }
 }
 
@@ -121,6 +120,48 @@ async fn prompt_async_sends_the_native_variant_to_the_pinned_operation() {
     let request = server.finish();
     assert!(request.starts_with("POST /session/ses_target/prompt_async HTTP/1.1\r\n"));
     assert_prompt_body(&request);
+}
+
+#[tokio::test]
+async fn prompt_async_wraps_an_output_schema_in_the_pinned_format_envelope() {
+    let server = FakeServer::once(response("204 No Content", "text/plain", ""));
+    let client = OpenCodeClient::new(server.base_url.parse().expect("valid URL"));
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "summary": { "type": "string" },
+            "tasks": {
+                "type": "array",
+                "items": { "type": "object", "required": ["id", "done"] }
+            }
+        },
+        "required": ["summary", "tasks"],
+        "additionalProperties": false,
+    });
+    let mut prompt = prompt_request();
+    prompt.output_schema = Some(schema.clone());
+
+    client
+        .prompt_async(&"ses_target".to_owned(), prompt)
+        .await
+        .expect("prompt is accepted");
+
+    let request = server.finish();
+    let body = request
+        .split_once("\r\n\r\n")
+        .expect("request has a body")
+        .1;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(body).expect("prompt body is JSON"),
+        serde_json::json!({
+            "agent": "worker",
+            "format": { "type": "json_schema", "schema": schema },
+            "messageID": "msg_oca_01",
+            "model": { "providerID": "openai", "modelID": "gpt-5.6" },
+            "parts": [{ "type": "text", "text": "Implement the facade" }],
+            "variant": "high",
+        })
+    );
 }
 
 #[tokio::test]
@@ -299,6 +340,35 @@ async fn create_session_uses_the_create_model_envelope() {
                 "variant": "high",
             }
         })
+    );
+}
+
+#[tokio::test]
+async fn create_session_sends_a_non_empty_permission_ruleset() {
+    let server = FakeServer::once(response(
+        "200 OK",
+        "application/json",
+        "{\"id\":\"ses_created\"}",
+    ));
+    let client = OpenCodeClient::new(server.base_url.parse().expect("valid URL"));
+    let permission = serde_json::json!({ "bash": "allow", "edit": "ask" });
+
+    client
+        .create_session(CreateSessionRequest {
+            permission: Some(permission.clone()),
+            ..CreateSessionRequest::default()
+        })
+        .await
+        .expect("session is created");
+
+    let request = server.finish();
+    let body = request
+        .split_once("\r\n\r\n")
+        .expect("request has a body")
+        .1;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(body).expect("create body is JSON"),
+        serde_json::json!({ "permission": permission })
     );
 }
 
