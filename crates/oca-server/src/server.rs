@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     fs::{self, OpenOptions},
     io::{self, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
@@ -56,6 +57,50 @@ pub enum RequestFailure<E> {
     Application(E),
 }
 
+/// The startup operation that rejected one candidate port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupStage {
+    Spawn,
+    Readiness,
+}
+
+impl fmt::Display for StartupStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Spawn => formatter.write_str("spawn"),
+            Self::Readiness => formatter.write_str("readiness"),
+        }
+    }
+}
+
+/// A retained explanation for one rejected startup candidate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartupDiagnostic {
+    pub port: u16,
+    pub stage: StartupStage,
+    pub reason: String,
+}
+
+impl StartupDiagnostic {
+    fn new(port: u16, stage: StartupStage, reason: impl Into<String>) -> Self {
+        Self {
+            port,
+            stage,
+            reason: reason.into(),
+        }
+    }
+}
+
+impl fmt::Display for StartupDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "port {} failed during {}: {}",
+            self.port, self.stage, self.reason
+        )
+    }
+}
+
 /// One real `OpenCode` command request.
 ///
 /// Implementations call an operation on the supplied [`OpenCodeClient`]. The
@@ -94,7 +139,12 @@ pub trait ServerRuntime {
     /// Returns an error when the server process cannot be created.
     fn spawn(&self, port: u16, log_path: &Path) -> Result<(), String>;
 
-    fn wait_until_ready(&self, port: u16, timeout: Duration) -> bool;
+    /// Waits for a successful loopback connection, retaining the last failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the final concrete connection error when `timeout` expires.
+    fn wait_until_ready(&self, port: u16, timeout: Duration) -> Result<(), String>;
 
     fn warn(&self, message: &str);
 }
@@ -160,15 +210,14 @@ impl ServerRuntime for SystemRuntime {
             .map_err(|error| error.to_string())
     }
 
-    fn wait_until_ready(&self, port: u16, timeout: Duration) -> bool {
+    fn wait_until_ready(&self, port: u16, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         let address = SocketAddr::new(LOOPBACK, port);
         loop {
-            if TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_ok() {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
+            match TcpStream::connect_timeout(&address, Duration::from_millis(50)) {
+                Ok(_) => return Ok(()),
+                Err(error) if Instant::now() >= deadline => return Err(error.to_string()),
+                Err(_) => {}
             }
             thread::sleep(Duration::from_millis(20));
         }
@@ -287,8 +336,8 @@ impl ConnectOrStart {
     ///
     /// # Errors
     ///
-    /// Returns the request failure, a state I/O error, or
-    /// [`ConnectError::ServerUnavailable`] when every configured port fails.
+    /// Returns the request failure, a state I/O error, or typed startup
+    /// diagnostics when every configured port fails.
     pub async fn connect_or_start<R, Q>(
         &self,
         runtime: &R,
@@ -310,35 +359,50 @@ impl ConnectOrStart {
 
         let lock = self.acquire_start_lock().map_err(ConnectError::State)?;
         let record_after_lock = self.read_record().map_err(ConnectError::State)?;
-        let record = if initial_record.as_ref() == record_after_lock.as_ref() {
-            self.start_record(runtime).map_err(ConnectError::State)?
-        } else {
-            record_after_lock
-        };
+        let recovery: Result<ServerRecord, ConnectError<Q::Error>> =
+            if let Some(record) = record_after_lock.filter(Self::record_is_live) {
+                Ok(record)
+            } else {
+                match self.start_record(runtime).map_err(ConnectError::State)? {
+                    StartOutcome::Started(record) => Ok(record),
+                    StartOutcome::Failed(diagnostics) => Err(ConnectError::Startup(diagnostics)),
+                }
+            };
         lock.unlock().map_err(ConnectError::State)?;
+        let record = recovery?;
 
-        if let Some(record) = record {
-            Self::warn_if_mismatched(runtime, &record);
-            return Self::send(request, record.port)
-                .await
-                .map_err(ConnectError::from_failure);
-        }
-        Err(ConnectError::ServerUnavailable)
+        Self::warn_if_mismatched(runtime, &record);
+        Self::send(request, record.port)
+            .await
+            .map_err(ConnectError::from_failure)
     }
 
-    fn start_record<R>(&self, runtime: &R) -> io::Result<Option<ServerRecord>>
+    fn start_record<R>(&self, runtime: &R) -> io::Result<StartOutcome>
     where
         R: ServerRuntime,
     {
         let version = runtime.opencode_version().ok();
         let environment_hash = runtime.start_environment_hash();
+        let mut diagnostics = Vec::new();
         for port in self.candidate_ports() {
             if !runtime.port_is_available(port) {
+                diagnostics.push(StartupDiagnostic::new(
+                    port,
+                    StartupStage::Spawn,
+                    "loopback port is unavailable",
+                ));
                 continue;
             }
-            if runtime.spawn(port, &self.log_path()).is_err()
-                || !runtime.wait_until_ready(port, self.start_timeout)
-            {
+            if let Err(reason) = runtime.spawn(port, &self.log_path()) {
+                diagnostics.push(StartupDiagnostic::new(port, StartupStage::Spawn, reason));
+                continue;
+            }
+            if let Err(reason) = runtime.wait_until_ready(port, self.start_timeout) {
+                diagnostics.push(StartupDiagnostic::new(
+                    port,
+                    StartupStage::Readiness,
+                    reason,
+                ));
                 continue;
             }
             let record = ServerRecord::new(
@@ -347,9 +411,17 @@ impl ConnectOrStart {
                 environment_hash.clone(),
             );
             self.write_record(&record)?;
-            return Ok(Some(record));
+            for diagnostic in diagnostics {
+                runtime.warn(&format!("discarded startup diagnostic: {diagnostic}"));
+            }
+            return Ok(StartOutcome::Started(record));
         }
-        Ok(None)
+        Ok(StartOutcome::Failed(diagnostics))
+    }
+
+    fn record_is_live(record: &ServerRecord) -> bool {
+        let address = SocketAddr::new(LOOPBACK, record.port);
+        TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_ok()
     }
 
     async fn send<Q>(request: &mut Q, port: u16) -> Result<Q::Output, RequestFailure<Q::Error>>
@@ -405,6 +477,11 @@ impl ConnectOrStart {
     }
 }
 
+enum StartOutcome {
+    Started(ServerRecord),
+    Failed(Vec<StartupDiagnostic>),
+}
+
 fn ensure_private_directory(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     set_private_directory_permissions(path)
@@ -449,6 +526,7 @@ fn set_private_file_permissions(_path: &Path) -> io::Result<()> {
 pub enum ConnectError<E> {
     Request(E),
     RequestMayHaveBeenTransmitted(E),
+    Startup(Vec<StartupDiagnostic>),
     ServerUnavailable,
     State(io::Error),
 }
@@ -479,8 +557,6 @@ mod tests {
         task::{Context, Poll, Waker},
         time::Duration,
     };
-
-    use fs2::FileExt;
 
     use super::{
         ConnectError, ConnectOrStart, OpenCodeRequest, RequestFailure, ServerRecord, ServerRuntime,
