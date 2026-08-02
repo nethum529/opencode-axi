@@ -152,11 +152,10 @@ where
 
     fn dispatch(&mut self) -> Option<SseEvent> {
         let event = (!self.data_lines.is_empty()).then(|| SseEvent {
-            id: self.id.take(),
+            id: self.id.clone(),
             event: self.event.take(),
             data: self.data_lines.join("\n"),
         });
-        self.id = None;
         self.event = None;
         self.data_lines.clear();
         event
@@ -216,6 +215,31 @@ mod tests {
                 data: "finished".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn retains_the_last_event_id_until_a_later_id_replaces_it() {
+        let mut stream = SseStream::new(Chunks {
+            chunks: VecDeque::from([
+                b"id: old\nevent: custom\ndata: first\n\ndata: second\n\nid: new\ndata: third\n\n"
+                    .to_vec(),
+            ]),
+        });
+
+        let first = block_on(stream.next()).unwrap().unwrap();
+        assert_eq!(first.id.as_deref(), Some("old"));
+        assert_eq!(first.event.as_deref(), Some("custom"));
+        assert_eq!(first.data, "first");
+
+        let second = block_on(stream.next()).unwrap().unwrap();
+        assert_eq!(second.id.as_deref(), Some("old"));
+        assert_eq!(second.event, None);
+        assert_eq!(second.data, "second");
+
+        let third = block_on(stream.next()).unwrap().unwrap();
+        assert_eq!(third.id.as_deref(), Some("new"));
+        assert_eq!(third.event, None);
+        assert_eq!(third.data, "third");
     }
 
     #[test]
