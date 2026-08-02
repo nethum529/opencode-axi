@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use oca_core::{EffortInput, ErrorCode, ModelCatalog, OcaError, ResolvedModel, resolve_model};
+use oca_core::{
+    EffortInput, ErrorCode, ModelCatalog, OcaError, RefId, ResolvedModel, resolve_model,
+};
 
 /// The fixed command grammar accepted by `oca`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -240,7 +242,7 @@ fn parse_dispatch(verb: &str, arguments: &[String]) -> Result<DispatchCommand, O
 }
 
 fn parse_message(arguments: &[String], permits_effort: bool) -> Result<MessageCommand, OcaError> {
-    let (reference, tail) = required_first(arguments, "ref")?;
+    let (reference, tail) = required_reference(arguments)?;
     let mut effort = None;
     let mut json = false;
     let mut message = Vec::new();
@@ -289,7 +291,7 @@ fn parse_message(arguments: &[String], permits_effort: bool) -> Result<MessageCo
 }
 
 fn parse_follow(arguments: &[String]) -> Result<FollowCommand, OcaError> {
-    let (reference, tail) = required_first(arguments, "ref")?;
+    let (reference, tail) = required_reference(arguments)?;
     Ok(FollowCommand {
         reference: reference.to_owned(),
         json: parse_json_only(tail)?,
@@ -297,7 +299,7 @@ fn parse_follow(arguments: &[String]) -> Result<FollowCommand, OcaError> {
 }
 
 fn parse_abort(arguments: &[String]) -> Result<AbortCommand, OcaError> {
-    let (reference, tail) = required_first(arguments, "ref")?;
+    let (reference, tail) = required_reference(arguments)?;
     Ok(AbortCommand {
         reference: reference.to_owned(),
         json: parse_json_only(tail)?,
@@ -319,7 +321,7 @@ fn parse_list(arguments: &[String]) -> Result<ListCommand, OcaError> {
 }
 
 fn parse_events(arguments: &[String]) -> Result<EventsCommand, OcaError> {
-    let (reference, tail) = required_first(arguments, "ref")?;
+    let (reference, tail) = required_reference(arguments)?;
     let mut since = None;
     let mut json = false;
     let mut index = 0;
@@ -350,7 +352,7 @@ fn parse_events(arguments: &[String]) -> Result<EventsCommand, OcaError> {
 }
 
 fn parse_ref_command(arguments: &[String]) -> Result<RefCommand, OcaError> {
-    let (reference, tail) = required_first(arguments, "ref")?;
+    let (reference, tail) = required_reference(arguments)?;
     Ok(RefCommand {
         reference: reference.to_owned(),
         json: parse_json_only(tail)?,
@@ -358,7 +360,7 @@ fn parse_ref_command(arguments: &[String]) -> Result<RefCommand, OcaError> {
 }
 
 fn parse_attach(arguments: &[String]) -> Result<AttachCommand, OcaError> {
-    let (reference, tail) = required_first(arguments, "ref")?;
+    let (reference, tail) = required_reference(arguments)?;
     let (session_id, tail) = required_first(tail, "session id")?;
     let (cwd, tail) = required_first(tail, "cwd")?;
     if !tail.is_empty() {
@@ -384,6 +386,14 @@ fn required_first<'a>(
         return Err(usage(format!("{name} is required")));
     }
     Ok((first, rest))
+}
+
+fn required_reference(arguments: &[String]) -> Result<(&str, &[String]), OcaError> {
+    let (reference, tail) = required_first(arguments, "ref")?;
+    RefId::new(reference).map_err(|_| {
+        usage("ref must be `w` followed by five lowercase ASCII base-36 characters")
+    })?;
+    Ok((reference, tail))
 }
 
 fn parse_json_only(arguments: &[String]) -> Result<bool, OcaError> {

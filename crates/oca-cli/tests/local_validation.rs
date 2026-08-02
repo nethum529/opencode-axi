@@ -7,16 +7,30 @@
 use oca_cli::parse_from;
 use oca_core::ErrorCode;
 
-/// T08 (#8), criterion 3: invalid ref syntax is a local validation failure.
-/// A ref is `w` followed by five base36 characters (spec-data-state.md
-/// section 4, "Ref identifiers").
+/// A ref is `w` followed by five lowercase ASCII base-36 characters. Each
+/// parser arm must reject malformed refs locally, before execution can open a
+/// transport.
 #[test]
 fn invalid_ref_syntax_fails_local_validation_on_every_ref_taking_verb() {
-    let malformed = ["", "not-a-ref", "W4F2A1", "w4f2", "w4f2a1x", "x4f2a1"];
+    let malformed = [
+        "",        // empty
+        "x4f2a1",  // wrong prefix
+        "w4f2a",   // wrong length
+        "w4f2a1x", // wrong length
+        "w4F2a1",  // uppercase
+        "w4f-a1",  // hyphen
+        "w4f_a1",  // underscore
+        "wé0000",  // non-ASCII
+    ];
 
-    for verb in ["f", "k", "push", "pr"] {
+    for verb in ["m", "q", "f", "k", "events", "push", "pr", "__attach"] {
         for reference in malformed {
-            let error = parse_from(["oca", verb, reference])
+            let arguments = match verb {
+                "m" | "q" => vec!["oca", verb, reference, "message"],
+                "__attach" => vec!["oca", verb, reference, "ses_1", "/repo"],
+                _ => vec!["oca", verb, reference],
+            };
+            let error = parse_from(arguments)
                 .err()
                 .unwrap_or_else(|| panic!("`oca {verb} {reference}` must fail local validation"));
             assert_eq!(
@@ -24,16 +38,38 @@ fn invalid_ref_syntax_fails_local_validation_on_every_ref_taking_verb() {
                 ErrorCode::Usage.as_str(),
                 "`oca {verb} {reference}` must be a usage failure"
             );
+            assert_eq!(
+                error.exit_code(),
+                2,
+                "`oca {verb} {reference}` must exit with the usage status"
+            );
         }
     }
 }
 
-/// T08 (#8), criterion 3: a well-formed ref still parses, so the syntax check
-/// above cannot be satisfied by rejecting every ref.
+/// Every canonical ref must get past its verb's ref validation to the next
+/// normal parser step.
 #[test]
-fn a_well_formed_ref_passes_local_validation() {
-    for verb in ["f", "k", "push", "pr"] {
-        parse_from(["oca", verb, "w4f2a1"])
-            .unwrap_or_else(|error| panic!("`oca {verb} w4f2a1` must parse, got {error}"));
+fn canonical_ref_syntax_passes_local_validation_on_every_ref_taking_verb() {
+    for reference in ["w00000", "w4f2a1", "wzzzzz"] {
+        for verb in ["m", "q", "f", "k", "push", "pr"] {
+            let arguments = match verb {
+                "m" | "q" => vec!["oca", verb, reference, "message"],
+                _ => vec!["oca", verb, reference],
+            };
+            parse_from(arguments).unwrap_or_else(|error| {
+                panic!("`oca {verb} {reference}` must pass local validation, got {error}")
+            });
+        }
+
+        for arguments in [
+            vec!["oca", "events", reference],
+            vec!["oca", "events", reference, "--since", "7"],
+            vec!["oca", "__attach", reference, "ses_1", "/repo"],
+        ] {
+            parse_from(arguments).unwrap_or_else(|error| {
+                panic!("canonical ref must pass local validation: {error}")
+            });
+        }
     }
 }
