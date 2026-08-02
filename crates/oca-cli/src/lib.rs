@@ -20,12 +20,346 @@ pub enum Command {
     Attach(AttachCommand),
 }
 
-const PUBLIC_COMMANDS: [&str; 8] = ["m", "q", "f", "k", "ls", "events", "push", "pr"];
+/// The kind of agent-visible command described by [`AgentGrammar`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentCommand {
+    /// A model alias and mandatory effort dispatch a new worker turn.
+    Dispatch,
+    /// A public control verb.
+    Control(&'static str),
+}
+
+/// The required shape of an operand in an agent-visible command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperandForm {
+    /// Exactly one token is required.
+    Required,
+    /// One or more tokens are required and are joined as text by the parser.
+    OneOrMore,
+}
+
+/// One positional operand accepted by a command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperandGrammar {
+    /// The display name used for the operand.
+    pub name: &'static str,
+    /// Whether the parser requires one token or a non-empty text tail.
+    pub form: OperandForm,
+}
+
+/// The form of a value accepted after an option spelling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlagValueForm {
+    /// The option is a switch and takes no following value.
+    None,
+    /// The option requires a following value with the displayed form.
+    Required {
+        /// The visible placeholder for the value.
+        placeholder: &'static str,
+        /// Enumerated values when the parser has a finite accepted set.
+        accepted_values: &'static [&'static str],
+    },
+}
+
+/// One accepted option spelling and executable examples of its use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlagGrammar {
+    /// Equivalent spellings accepted by the parser.
+    pub spellings: &'static [&'static str],
+    /// Whether the option takes a value and, if known, its accepted forms.
+    pub value: FlagValueForm,
+    /// Complete accepted argv sequences exercising the listed spellings.
+    pub argv_examples: &'static [&'static [&'static str]],
+}
+
+/// The grammar for one public command spelling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommandGrammar {
+    /// Whether this entry is dispatch syntax or one public control verb.
+    pub kind: AgentCommand,
+    /// Syntax tokens to show an agent when constructing the command.
+    pub display_tokens: &'static [&'static str],
+    /// Positional arguments accepted in order.
+    pub operands: &'static [OperandGrammar],
+    /// Accepted flags and their value forms.
+    pub flags: &'static [FlagGrammar],
+    /// Complete accepted argv sequences for the command.
+    pub argv_examples: &'static [&'static [&'static str]],
+}
+
+/// Parser-owned, agent-visible command grammar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgentGrammar {
+    /// Every command agents may invoke, including model dispatch.
+    pub commands: &'static [CommandGrammar],
+    /// Every model alias accepted in model-dispatch syntax.
+    pub dispatch_aliases: &'static [&'static str],
+    /// Every spelling accepted for an effort value.
+    pub effort_forms: &'static [&'static str],
+}
+
+const EFFORT_FORMS: &[&str] = &["l", "m", "h", "x", "max", "low", "medium", "high", "xhigh"];
+const DISPATCH_ALIASES: &[&str] = &["opus", "sonnet", "haiku", "flash", "deepseek"];
+const DISPATCH_OPERANDS: &[OperandGrammar] = &[OperandGrammar {
+    name: "prompt",
+    form: OperandForm::OneOrMore,
+}];
+const REF_OPERAND: &[OperandGrammar] = &[OperandGrammar {
+    name: "ref",
+    form: OperandForm::Required,
+}];
+const REF_AND_MESSAGE_OPERANDS: &[OperandGrammar] = &[
+    OperandGrammar {
+        name: "ref",
+        form: OperandForm::Required,
+    },
+    OperandGrammar {
+        name: "message",
+        form: OperandForm::OneOrMore,
+    },
+];
+
+const DISPATCH_EXAMPLES: &[&[&str]] = &[
+    &["oca", "opus:h", "implement", "the", "ticket"],
+    &["oca", "sonnet", "-e", "x", "review", "the", "diff"],
+    &["oca", "haiku:medium", "summarize", "the", "change"],
+    &["oca", "flash:max", "run", "the", "tests"],
+    &["oca", "deepseek:h", "check", "the", "parser"],
+    &["oca", "--json", "opus:h", "--", "--literal", "prompt"],
+];
+const DISPATCH_FLAGS: &[FlagGrammar] = &[
+    FlagGrammar {
+        spellings: &["--json"],
+        value: FlagValueForm::None,
+        argv_examples: &[
+            &["oca", "opus:h", "--json", "emit", "json"],
+            &["oca", "--json", "opus:h", "emit", "global", "json"],
+        ],
+    },
+    FlagGrammar {
+        spellings: &["-e", "--effort"],
+        value: FlagValueForm::Required {
+            placeholder: "<effort>",
+            accepted_values: EFFORT_FORMS,
+        },
+        argv_examples: &[
+            &["oca", "opus", "-e", "high", "use", "short", "effort"],
+            &["oca", "opus", "--effort", "h", "use", "long", "effort"],
+        ],
+    },
+    FlagGrammar {
+        spellings: &["-r", "--role"],
+        value: FlagValueForm::Required {
+            placeholder: "<role>",
+            accepted_values: &[],
+        },
+        argv_examples: &[
+            &["oca", "opus:h", "-r", "review", "inspect", "this"],
+            &["oca", "opus:h", "--role", "impl", "build", "this"],
+        ],
+    },
+    FlagGrammar {
+        spellings: &["-w", "--worktree"],
+        value: FlagValueForm::None,
+        argv_examples: &[
+            &["oca", "opus:h", "-w", "make", "an", "isolated", "change"],
+            &["oca", "opus:h", "--worktree", "make", "another", "change"],
+        ],
+    },
+    FlagGrammar {
+        spellings: &["--headless"],
+        value: FlagValueForm::None,
+        argv_examples: &[&["oca", "opus:h", "--headless", "run", "without", "a", "tui"]],
+    },
+];
+
+const MESSAGE_EXAMPLES: &[&[&str]] = &[
+    &["oca", "m", "w4f2a1", "continue", "the", "work"],
+    &["oca", "m", "w4f2a1", "--", "--literal", "message"],
+];
+const MESSAGE_FLAGS: &[FlagGrammar] = &[
+    FlagGrammar {
+        spellings: &["--json"],
+        value: FlagValueForm::None,
+        argv_examples: &[&["oca", "m", "w4f2a1", "--json", "report", "json"]],
+    },
+    FlagGrammar {
+        spellings: &["-e", "--effort"],
+        value: FlagValueForm::Required {
+            placeholder: "<effort>",
+            accepted_values: EFFORT_FORMS,
+        },
+        argv_examples: &[
+            &["oca", "m", "w4f2a1", "-e", "h", "raise", "effort"],
+            &["oca", "m", "w4f2a1", "--effort", "high", "raise", "effort"],
+        ],
+    },
+];
+
+const QUEUE_EXAMPLES: &[&[&str]] = &[&["oca", "q", "w4f2a1", "queue", "this", "message"]];
+const QUEUE_FLAGS: &[FlagGrammar] = &[FlagGrammar {
+    spellings: &["--json"],
+    value: FlagValueForm::None,
+    argv_examples: &[&["oca", "q", "w4f2a1", "--json", "queue", "json"]],
+}];
+
+const FOLLOW_EXAMPLES: &[&[&str]] = &[&["oca", "f", "w4f2a1"]];
+const FOLLOW_FLAGS: &[FlagGrammar] = &[FlagGrammar {
+    spellings: &["--json"],
+    value: FlagValueForm::None,
+    argv_examples: &[&["oca", "f", "w4f2a1", "--json"]],
+}];
+
+const ABORT_EXAMPLES: &[&[&str]] = &[&["oca", "k", "w4f2a1"]];
+const ABORT_FLAGS: &[FlagGrammar] = &[FlagGrammar {
+    spellings: &["--json"],
+    value: FlagValueForm::None,
+    argv_examples: &[&["oca", "k", "w4f2a1", "--json"]],
+}];
+
+const LIST_EXAMPLES: &[&[&str]] = &[&["oca", "ls"]];
+const LIST_FLAGS: &[FlagGrammar] = &[
+    FlagGrammar {
+        spellings: &["--all"],
+        value: FlagValueForm::None,
+        argv_examples: &[&["oca", "ls", "--all"]],
+    },
+    FlagGrammar {
+        spellings: &["--blocked"],
+        value: FlagValueForm::None,
+        argv_examples: &[&["oca", "ls", "--blocked"]],
+    },
+    FlagGrammar {
+        spellings: &["--count"],
+        value: FlagValueForm::None,
+        argv_examples: &[&["oca", "ls", "--count"]],
+    },
+    FlagGrammar {
+        spellings: &["--json"],
+        value: FlagValueForm::None,
+        argv_examples: &[&["oca", "ls", "--json"]],
+    },
+];
+
+const EVENTS_EXAMPLES: &[&[&str]] = &[&["oca", "events", "w4f2a1"]];
+const EVENTS_FLAGS: &[FlagGrammar] = &[
+    FlagGrammar {
+        spellings: &["--since"],
+        value: FlagValueForm::Required {
+            placeholder: "<non-negative-integer>",
+            accepted_values: &[],
+        },
+        argv_examples: &[&["oca", "events", "w4f2a1", "--since", "7"]],
+    },
+    FlagGrammar {
+        spellings: &["--json"],
+        value: FlagValueForm::None,
+        argv_examples: &[&["oca", "events", "w4f2a1", "--json"]],
+    },
+];
+
+const PUSH_EXAMPLES: &[&[&str]] = &[&["oca", "push", "w4f2a1"]];
+const PUSH_FLAGS: &[FlagGrammar] = &[FlagGrammar {
+    spellings: &["--json"],
+    value: FlagValueForm::None,
+    argv_examples: &[&["oca", "push", "w4f2a1", "--json"]],
+}];
+
+const PULL_REQUEST_EXAMPLES: &[&[&str]] = &[&["oca", "pr", "w4f2a1"]];
+const PULL_REQUEST_FLAGS: &[FlagGrammar] = &[FlagGrammar {
+    spellings: &["--json"],
+    value: FlagValueForm::None,
+    argv_examples: &[&["oca", "pr", "w4f2a1", "--json"]],
+}];
+
+const AGENT_COMMANDS: &[CommandGrammar] = &[
+    CommandGrammar {
+        kind: AgentCommand::Dispatch,
+        display_tokens: &["<alias>:<effort>", "<alias> -e <effort>"],
+        operands: DISPATCH_OPERANDS,
+        flags: DISPATCH_FLAGS,
+        argv_examples: DISPATCH_EXAMPLES,
+    },
+    CommandGrammar {
+        kind: AgentCommand::Control("m"),
+        display_tokens: &["m"],
+        operands: REF_AND_MESSAGE_OPERANDS,
+        flags: MESSAGE_FLAGS,
+        argv_examples: MESSAGE_EXAMPLES,
+    },
+    CommandGrammar {
+        kind: AgentCommand::Control("q"),
+        display_tokens: &["q"],
+        operands: REF_AND_MESSAGE_OPERANDS,
+        flags: QUEUE_FLAGS,
+        argv_examples: QUEUE_EXAMPLES,
+    },
+    CommandGrammar {
+        kind: AgentCommand::Control("f"),
+        display_tokens: &["f"],
+        operands: REF_OPERAND,
+        flags: FOLLOW_FLAGS,
+        argv_examples: FOLLOW_EXAMPLES,
+    },
+    CommandGrammar {
+        kind: AgentCommand::Control("k"),
+        display_tokens: &["k"],
+        operands: REF_OPERAND,
+        flags: ABORT_FLAGS,
+        argv_examples: ABORT_EXAMPLES,
+    },
+    CommandGrammar {
+        kind: AgentCommand::Control("ls"),
+        display_tokens: &["ls"],
+        operands: &[],
+        flags: LIST_FLAGS,
+        argv_examples: LIST_EXAMPLES,
+    },
+    CommandGrammar {
+        kind: AgentCommand::Control("events"),
+        display_tokens: &["events"],
+        operands: REF_OPERAND,
+        flags: EVENTS_FLAGS,
+        argv_examples: EVENTS_EXAMPLES,
+    },
+    CommandGrammar {
+        kind: AgentCommand::Control("push"),
+        display_tokens: &["push"],
+        operands: REF_OPERAND,
+        flags: PUSH_FLAGS,
+        argv_examples: PUSH_EXAMPLES,
+    },
+    CommandGrammar {
+        kind: AgentCommand::Control("pr"),
+        display_tokens: &["pr"],
+        operands: REF_OPERAND,
+        flags: PULL_REQUEST_FLAGS,
+        argv_examples: PULL_REQUEST_EXAMPLES,
+    },
+];
+
+/// The public parser-owned grammar for agent construction of `oca` argv.
+pub static AGENT_GRAMMAR: AgentGrammar = AgentGrammar {
+    commands: AGENT_COMMANDS,
+    dispatch_aliases: DISPATCH_ALIASES,
+    effort_forms: EFFORT_FORMS,
+};
+
+/// Returns the public parser-owned grammar for agent construction of `oca` argv.
+#[must_use]
+pub const fn grammar_contract() -> &'static AgentGrammar {
+    &AGENT_GRAMMAR
+}
 
 /// The commands published to help, generated schemas, and the agent skill.
-#[must_use]
-pub const fn public_commands() -> &'static [&'static str] {
-    &PUBLIC_COMMANDS
+pub fn public_commands() -> impl Iterator<Item = &'static str> {
+    grammar_contract()
+        .commands
+        .iter()
+        .filter_map(|command| match command.kind {
+            AgentCommand::Dispatch => None,
+            AgentCommand::Control(verb) => Some(verb),
+        })
 }
 
 /// The concise agent-facing command reference.
@@ -641,10 +975,10 @@ mod tests {
     #[test]
     fn hidden_attach_is_excluded_from_agent_facing_metadata() {
         assert!(!help_text().contains("__attach"));
-        assert!(!public_commands().contains(&"__attach"));
+        assert!(!public_commands().any(|command| command == "__attach"));
         assert_eq!(
-            public_commands(),
-            ["m", "q", "f", "k", "ls", "events", "push", "pr"]
+            public_commands().collect::<Vec<_>>(),
+            vec!["m", "q", "f", "k", "ls", "events", "push", "pr"]
         );
     }
 
