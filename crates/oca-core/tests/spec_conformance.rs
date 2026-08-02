@@ -77,8 +77,8 @@ fn aliases_are_normalized_without_a_public_wrapper_type() {
     catalog.insert("  CuStOm  ", definition);
     assert!(catalog.get("custom").is_some());
 
-    let opus = resolve_model("  OpUs  ", "high", &catalog)
-        .expect("a normalized opus alias must resolve");
+    let opus =
+        resolve_model("  OpUs  ", "high", &catalog).expect("a normalized opus alias must resolve");
     assert_eq!(opus.alias, "opus");
 
     let deepseek = resolve_model("  DeEpSeEk  ", "high", &catalog)

@@ -41,37 +41,10 @@ impl fmt::Display for Effort {
     }
 }
 
-/// A model alias after it has been normalized for catalog lookup.
-#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub struct Alias(String);
-
-impl Alias {
-    pub fn new(value: impl AsRef<str>) -> Self {
-        Self(value.as_ref().trim().to_ascii_lowercase())
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl AsRef<str> for Alias {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
-
-impl From<&str> for Alias {
-    fn from(value: &str) -> Self {
-        Self::new(value)
-    }
-}
-
-impl From<String> for Alias {
-    fn from(value: String) -> Self {
-        Self::new(value)
-    }
+/// Normalize a model alias for catalog lookup.
+#[must_use]
+pub fn normalize_alias(value: impl AsRef<str>) -> String {
+    value.as_ref().trim().to_ascii_lowercase()
 }
 
 /// One configured model and the effort ladder it supports.
@@ -123,11 +96,11 @@ impl ModelCatalog {
         definition: impl Into<ModelDefinition>,
     ) -> Option<ModelDefinition> {
         self.models
-            .insert(Alias::new(alias.into()).0, definition.into())
+            .insert(normalize_alias(alias.into()), definition.into())
     }
 
     pub fn get(&self, alias: impl AsRef<str>) -> Option<&ModelDefinition> {
-        self.models.get(Alias::new(alias).as_str())
+        self.models.get(&normalize_alias(alias))
     }
 
     pub fn aliases(&self) -> impl Iterator<Item = &str> {
@@ -269,21 +242,18 @@ where
     E: Into<EffortInput>,
     C: Borrow<ModelCatalog>,
 {
-    let requested_alias = Alias::new(alias);
-    let canonical_alias = if requested_alias.as_str() == "deepseek" {
-        Alias::new("flash")
+    let requested_alias = normalize_alias(alias);
+    let canonical_alias = if requested_alias == "deepseek" {
+        "flash".to_owned()
     } else {
         requested_alias
     };
     let catalog = catalog.borrow();
 
-    // Alias validation intentionally precedes every effort validation.
-    let definition = catalog.get(canonical_alias.as_str()).ok_or_else(|| {
+    // Model-name validation intentionally precedes every effort validation.
+    let definition = catalog.get(&canonical_alias).ok_or_else(|| {
         OcaError::new(ErrorCode::AliasUnknown)
-            .with_error(format!(
-                "unknown model alias `{}`",
-                canonical_alias.as_str()
-            ))
+            .with_error(format!("unknown model alias `{}`", canonical_alias))
             .with_help("choose one of the configured model aliases")
     })?;
 
@@ -294,13 +264,13 @@ where
         OcaError::new(ErrorCode::EffortUnsupported)
             .with_error(format!(
                 "effort `{requested_effort}` is unsupported for `{}`; available ladder: {ladder}",
-                canonical_alias.as_str()
+                canonical_alias
             ))
             .with_help(format!("use one of the available efforts: {ladder}"))
     })?;
 
     Ok(ResolvedModel {
-        alias: canonical_alias.0,
+        alias: canonical_alias,
         provider: definition.provider.clone(),
         model: definition.model.clone(),
         effort: requested_effort.to_string(),
