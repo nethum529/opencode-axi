@@ -8,8 +8,8 @@ pub use error::{
     exit, parse_error_envelope, validate_error_envelope,
 };
 pub use resolver::{
-    Alias, Catalog, Effort, EffortInput, ModelCatalog, ModelDefinition, ModelEntry, ModelSpec,
-    ResolvedModel, resolve_model,
+    Catalog, Effort, EffortInput, ModelCatalog, ModelDefinition, ModelEntry, ModelSpec,
+    ResolvedModel, normalize_alias, resolve_model,
 };
 
 /// A canonical short reference used by oca state and worktree operations.
