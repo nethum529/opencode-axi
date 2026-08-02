@@ -110,13 +110,13 @@ mod tests {
             resolve_model("missing", None::<&str>, &catalog)
                 .expect_err("unknown alias must win")
                 .code(),
-            "alias_unknown"
+            "invalid_model"
         );
         assert_eq!(
             resolve_model("opus", None::<&str>, &catalog)
                 .expect_err("effort is mandatory")
                 .code(),
-            "effort_missing"
+            "effort_required"
         );
         assert_eq!(
             resolve_model(

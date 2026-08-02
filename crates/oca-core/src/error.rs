@@ -48,20 +48,26 @@ pub enum ErrorCode {
     EffortConflict,
     EffortUnsupported,
     UnknownRef,
+    SessionNotFound,
     WorkerBusy,
     ServerUnavailable,
+    ServerStartTimeout,
     ServerUnreachable,
     ProtocolMismatch,
     RateLimited,
     ContractInvalid,
     WorktreeConflict,
+    WorktreeDirty,
     WorktreeEmpty,
+    OutOfScope,
     ZeroByteOutput,
+    PromptUncertain,
     PublishDisabled,
     ProtectedBranch,
     PublishRemoteMissing,
     PublishFailed,
     EventsCorrupt,
+    FollowTimeout,
     Interrupted,
 }
 
@@ -76,20 +82,26 @@ impl ErrorCode {
             Self::EffortConflict,
             Self::EffortUnsupported,
             Self::UnknownRef,
+            Self::SessionNotFound,
             Self::WorkerBusy,
             Self::ServerUnavailable,
+            Self::ServerStartTimeout,
             Self::ServerUnreachable,
             Self::ProtocolMismatch,
             Self::RateLimited,
             Self::ContractInvalid,
             Self::WorktreeConflict,
+            Self::WorktreeDirty,
             Self::WorktreeEmpty,
+            Self::OutOfScope,
             Self::ZeroByteOutput,
+            Self::PromptUncertain,
             Self::PublishDisabled,
             Self::ProtectedBranch,
             Self::PublishRemoteMissing,
             Self::PublishFailed,
             Self::EventsCorrupt,
+            Self::FollowTimeout,
             Self::Interrupted,
         ]
     }
@@ -97,26 +109,32 @@ impl ErrorCode {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Usage => "usage",
-            Self::AliasUnknown => "alias_unknown",
-            Self::EffortMissing => "effort_missing",
+            Self::Usage => "invalid_usage",
+            Self::AliasUnknown => "invalid_model",
+            Self::EffortMissing => "effort_required",
             Self::EffortConflict => "effort_conflict",
             Self::EffortUnsupported => "effort_unsupported",
-            Self::UnknownRef => "unknown_ref",
+            Self::UnknownRef => "ref_not_found",
+            Self::SessionNotFound => "session_not_found",
             Self::WorkerBusy => "worker_busy",
             Self::ServerUnavailable => "server_unavailable",
+            Self::ServerStartTimeout => "server_start_timeout",
             Self::ServerUnreachable => "server_unreachable",
             Self::ProtocolMismatch => "protocol_mismatch",
             Self::RateLimited => "rate_limited",
             Self::ContractInvalid => "contract_invalid",
             Self::WorktreeConflict => "worktree_conflict",
+            Self::WorktreeDirty => "worktree_dirty",
             Self::WorktreeEmpty => "worktree_empty",
+            Self::OutOfScope => "out_of_scope",
             Self::ZeroByteOutput => "zero_byte_output",
+            Self::PromptUncertain => "prompt_uncertain",
             Self::PublishDisabled => "publish_disabled",
-            Self::ProtectedBranch => "protected_branch",
+            Self::ProtectedBranch => "publish_branch_forbidden",
             Self::PublishRemoteMissing => "publish_remote_missing",
             Self::PublishFailed => "publish_failed",
             Self::EventsCorrupt => "events_corrupt",
+            Self::FollowTimeout => "follow_timeout",
             Self::Interrupted => "interrupted",
         }
     }
@@ -124,26 +142,32 @@ impl ErrorCode {
     #[must_use]
     pub fn from_code(code: &str) -> Option<Self> {
         match code {
-            "usage" => Some(Self::Usage),
-            "alias_unknown" | "unknown_alias" => Some(Self::AliasUnknown),
-            "effort_missing" | "missing_effort" => Some(Self::EffortMissing),
+            "invalid_usage" => Some(Self::Usage),
+            "invalid_model" => Some(Self::AliasUnknown),
+            "effort_required" => Some(Self::EffortMissing),
             "effort_conflict" => Some(Self::EffortConflict),
             "effort_unsupported" => Some(Self::EffortUnsupported),
-            "unknown_ref" => Some(Self::UnknownRef),
+            "ref_not_found" => Some(Self::UnknownRef),
+            "session_not_found" => Some(Self::SessionNotFound),
             "worker_busy" => Some(Self::WorkerBusy),
             "server_unavailable" => Some(Self::ServerUnavailable),
+            "server_start_timeout" => Some(Self::ServerStartTimeout),
             "server_unreachable" => Some(Self::ServerUnreachable),
             "protocol_mismatch" => Some(Self::ProtocolMismatch),
             "rate_limited" => Some(Self::RateLimited),
             "contract_invalid" => Some(Self::ContractInvalid),
             "worktree_conflict" => Some(Self::WorktreeConflict),
+            "worktree_dirty" => Some(Self::WorktreeDirty),
             "worktree_empty" => Some(Self::WorktreeEmpty),
+            "out_of_scope" => Some(Self::OutOfScope),
             "zero_byte_output" => Some(Self::ZeroByteOutput),
+            "prompt_uncertain" => Some(Self::PromptUncertain),
             "publish_disabled" => Some(Self::PublishDisabled),
-            "protected_branch" => Some(Self::ProtectedBranch),
+            "publish_branch_forbidden" => Some(Self::ProtectedBranch),
             "publish_remote_missing" => Some(Self::PublishRemoteMissing),
             "publish_failed" => Some(Self::PublishFailed),
             "events_corrupt" => Some(Self::EventsCorrupt),
+            "follow_timeout" => Some(Self::FollowTimeout),
             "interrupted" => Some(Self::Interrupted),
             _ => None,
         }
@@ -158,20 +182,26 @@ impl ErrorCode {
             Self::EffortConflict => "Conflicting effort values",
             Self::EffortUnsupported => "Unsupported effort",
             Self::UnknownRef => "Unknown ref",
+            Self::SessionNotFound => "Session not found",
             Self::WorkerBusy => "Worker is busy",
             Self::ServerUnavailable => "Server unavailable",
+            Self::ServerStartTimeout => "Server start timed out",
             Self::ServerUnreachable => "Server unreachable",
             Self::ProtocolMismatch => "Protocol mismatch",
             Self::RateLimited => "Rate limited",
             Self::ContractInvalid => "Invalid worker response",
             Self::WorktreeConflict => "Worktree conflict",
+            Self::WorktreeDirty => "Worktree is dirty",
             Self::WorktreeEmpty => "Worktree is empty",
+            Self::OutOfScope => "Operation is out of scope",
             Self::ZeroByteOutput => "Zero-byte output",
+            Self::PromptUncertain => "Prompt is uncertain",
             Self::PublishDisabled => "Publishing is disabled",
             Self::ProtectedBranch => "Protected branch",
             Self::PublishRemoteMissing => "Publish remote is missing",
             Self::PublishFailed => "Publish failed",
             Self::EventsCorrupt => "Event journal is corrupt",
+            Self::FollowTimeout => "Follow timed out",
             Self::Interrupted => "Interrupted",
         }
     }
@@ -185,20 +215,26 @@ impl ErrorCode {
             Self::EffortConflict => "Specify effort only once",
             Self::EffortUnsupported => "Choose an effort supported by this alias",
             Self::UnknownRef => "Run `oca ls` to list refs",
+            Self::SessionNotFound => "Start a new session or verify the ref",
             Self::WorkerBusy => "Use `oca q <ref>` to queue a message",
             Self::ServerUnavailable => "Start `opencode serve` and retry",
+            Self::ServerStartTimeout => "Check the OpenCode server and retry",
             Self::ServerUnreachable => "Check the OpenCode server and retry",
             Self::ProtocolMismatch => "Check the OpenCode version and retry",
             Self::RateLimited => "Wait before retrying",
             Self::ContractInvalid => "Review the worker response and retry",
             Self::WorktreeConflict => "Choose another ref or remove the conflicting worktree",
+            Self::WorktreeDirty => "Commit, stash, or discard changes before continuing",
             Self::WorktreeEmpty => "Make a non-empty change before committing",
+            Self::OutOfScope => "Choose a ref within this worktree",
             Self::ZeroByteOutput => "Write content to every output file",
+            Self::PromptUncertain => "Clarify the prompt and retry",
             Self::PublishDisabled => "[publish] push = true",
             Self::ProtectedBranch => "Publish from a non-protected branch",
             Self::PublishRemoteMissing => "Configure a publish remote and retry",
             Self::PublishFailed => "Inspect the remote error and retry",
             Self::EventsCorrupt => "Remove the corrupt journal after preserving its contents",
+            Self::FollowTimeout => "Retry the follow command",
             Self::Interrupted => "Retry the command if it was not completed",
         }
     }
@@ -211,22 +247,28 @@ impl ErrorCode {
             | Self::EffortMissing
             | Self::EffortConflict
             | Self::EffortUnsupported => exit::USAGE,
-            Self::ServerUnavailable | Self::ServerUnreachable | Self::RateLimited => {
+            Self::ServerUnavailable | Self::ServerStartTimeout | Self::ServerUnreachable => {
                 exit::SERVER_UNREACHABLE
             }
             Self::Interrupted => exit::INTERRUPTED,
             Self::UnknownRef
+            | Self::SessionNotFound
             | Self::WorkerBusy
+            | Self::RateLimited
             | Self::ProtocolMismatch
             | Self::ContractInvalid
             | Self::WorktreeConflict
+            | Self::WorktreeDirty
             | Self::WorktreeEmpty
+            | Self::OutOfScope
             | Self::ZeroByteOutput
+            | Self::PromptUncertain
             | Self::PublishDisabled
-            | Self::ProtectedBranch
             | Self::PublishRemoteMissing
             | Self::PublishFailed
             | Self::EventsCorrupt => exit::FAILURE,
+            Self::FollowTimeout => exit::FAILURE,
+            Self::ProtectedBranch => exit::USAGE,
         }
     }
 }
@@ -582,19 +624,19 @@ mod tests {
     fn every_code_has_a_golden_envelope_and_frozen_exit_code() {
         let expected = [
             (
-                "usage",
+                "invalid_usage",
                 "Invalid command usage",
                 "Run `oca --help` for usage",
                 2,
             ),
             (
-                "alias_unknown",
+                "invalid_model",
                 "Unknown model alias",
                 "Use a configured model alias",
                 2,
             ),
             (
-                "effort_missing",
+                "effort_required",
                 "Missing effort",
                 "Specify an effort after the alias",
                 2,
@@ -611,7 +653,18 @@ mod tests {
                 "Choose an effort supported by this alias",
                 2,
             ),
-            ("unknown_ref", "Unknown ref", "Run `oca ls` to list refs", 1),
+            (
+                "ref_not_found",
+                "Unknown ref",
+                "Run `oca ls` to list refs",
+                1,
+            ),
+            (
+                "session_not_found",
+                "Session not found",
+                "Start a new session or verify the ref",
+                1,
+            ),
             (
                 "worker_busy",
                 "Worker is busy",
@@ -622,6 +675,12 @@ mod tests {
                 "server_unavailable",
                 "Server unavailable",
                 "Start `opencode serve` and retry",
+                5,
+            ),
+            (
+                "server_start_timeout",
+                "Server start timed out",
+                "Check the OpenCode server and retry",
                 5,
             ),
             (
@@ -636,7 +695,7 @@ mod tests {
                 "Check the OpenCode version and retry",
                 1,
             ),
-            ("rate_limited", "Rate limited", "Wait before retrying", 5),
+            ("rate_limited", "Rate limited", "Wait before retrying", 1),
             (
                 "contract_invalid",
                 "Invalid worker response",
@@ -650,9 +709,21 @@ mod tests {
                 1,
             ),
             (
+                "worktree_dirty",
+                "Worktree is dirty",
+                "Commit, stash, or discard changes before continuing",
+                1,
+            ),
+            (
                 "worktree_empty",
                 "Worktree is empty",
                 "Make a non-empty change before committing",
+                1,
+            ),
+            (
+                "out_of_scope",
+                "Operation is out of scope",
+                "Choose a ref within this worktree",
                 1,
             ),
             (
@@ -662,16 +733,22 @@ mod tests {
                 1,
             ),
             (
+                "prompt_uncertain",
+                "Prompt is uncertain",
+                "Clarify the prompt and retry",
+                1,
+            ),
+            (
                 "publish_disabled",
                 "Publishing is disabled",
                 "[publish] push = true",
                 1,
             ),
             (
-                "protected_branch",
+                "publish_branch_forbidden",
                 "Protected branch",
                 "Publish from a non-protected branch",
-                1,
+                2,
             ),
             (
                 "publish_remote_missing",
@@ -689,6 +766,12 @@ mod tests {
                 "events_corrupt",
                 "Event journal is corrupt",
                 "Remove the corrupt journal after preserving its contents",
+                1,
+            ),
+            (
+                "follow_timeout",
+                "Follow timed out",
+                "Retry the follow command",
                 1,
             ),
             (
@@ -778,6 +861,7 @@ mod tests {
             assert!(matches!(exit_code, 0 | 1 | 2 | 5 | 130));
             assert!(!matches!(exit_code, 3 | 4));
         }
+        assert_eq!(ErrorCode::FollowTimeout.exit_code(), 1);
         assert_eq!(FollowExit::Blocked.code(), 3);
         assert_eq!(FollowExit::Timeout.code(), 4);
     }
@@ -789,7 +873,7 @@ mod tests {
 
         assert_eq!(
             captured_output.as_bytes(),
-            b"error: Unknown ref\ncode: unknown_ref\nhelp: Run `oca ls` to list refs\nref: wabc12\n"
+            b"error: Unknown ref\ncode: ref_not_found\nhelp: Run `oca ls` to list refs\nref: wabc12\n"
         );
         assert_eq!(captured_output.matches("error:").count(), 1);
         assert_eq!(captured_output.lines().count(), 4);

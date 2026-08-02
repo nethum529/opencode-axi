@@ -4,7 +4,7 @@
 //! transcribed from the frozen spec, so a drift between `oca-core` and the spec
 //! fails here rather than at release.
 
-use oca_core::{ErrorCode, ModelCatalog, resolve_model};
+use oca_core::{ErrorCode, FollowExit, ModelCatalog, OcaError, resolve_model};
 
 /// spec-data-state.md section 3, "Ladders": alias, provider, model, accepted efforts.
 const SPEC_LADDERS: [(&str, &str, &str, &[&str]); 4] = [
@@ -37,7 +37,7 @@ const SPEC_LADDERS: [(&str, &str, &str, &[&str]); 4] = [
 /// spec-cli-surface.md, "Codes": code identifier and its frozen exit number.
 /// `herdr_unavailable` is omitted: it carries no exit number because it never
 /// fails a dispatch.
-const SPEC_CODES: [(&str, i32); 23] = [
+const SPEC_CODES: [(&str, i32); 27] = [
     ("effort_required", 2),
     ("effort_unsupported", 2),
     ("effort_conflict", 2),
@@ -48,6 +48,7 @@ const SPEC_CODES: [(&str, i32); 23] = [
     ("worker_busy", 1),
     ("server_unavailable", 5),
     ("server_start_timeout", 5),
+    ("server_unreachable", 5),
     ("rate_limited", 1),
     ("protocol_mismatch", 1),
     ("contract_invalid", 1),
@@ -59,8 +60,11 @@ const SPEC_CODES: [(&str, i32); 23] = [
     ("prompt_uncertain", 1),
     ("publish_disabled", 1),
     ("publish_branch_forbidden", 2),
+    ("publish_remote_missing", 1),
+    ("publish_failed", 1),
     ("events_corrupt", 1),
-    ("follow_timeout", 4),
+    ("follow_timeout", 1),
+    ("interrupted", 130),
 ];
 
 /// T04 (#4), criterion 1: the effort matrix resolves against the four aliases
@@ -144,4 +148,102 @@ fn every_error_code_round_trips_through_its_wire_string() {
     }
     assert_eq!(ErrorCode::from_code("not_a_code"), None);
     assert_eq!(ErrorCode::from_code(""), None);
+}
+
+/// T07 (#7), criterion 1: additions to the code table are real serializable
+/// errors, not unimplemented strings in a registry.
+#[test]
+fn error_catalogue_includes_previously_absent_contract_codes() {
+    for wire_code in [
+        "session_not_found",
+        "server_start_timeout",
+        "worktree_dirty",
+        "out_of_scope",
+        "prompt_uncertain",
+        "follow_timeout",
+    ] {
+        let error_code = ErrorCode::from_code(wire_code)
+            .unwrap_or_else(|| panic!("{wire_code} must be a catalogue entry"));
+        let error = OcaError::new(error_code);
+        assert_eq!(error.code(), wire_code);
+        assert_eq!(ErrorCode::from_code(error.code()), Some(error_code));
+        assert!(oca_core::parse_error_envelope(&error.to_json()).is_ok());
+    }
+}
+
+/// T07 (#7), criterion 2: the public code catalogue and the canonical table
+/// have the same members, including codes which are not emitted by every CLI.
+#[test]
+fn canonical_error_contract_has_no_missing_or_extra_codes() {
+    for required in [
+        ("server_unreachable", 5),
+        ("publish_remote_missing", 1),
+        ("publish_failed", 1),
+        ("interrupted", 130),
+    ] {
+        assert!(SPEC_CODES.contains(&required), "missing {required:?}");
+    }
+
+    let canonical: Vec<&str> = SPEC_CODES.iter().map(|(code, _)| *code).collect();
+    for code in ErrorCode::all() {
+        assert!(
+            canonical.contains(&code.as_str()),
+            "extra {}",
+            code.as_str()
+        );
+    }
+}
+
+/// T07 (#7), criterion 3: renamed wire strings are a deliberate breaking
+/// change, so parsers only accept their canonical replacements.
+#[test]
+fn breaking_wire_string_renames_are_one_way() {
+    for (error_code, wire_code) in [
+        (ErrorCode::Usage, "invalid_usage"),
+        (ErrorCode::AliasUnknown, "invalid_model"),
+        (ErrorCode::EffortMissing, "effort_required"),
+        (ErrorCode::UnknownRef, "ref_not_found"),
+        (ErrorCode::ProtectedBranch, "publish_branch_forbidden"),
+    ] {
+        assert_eq!(OcaError::new(error_code).code(), wire_code);
+        assert_eq!(ErrorCode::from_code(wire_code), Some(error_code));
+    }
+
+    for retired in [
+        "usage",
+        "alias_unknown",
+        "effort_missing",
+        "unknown_ref",
+        "protected_branch",
+    ] {
+        assert_eq!(ErrorCode::from_code(retired), None, "{retired} is retired");
+    }
+}
+
+/// T07 (#7), criterion 4: error outcomes use general failure unless they are
+/// specifically a usage error, a server reachability error, or interruption.
+#[test]
+fn error_exit_statuses_match_the_contract() {
+    assert_eq!(ErrorCode::RateLimited.exit_code(), 1);
+    assert_eq!(ErrorCode::ProtectedBranch.exit_code(), 2);
+
+    for (wire_code, exit_code) in SPEC_CODES {
+        let error_code = ErrorCode::from_code(wire_code)
+            .unwrap_or_else(|| panic!("{wire_code} must be a catalogue entry"));
+        assert_eq!(error_code.exit_code(), exit_code, "{wire_code}");
+    }
+}
+
+/// T07 (#7), criterion 5: a timed-out follow operation reported as an error
+/// is a failure; exits 3 and 4 identify only follow command outcomes.
+#[test]
+fn follow_timeout_is_reallocated_to_failure() {
+    assert_eq!(ErrorCode::FollowTimeout.exit_code(), 1);
+    assert!(
+        ErrorCode::all()
+            .iter()
+            .all(|code| !matches!(code.exit_code(), 3 | 4))
+    );
+    assert_eq!(FollowExit::Blocked.code(), 3);
+    assert_eq!(FollowExit::Timeout.code(), 4);
 }
