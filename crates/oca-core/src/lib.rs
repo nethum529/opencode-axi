@@ -1,3 +1,5 @@
+use std::fmt;
+
 pub mod error;
 pub mod resolver;
 
@@ -10,9 +12,84 @@ pub use resolver::{
     ResolvedModel, resolve_model,
 };
 
+/// A canonical short reference used by oca state and worktree operations.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct RefId(String);
+
+impl RefId {
+    /// Creates a canonical short reference.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InvalidRefId`] when `value` is not a canonical short reference.
+    pub fn new(value: impl Into<String>) -> Result<Self, InvalidRefId> {
+        let value = value.into();
+        if value.len() != 6
+            || !value.starts_with('w')
+            || !value
+                .bytes()
+                .skip(1)
+                .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
+        {
+            return Err(InvalidRefId { value });
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the reference text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for RefId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// A value that does not satisfy oca's canonical short-reference format.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InvalidRefId {
+    value: String,
+}
+
+impl InvalidRefId {
+    /// Returns the rejected reference text.
+    #[must_use]
+    pub fn value(&self) -> &str {
+        &self.value
+    }
+}
+
+impl fmt::Display for InvalidRefId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "invalid oca reference: {}", self.value)
+    }
+}
+
+impl std::error::Error for InvalidRefId {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ref_id_accepts_canonical_values() {
+        for value in ["w00000", "w4f2a1", "wzzzzz"] {
+            assert!(RefId::new(value).is_ok(), "{value} should be accepted");
+        }
+    }
+
+    #[test]
+    fn ref_id_rejects_noncanonical_values() {
+        for value in [
+            "x4f2a1", "w4f2a", "w4f2a10", "w4F2a1", "w4f-a1", "w4f_a1", "wé0000",
+        ] {
+            assert!(RefId::new(value).is_err(), "{value} should be rejected");
+        }
+    }
 
     #[test]
     fn default_catalog_exposes_four_aliases_and_flash_synonym() {

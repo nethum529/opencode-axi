@@ -1,3 +1,4 @@
+use oca_core::RefId as CanonicalRef;
 use std::{
     ffi::OsStr,
     fmt, fs, io,
@@ -12,38 +13,37 @@ const LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
 type AfterScanHook = dyn Fn(&Path) + Send + Sync;
 
 /// A validated identifier used to name an oca branch and worktree.
+///
+/// Validation is owned by `oca-core`; this wrapper preserves the git crate's
+/// established error type while exposing the shared reference contract to
+/// worktree operations.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct RefId(String);
+pub struct RefId(CanonicalRef);
 
 impl RefId {
     /// Creates a reference identifier that is safe to use in oca-owned paths.
     ///
     /// # Errors
     ///
-    /// Returns [`GitError::InvalidRef`] when the identifier is empty or contains
-    /// characters that are unsafe in an oca-owned path.
+    /// Returns [`GitError::InvalidRef`] when the identifier is not `w` followed
+    /// by exactly five lowercase ASCII base-36 digits.
     pub fn new(value: impl Into<String>) -> Result<Self, GitError> {
         let value = value.into();
-        if value.is_empty()
-            || !value
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
-        {
-            return Err(GitError::InvalidRef { value });
-        }
-        Ok(Self(value))
+        CanonicalRef::new(&value)
+            .map(Self)
+            .map_err(|_| GitError::InvalidRef { value })
     }
 
     /// Returns the identifier text.
     #[must_use]
     pub fn as_str(&self) -> &str {
-        &self.0
+        self.0.as_str()
     }
 }
 
 impl fmt::Display for RefId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        self.0.fmt(formatter)
     }
 }
 

@@ -17,6 +17,7 @@ use std::{
 };
 
 use fs2::FileExt;
+use oca_core::RefId;
 use serde::{Deserialize, Serialize};
 
 const REF_ID_WIDTH: usize = 5;
@@ -275,7 +276,7 @@ impl RefStore {
             let occupied: HashSet<_> = records.iter().map(|record| record.id.as_str()).collect();
             let id = loop {
                 let candidate = self.id_source.next_id();
-                if is_ref_id(&candidate) && !occupied.contains(candidate.as_str()) {
+                if RefId::new(&candidate).is_ok() && !occupied.contains(candidate.as_str()) {
                     break candidate;
                 }
             };
@@ -342,7 +343,7 @@ impl RefStore {
     ///
     /// Returns an error for invalid or existing IDs, or if persistence fails.
     pub fn insert(&self, record: RefRecord) -> Result<(), RefStoreError> {
-        if !is_ref_id(&record.id) {
+        if RefId::new(&record.id).is_err() {
             return Err(RefStoreError::InvalidRefId(record.id));
         }
         self.with_locked_records(|records| {
@@ -532,15 +533,6 @@ impl RefStore {
     }
 }
 
-fn is_ref_id(id: &str) -> bool {
-    id.len() == REF_ID_WIDTH + 1
-        && id.starts_with('w')
-        && id
-            .bytes()
-            .skip(1)
-            .all(|byte| byte.is_ascii_digit() || byte.is_ascii_lowercase())
-}
-
 fn encode_base36(mut value: u64) -> String {
     let mut digits = [b'0'; REF_ID_WIDTH];
     for digit in digits.iter_mut().rev() {
@@ -656,6 +648,22 @@ mod tests {
     }
 
     #[test]
+    fn allocate_skips_noncanonical_candidates() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = RefStorePaths::in_directory(directory.path());
+        let store = RefStore::with_id_source(
+            paths,
+            Arc::new(SequenceIdSource::new(&[
+                "x4f2a1", "w4f2a", "w4f2a10", "w4F2a1", "w4f-a1", "w4f_a1", "wé0000", "w4f2a1",
+            ])),
+        );
+
+        let allocated = store.allocate(NewRef::for_session("session-one")).unwrap();
+
+        assert_eq!(allocated.id, "w4f2a1");
+    }
+
+    #[test]
     fn ref_id_suffix_is_zero_padded_base36() {
         assert_eq!(super::encode_base36(35), "0000z");
         assert_eq!(super::encode_base36(60_466_175), "zzzzz");
@@ -752,6 +760,29 @@ mod tests {
             store.insert(RefRecord { id: "w0a1b2".to_string(), session_id: "new-session".to_string(), repo: None, spawner_tag: None, tombstoned: false }),
             Err(RefStoreError::RefAlreadyExists(id)) if id == "w0a1b2"
         ));
+    }
+
+    #[test]
+    fn insert_rejects_noncanonical_ids() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RefStore::with_paths(RefStorePaths::in_directory(directory.path()));
+
+        for value in [
+            "x4f2a1", "w4f2a", "w4f2a10", "w4F2a1", "w4f-a1", "w4f_a1", "wé0000",
+        ] {
+            let result = store.insert(RefRecord {
+                id: value.to_string(),
+                session_id: "session-one".to_string(),
+                repo: None,
+                spawner_tag: None,
+                tombstoned: false,
+            });
+
+            assert!(
+                matches!(result, Err(RefStoreError::InvalidRefId(id)) if id == value),
+                "{value} should be rejected"
+            );
+        }
     }
 
     #[test]

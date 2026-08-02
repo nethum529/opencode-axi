@@ -765,6 +765,9 @@ dependencies = [
 [[package]]
 name = "oca-git"
 version = "0.1.0"
+dependencies = [
+ "oca-core",
+]
 
 [[package]]
 name = "oca-opencode"
@@ -805,6 +808,7 @@ name = "oca-state"
 version = "0.1.0"
 dependencies = [
  "fs2",
+ "oca-core",
  "serde",
  "serde_json",
  "tempfile",

@@ -6,3 +6,4 @@ rust-version.workspace = true
 
 [dependencies]
 # No external dependency identified yet: git is invoked as a subprocess, not linked.
+oca-core = { path = "../oca-core" }
