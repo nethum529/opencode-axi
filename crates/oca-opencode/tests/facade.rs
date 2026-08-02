@@ -108,6 +108,17 @@ fn read_request(stream: &mut TcpStream) -> String {
     String::from_utf8(request).expect("request is utf-8")
 }
 
+#[test]
+fn session_operations_accept_string_slices() {
+    let client = OpenCodeClient::new("http://localhost".parse().expect("valid URL"));
+    let session: &str = "ses_target";
+
+    std::mem::drop(client.prompt_async(session, prompt_request()));
+    std::mem::drop(client.queue(session, prompt_request()));
+    std::mem::drop(client.abort(session));
+    std::mem::drop(client.messages(session));
+}
+
 #[tokio::test]
 async fn prompt_async_sends_the_native_variant_to_the_pinned_operation() {
     let server = FakeServer::once(response("204 No Content", "text/plain", ""));
