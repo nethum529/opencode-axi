@@ -27,7 +27,7 @@ fn schema_and_validator_reject_contract_violations() {
     for missing_field in ["error", "code", "help"] {
         let mut error = json!({
             "error": "Unknown ref",
-            "code": "unknown_ref",
+            "code": "ref_not_found",
             "help": "Run `oca ls` to list refs"
         });
         error
