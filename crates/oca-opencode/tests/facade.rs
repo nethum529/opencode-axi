@@ -107,13 +107,24 @@ fn read_request(stream: &mut TcpStream) -> String {
     String::from_utf8(request).expect("request is utf-8")
 }
 
+#[test]
+fn session_operations_accept_string_slices() {
+    let client = OpenCodeClient::new("http://localhost".parse().expect("valid URL"));
+    let session: &str = "ses_target";
+
+    std::mem::drop(client.prompt_async(session, prompt_request()));
+    std::mem::drop(client.queue(session, prompt_request()));
+    std::mem::drop(client.abort(session));
+    std::mem::drop(client.messages(session));
+}
+
 #[tokio::test]
 async fn prompt_async_sends_the_native_variant_to_the_pinned_operation() {
     let server = FakeServer::once(response("204 No Content", "text/plain", ""));
     let client = OpenCodeClient::new(server.base_url.parse().expect("valid URL"));
 
     client
-        .prompt_async(&"ses_target".to_owned(), prompt_request())
+        .prompt_async("ses_target", prompt_request())
         .await
         .expect("prompt is accepted");
 
@@ -142,7 +153,7 @@ async fn prompt_async_wraps_an_output_schema_in_the_pinned_format_envelope() {
     prompt.output_schema = Some(schema.clone());
 
     client
-        .prompt_async(&"ses_target".to_owned(), prompt)
+        .prompt_async("ses_target", prompt)
         .await
         .expect("prompt is accepted");
 
@@ -170,7 +181,7 @@ async fn queue_uses_the_legacy_prompt_async_operation_with_the_native_variant() 
     let client = OpenCodeClient::new(server.base_url.parse().expect("valid URL"));
 
     client
-        .queue(&"ses_target".to_owned(), prompt_request())
+        .queue("ses_target", prompt_request())
         .await
         .expect("queued prompt is accepted");
 
@@ -184,10 +195,7 @@ async fn abort_sends_the_pinned_operation_shape() {
     let server = FakeServer::once(response("200 OK", "application/json", "true"));
     let client = OpenCodeClient::new(server.base_url.parse().expect("valid URL"));
 
-    let accepted = client
-        .abort(&"ses_target".to_owned())
-        .await
-        .expect("abort is accepted");
+    let accepted = client.abort("ses_target").await.expect("abort is accepted");
 
     assert!(accepted.aborted);
     let request = server.finish();
@@ -205,7 +213,7 @@ async fn messages_sends_the_pinned_operation_shape() {
     let client = OpenCodeClient::new(server.base_url.parse().expect("valid URL"));
 
     let messages = client
-        .messages(&"ses_target".to_owned())
+        .messages("ses_target")
         .await
         .expect("messages are returned");
 
@@ -245,9 +253,7 @@ async fn remaining_facade_methods_map_malformed_envelopes_to_protocol_mismatch()
     let server = FakeServer::once(response("200 OK", "application/json", "{}"));
     let client = OpenCodeClient::new(server.base_url.parse().expect("valid URL"));
     assert!(matches!(
-        client
-            .prompt_async(&"ses_target".to_owned(), prompt_request())
-            .await,
+        client.prompt_async("ses_target", prompt_request()).await,
         Err(OpenCodeError::ProtocolMismatch { .. })
     ));
     let _ = server.finish();
@@ -255,9 +261,7 @@ async fn remaining_facade_methods_map_malformed_envelopes_to_protocol_mismatch()
     let server = FakeServer::once(response("200 OK", "application/json", "{}"));
     let client = OpenCodeClient::new(server.base_url.parse().expect("valid URL"));
     assert!(matches!(
-        client
-            .queue(&"ses_target".to_owned(), prompt_request())
-            .await,
+        client.queue("ses_target", prompt_request()).await,
         Err(OpenCodeError::ProtocolMismatch { .. })
     ));
     let _ = server.finish();
@@ -265,7 +269,7 @@ async fn remaining_facade_methods_map_malformed_envelopes_to_protocol_mismatch()
     let server = FakeServer::once(response("200 OK", "application/json", "{}"));
     let client = OpenCodeClient::new(server.base_url.parse().expect("valid URL"));
     assert!(matches!(
-        client.abort(&"ses_target".to_owned()).await,
+        client.abort("ses_target").await,
         Err(OpenCodeError::ProtocolMismatch { .. })
     ));
     let _ = server.finish();
@@ -273,7 +277,7 @@ async fn remaining_facade_methods_map_malformed_envelopes_to_protocol_mismatch()
     let server = FakeServer::once(response("200 OK", "application/json", "[{}]"));
     let client = OpenCodeClient::new(server.base_url.parse().expect("valid URL"));
     assert!(matches!(
-        client.messages(&"ses_target".to_owned()).await,
+        client.messages("ses_target").await,
         Err(OpenCodeError::ProtocolMismatch { .. })
     ));
     let _ = server.finish();
