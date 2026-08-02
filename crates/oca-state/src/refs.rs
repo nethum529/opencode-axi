@@ -10,7 +10,7 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicU64, Ordering},
     },
     time::{SystemTime, UNIX_EPOCH},
@@ -19,6 +19,9 @@ use std::{
 use fs2::FileExt;
 use oca_core::RefId;
 use serde::{Deserialize, Serialize};
+
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const REF_ID_WIDTH: usize = 5;
 const REF_ID_SPACE: u64 = 60_466_176;
@@ -127,7 +130,6 @@ impl NewRef {
 pub struct RefStorePaths {
     pub refs_file: PathBuf,
     pub lock_file: PathBuf,
-    pub corrupt_directory: PathBuf,
 }
 
 impl RefStorePaths {
@@ -137,7 +139,6 @@ impl RefStorePaths {
         Self {
             refs_file: directory.join("refs.json"),
             lock_file: directory.join("refs.lock"),
-            corrupt_directory: directory.join("corrupt"),
         }
     }
 
@@ -204,7 +205,6 @@ pub struct RefStore {
     paths: RefStorePaths,
     id_source: Arc<dyn RefIdSource>,
     atomic_write_hook: Arc<dyn AtomicWriteHook>,
-    corruption_notice: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl fmt::Debug for RefStore {
@@ -237,7 +237,6 @@ impl RefStore {
             paths,
             id_source,
             atomic_write_hook,
-            corruption_notice: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -253,16 +252,6 @@ impl RefStore {
     #[must_use]
     pub fn paths(&self) -> &RefStorePaths {
         &self.paths
-    }
-
-    /// Returns the quarantined path once, so the command layer can report it
-    /// to stderr without making state persistence responsible for terminal IO.
-    #[must_use]
-    pub fn take_corruption_notice(&self) -> Option<PathBuf> {
-        self.corruption_notice
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .take()
     }
 
     /// Allocates an unused ref ID while retaining the advisory lock through the
@@ -404,16 +393,23 @@ impl RefStore {
             path: parent.to_path_buf(),
             source,
         })?;
-        let lock = OpenOptions::new()
+        secure_path(parent, 0o700)?;
+        let mut lock_options = OpenOptions::new();
+        lock_options
             .read(true)
             .write(true)
             .create(true)
-            .truncate(false)
-            .open(&self.paths.lock_file)
-            .map_err(|source| RefStoreError::Io {
-                path: self.paths.lock_file.clone(),
-                source,
-            })?;
+            .truncate(false);
+        #[cfg(unix)]
+        lock_options.mode(0o600);
+        let lock =
+            lock_options
+                .open(&self.paths.lock_file)
+                .map_err(|source| RefStoreError::Io {
+                    path: self.paths.lock_file.clone(),
+                    source,
+                })?;
+        secure_path(&self.paths.lock_file, 0o600)?;
         lock.lock_exclusive().map_err(|source| RefStoreError::Io {
             path: self.paths.lock_file.clone(),
             source,
@@ -441,20 +437,11 @@ impl RefStore {
     fn read_records(&self) -> Result<Vec<RefRecord>, RefStoreError> {
         match fs::read(&self.paths.refs_file) {
             Ok(bytes) => {
-                if let Ok(records) = serde_json::from_slice(&bytes) {
-                    Ok(records)
-                } else {
-                    let quarantine = self.quarantine_corrupt_file()?;
-                    self.write_records_atomically(&[])?;
-                    let mut notice = self
-                        .corruption_notice
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    if notice.is_none() {
-                        *notice = Some(quarantine);
-                    }
-                    Ok(Vec::new())
-                }
+                secure_path(&self.paths.refs_file, 0o600)?;
+                serde_json::from_slice(&bytes).map_err(|source| RefStoreError::Deserialize {
+                    path: self.paths.refs_file.clone(),
+                    source,
+                })
             }
             Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
             Err(source) => Err(RefStoreError::Io {
@@ -462,27 +449,6 @@ impl RefStore {
                 source,
             }),
         }
-    }
-
-    fn quarantine_corrupt_file(&self) -> Result<PathBuf, RefStoreError> {
-        fs::create_dir_all(&self.paths.corrupt_directory).map_err(|source| RefStoreError::Io {
-            path: self.paths.corrupt_directory.clone(),
-            source,
-        })?;
-        let milliseconds = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let quarantine = self
-            .paths
-            .corrupt_directory
-            .join(format!("refs.json.{milliseconds}"));
-        fs::rename(&self.paths.refs_file, &quarantine).map_err(|source| RefStoreError::Io {
-            path: self.paths.refs_file.clone(),
-            source,
-        })?;
-        sync_directory(&self.paths.corrupt_directory)?;
-        Ok(quarantine)
     }
 
     fn write_records_atomically(&self, records: &[RefRecord]) -> Result<(), RefStoreError> {
@@ -497,14 +463,17 @@ impl RefStore {
                 .as_nanos()
         ));
         let write_result = (|| -> Result<(), RefStoreError> {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-                .map_err(|source| RefStoreError::Io {
-                    path: temporary.clone(),
-                    source,
-                })?;
+            let mut temporary_options = OpenOptions::new();
+            temporary_options.write(true).create_new(true);
+            #[cfg(unix)]
+            temporary_options.mode(0o600);
+            let mut file =
+                temporary_options
+                    .open(&temporary)
+                    .map_err(|source| RefStoreError::Io {
+                        path: temporary.clone(),
+                        source,
+                    })?;
             file.write_all(&bytes).map_err(|source| RefStoreError::Io {
                 path: temporary.clone(),
                 source,
@@ -531,6 +500,21 @@ impl RefStore {
         }
         write_result
     }
+}
+
+fn secure_path(path: &Path, mode: u32) -> Result<(), RefStoreError> {
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(mode)).map_err(|source| {
+        RefStoreError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
+    })?;
+
+    #[cfg(not(unix))]
+    let _ = (path, mode);
+
+    Ok(())
 }
 
 fn encode_base36(mut value: u64) -> String {
@@ -566,7 +550,14 @@ pub enum RefStoreError {
     InvalidRefId(String),
     RefAlreadyExists(String),
     RefNotFound(String),
-    Io { path: PathBuf, source: io::Error },
+    Io {
+        path: PathBuf,
+        source: io::Error,
+    },
+    Deserialize {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
     Serialize(serde_json::Error),
 }
 
@@ -583,6 +574,13 @@ impl fmt::Display for RefStoreError {
             Self::RefAlreadyExists(id) => write!(formatter, "ref {id} already exists"),
             Self::RefNotFound(id) => write!(formatter, "ref {id} does not exist"),
             Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
+            Self::Deserialize { path, source } => {
+                write!(
+                    formatter,
+                    "cannot deserialize refs from {}: {source}",
+                    path.display()
+                )
+            }
             Self::Serialize(source) => write!(formatter, "cannot serialize refs: {source}"),
         }
     }
@@ -592,7 +590,7 @@ impl std::error::Error for RefStoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Io { source, .. } => Some(source),
-            Self::Serialize(source) => Some(source),
+            Self::Deserialize { source, .. } | Self::Serialize(source) => Some(source),
             Self::HomeDirectoryUnavailable
             | Self::MissingParent(_)
             | Self::InvalidRefId(_)
@@ -610,6 +608,11 @@ mod tests {
         sync::{Arc, Barrier, Mutex},
         thread,
     };
+
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::path::PathBuf;
 
     use super::{
         AtomicWriteHook, NewRef, RefIdSource, RefListFilter, RefPatch, RefRecord, RefStore,
@@ -786,25 +789,138 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_refs_are_quarantined_and_reported_once() {
+    fn malformed_refs_return_the_original_deserialize_error_without_replacing_them() {
         let directory = tempfile::tempdir().unwrap();
         let paths = RefStorePaths::in_directory(directory.path());
-        fs::write(&paths.refs_file, b"not json").unwrap();
+        let payload = b"not json";
+        fs::write(&paths.refs_file, payload).unwrap();
         let store = RefStore::with_paths(paths.clone());
 
-        assert!(store.list(&RefListFilter::default()).unwrap().is_empty());
-        let quarantine_notice = store.take_corruption_notice().unwrap();
+        let error = store.list(&RefListFilter::default()).unwrap_err();
 
-        assert!(quarantine_notice.starts_with(&paths.corrupt_directory));
-        assert!(
-            quarantine_notice
-                .file_name()
-                .unwrap()
-                .to_string_lossy()
-                .starts_with("refs.json.")
+        match error {
+            RefStoreError::Deserialize { path, source } => {
+                assert_eq!(path, paths.refs_file);
+                assert_eq!(
+                    source.to_string(),
+                    serde_json::from_slice::<Vec<RefRecord>>(payload)
+                        .unwrap_err()
+                        .to_string()
+                );
+            }
+            error => panic!("expected deserialize error, got {error:?}"),
+        }
+        assert_eq!(fs::read(&paths.refs_file).unwrap(), payload);
+        assert!(!directory.path().join("corrupt").exists());
+    }
+
+    #[test]
+    fn type_invalid_refs_return_the_original_deserialize_error_without_replacing_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = RefStorePaths::in_directory(directory.path());
+        let payload = br#"[{"id":"w00000","session_id":42}]"#;
+        fs::write(&paths.refs_file, payload).unwrap();
+        let store = RefStore::with_paths(paths.clone());
+
+        let error = store.list(&RefListFilter::default()).unwrap_err();
+
+        match error {
+            RefStoreError::Deserialize { path, source } => {
+                assert_eq!(path, paths.refs_file);
+                assert_eq!(
+                    source.to_string(),
+                    serde_json::from_slice::<Vec<RefRecord>>(payload)
+                        .unwrap_err()
+                        .to_string()
+                );
+            }
+            error => panic!("expected deserialize error, got {error:?}"),
+        }
+        assert_eq!(fs::read(&paths.refs_file).unwrap(), payload);
+        assert!(!directory.path().join("corrupt").exists());
+    }
+
+    #[cfg(unix)]
+    fn mode(path: &std::path::Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operations_secure_preexisting_refs_and_lock_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = RefStorePaths::in_directory(directory.path());
+        fs::write(&paths.refs_file, b"[]").unwrap();
+        fs::write(&paths.lock_file, b"").unwrap();
+        fs::set_permissions(&paths.refs_file, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&paths.lock_file, fs::Permissions::from_mode(0o644)).unwrap();
+
+        RefStore::with_paths(paths.clone())
+            .list(&RefListFilter::default())
+            .unwrap();
+
+        assert_eq!(mode(&paths.refs_file), 0o600);
+        assert_eq!(mode(&paths.lock_file), 0o600);
+    }
+
+    #[cfg(unix)]
+    struct CaptureTemporaryFileMode {
+        directory: PathBuf,
+        temporary_mode: Mutex<Option<u32>>,
+    }
+
+    #[cfg(unix)]
+    impl AtomicWriteHook for CaptureTemporaryFileMode {
+        fn before_rename(&self) -> io::Result<()> {
+            let temporary = fs::read_dir(&self.directory)?.find_map(|entry| {
+                let entry = entry.ok()?;
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".refs.json.")
+                    .then_some(entry.path())
+            });
+            *self.temporary_mode.lock().unwrap() = temporary.map(|path| mode(&path));
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_mutation_creates_private_store_directory_and_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_directory = directory.path().join("state");
+        let paths = RefStorePaths::in_directory(&store_directory);
+        let hook = Arc::new(CaptureTemporaryFileMode {
+            directory: store_directory.clone(),
+            temporary_mode: Mutex::new(None),
+        });
+        let store = RefStore::with_id_source_and_write_hook(
+            paths.clone(),
+            Arc::new(SequenceIdSource::new(&["w00000"])),
+            hook.clone(),
         );
-        assert_eq!(fs::read(&paths.refs_file).unwrap(), b"[]");
-        assert!(store.take_corruption_notice().is_none());
+
+        store.allocate(NewRef::for_session("session-one")).unwrap();
+
+        assert_eq!(mode(&store_directory), 0o700);
+        assert_eq!(mode(&paths.refs_file), 0o600);
+        assert_eq!(mode(&paths.lock_file), 0o600);
+        assert_eq!(*hook.temporary_mode.lock().unwrap(), Some(0o600));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operations_secure_an_existing_store_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = RefStorePaths::in_directory(directory.path());
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+
+        RefStore::with_paths(paths)
+            .list(&RefListFilter::default())
+            .unwrap();
+
+        assert_eq!(mode(directory.path()), 0o700);
     }
 
     struct FailBeforeRename;
