@@ -1,4 +1,4 @@
 error: Unknown ref
-code: unknown_ref
+code: ref_not_found
 help: Run `oca ls` to list refs
 ref: w00001
