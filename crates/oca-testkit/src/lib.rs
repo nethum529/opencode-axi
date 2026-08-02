@@ -441,61 +441,6 @@ impl fmt::Display for ReplayError {
 
 impl std::error::Error for ReplayError {}
 
-/// The upstream HTTP seam used by [`RecordingTransport`].
-pub trait HttpTransport {
-    type Error;
-
-    /// Sends one request to the real server.
-    ///
-    /// # Errors
-    ///
-    /// Returns the transport-specific error if the upstream cannot serve the request.
-    fn execute(&mut self, request: &HttpRequest) -> Result<HttpResponse, Self::Error>;
-}
-
-/// A forwarding transport that records each successful upstream exchange.
-///
-/// This is the recorder's boundary with a real local `OpenCode` server: it forwards the original
-/// request unchanged, returns the original response unchanged, and stores only a sanitized copy.
-#[derive(Debug)]
-pub struct RecordingTransport<T> {
-    upstream: T,
-    recorder: Recorder,
-}
-
-impl<T> RecordingTransport<T> {
-    #[must_use]
-    pub fn new(upstream: T) -> Self {
-        Self {
-            upstream,
-            recorder: Recorder::new(),
-        }
-    }
-
-    #[must_use]
-    pub fn into_recording(self) -> Recording {
-        self.recorder.finish()
-    }
-
-    #[must_use]
-    pub fn into_upstream(self) -> T {
-        self.upstream
-    }
-}
-
-impl<T> HttpTransport for RecordingTransport<T>
-where
-    T: HttpTransport,
-{
-    type Error = T::Error;
-
-    fn execute(&mut self, request: &HttpRequest) -> Result<HttpResponse, Self::Error> {
-        let response = self.upstream.execute(request)?;
-        self.recorder.record(request.clone(), response.clone());
-        Ok(response)
-    }
-}
-
 /// A loopback HTTP replay server backed by [`ReplayServer`].
 ///
 /// It uses HTTP chunked transfer encoding for every response. Each recorded `body_chunks` item
