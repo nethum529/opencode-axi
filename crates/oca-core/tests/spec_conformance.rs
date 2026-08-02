@@ -4,7 +4,7 @@
 //! transcribed from the frozen spec, so a drift between `oca-core` and the spec
 //! fails here rather than at release.
 
-use oca_core::{ErrorCode, ModelCatalog, resolve_model};
+use oca_core::{ErrorCode, ModelCatalog, normalize_alias, resolve_model};
 
 /// spec-data-state.md section 3, "Ladders": alias, provider, model, accepted efforts.
 const SPEC_LADDERS: [(&str, &str, &str, &[&str]); 4] = [
@@ -62,6 +62,30 @@ const SPEC_CODES: [(&str, i32); 23] = [
     ("events_corrupt", 1),
     ("follow_timeout", 4),
 ];
+
+/// FIX14c: aliases are normalized through the public function and every
+/// catalog/resolver lookup follows the same canonical form.
+#[test]
+fn aliases_are_normalized_without_a_public_wrapper_type() {
+    assert_eq!(normalize_alias("  OpUs  "), "opus");
+
+    let mut catalog = ModelCatalog::default();
+    let definition = catalog
+        .get("opus")
+        .expect("the default opus definition must exist")
+        .clone();
+    catalog.insert("  CuStOm  ", definition);
+    assert!(catalog.get("custom").is_some());
+
+    let opus = resolve_model("  OpUs  ", "high", &catalog)
+        .expect("a normalized opus alias must resolve");
+    assert_eq!(opus.alias, "opus");
+
+    let deepseek = resolve_model("  DeEpSeEk  ", "high", &catalog)
+        .expect("a normalized deepseek alias must resolve");
+    let flash = resolve_model("flash", "high", &catalog).expect("flash:high must resolve");
+    assert_eq!(deepseek, flash);
+}
 
 /// T04 (#4), criterion 1: the effort matrix resolves against the four aliases
 /// the spec actually defines, with the provider and model each alias names.
