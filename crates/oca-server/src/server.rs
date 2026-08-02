@@ -527,7 +527,6 @@ pub enum ConnectError<E> {
     Request(E),
     RequestMayHaveBeenTransmitted(E),
     Startup(Vec<StartupDiagnostic>),
-    ServerUnavailable,
     State(io::Error),
 }
 
@@ -632,12 +631,40 @@ mod tests {
     #[test]
     fn racing_cold_starts_spawn_once_and_the_loser_adopts_the_winner_record() {
         let directory = tempfile::tempdir().expect("temporary state directory");
+        let runtime = Arc::new(RacingRuntime::default());
+        let first_directory = directory.path().to_path_buf();
+        let first_runtime = Arc::clone(&runtime);
+        let first = std::thread::spawn(move || {
+            let mut request = ReadyRequest;
+            block_on(
+                ConnectOrStart::new(first_directory, 4096, [], Duration::from_millis(50))
+                    .connect_or_start(first_runtime.as_ref(), &mut request),
+            )
+        });
+        while runtime.spawned.load(Ordering::SeqCst) == 0 {
+            std::thread::yield_now();
+        }
+
+        let mut request = ReadyRequest;
+        block_on(
+            ConnectOrStart::new(directory.path(), 4096, [], Duration::from_millis(50))
+                .connect_or_start(runtime.as_ref(), &mut request),
+        )
+        .expect("loser adopts the winner");
+        first.join().expect("winner thread").expect("winner starts");
+
+        assert_eq!(runtime.spawned.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn racing_stale_field_equal_records_spawn_once_and_both_callers_recover() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
         let port = available_loopback_port();
         let manager = ConnectOrStart::new(directory.path(), port, [], Duration::from_millis(50));
         manager
             .write_record(&ServerRecord::new(port, "1.18.10", "environment"))
             .expect("stale field-equal discovery hint");
-        let runtime = Arc::new(LoopbackRacingRuntime::default());
+        let runtime = Arc::new(RacingRuntime::default());
         let barrier = Arc::new(Barrier::new(2));
         let first_directory = directory.path().to_path_buf();
         let first_runtime = Arc::clone(&runtime);
@@ -683,7 +710,7 @@ mod tests {
             .write_record(&ServerRecord::new(stale_port, "1.18.10", "environment"))
             .expect("stale discovery hint");
         let lock = manager.acquire_start_lock().expect("held start lock");
-        let runtime = Arc::new(LoopbackRacingRuntime::default());
+        let runtime = Arc::new(RacingRuntime::default());
         let (failed_tx, failed_rx) = mpsc::channel();
         let worker_manager = manager.clone();
         let worker_runtime = Arc::clone(&runtime);
@@ -753,10 +780,8 @@ mod tests {
 
     #[test]
     fn system_readiness_timeout_returns_its_final_connection_error() {
-        let port = available_loopback_port();
-
         let error = SystemRuntime::default()
-            .wait_until_ready(port, Duration::ZERO)
+            .wait_until_ready(0, Duration::ZERO)
             .expect_err("unused port never becomes ready");
 
         assert!(!error.is_empty());
@@ -881,12 +906,12 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct LoopbackRacingRuntime {
+    struct RacingRuntime {
         spawned: AtomicU8,
         listeners: Mutex<Vec<TcpListener>>,
     }
 
-    impl ServerRuntime for LoopbackRacingRuntime {
+    impl ServerRuntime for RacingRuntime {
         fn opencode_version(&self) -> Result<String, String> {
             Ok("1.18.10".to_owned())
         }
@@ -1006,12 +1031,24 @@ mod tests {
 
     fn post_lock_record_is_adopted_when_live(changed: bool) {
         let directory = tempfile::tempdir().expect("temporary state directory");
-        let initial_port = available_loopback_port();
-        let post_lock_port = if changed {
-            available_loopback_port()
-        } else {
-            initial_port
-        };
+        let initial_listener = TcpListener::bind(("127.0.0.1", 0)).expect("live initial record");
+        let initial_port = initial_listener
+            .local_addr()
+            .expect("initial loopback address")
+            .port();
+        let replacement_listener = changed
+            .then(|| TcpListener::bind(("127.0.0.1", 0)).expect("live changed replacement record"));
+        let post_lock_port = replacement_listener
+            .as_ref()
+            .map_or(initial_port, |listener| {
+                listener
+                    .local_addr()
+                    .expect("replacement loopback address")
+                    .port()
+            });
+        if changed {
+            assert_ne!(initial_port, post_lock_port, "record port must change");
+        }
         let manager = ConnectOrStart::new(
             directory.path(),
             initial_port,
@@ -1032,7 +1069,6 @@ mod tests {
         });
 
         failed_rx.recv().expect("initial request failed");
-        let listener = TcpListener::bind(("127.0.0.1", post_lock_port)).expect("live replacement");
         manager
             .write_record(&ServerRecord::new(post_lock_port, "1.18.10", "environment"))
             .expect("post-lock record");
@@ -1042,7 +1078,7 @@ mod tests {
             .join()
             .expect("recovery thread")
             .expect("live post-lock record is adopted");
-        drop(listener);
+        drop((initial_listener, replacement_listener));
     }
 
     struct DiagnosticRuntime {
