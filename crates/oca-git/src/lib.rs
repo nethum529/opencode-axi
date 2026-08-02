@@ -6,10 +6,12 @@ use std::{
     process::{Command, ExitStatus, Output},
     sync::Arc,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
+const DEFAULT_LOCK_ACQUISITION_TIMEOUT: Duration = Duration::from_secs(10);
+const LOCK_OWNER_RECORD: &str = "owner";
 type AfterScanHook = dyn Fn(&Path) + Send + Sync;
 
 /// A validated identifier used to name an oca branch and worktree.
@@ -147,6 +149,8 @@ pub enum GitError {
     WorktreeEmpty,
     /// The worktree changed after its initial scan and before commit handoff.
     WorktreeChanged { paths: Vec<RelativePath> },
+    /// Another live process retained the repository lock past the acquisition timeout.
+    LockTimeout,
     /// An operating-system operation failed.
     Io(io::Error),
     /// Git returned an unexpected non-zero status.
@@ -168,6 +172,7 @@ impl GitError {
             Self::ZeroByteOutput { .. } => "zero_byte_output",
             Self::WorktreeEmpty => "worktree_empty",
             Self::WorktreeChanged { .. } => "worktree_changed",
+            Self::LockTimeout => "lock_timeout",
             Self::Io(_) | Self::GitCommand { .. } => "git_error",
         }
     }
@@ -193,6 +198,7 @@ impl fmt::Display for GitError {
             Self::WorktreeChanged { paths } => {
                 write!(formatter, "worktree changed during validation: {paths:?}")
             }
+            Self::LockTimeout => formatter.write_str("timed out waiting for the repository lock"),
             Self::Io(error) => write!(formatter, "filesystem operation failed: {error}"),
             Self::GitCommand { operation, status } => {
                 write!(formatter, "git {operation} failed with status {status}")
@@ -212,6 +218,7 @@ impl std::error::Error for GitError {
             | Self::ZeroByteOutput { .. }
             | Self::WorktreeEmpty
             | Self::WorktreeChanged { .. }
+            | Self::LockTimeout
             | Self::GitCommand { .. } => None,
         }
     }
@@ -226,6 +233,7 @@ impl From<io::Error> for GitError {
 /// Creates and validates oca-owned Git worktrees.
 pub struct WorktreeManager {
     after_scan_hook: Option<Arc<AfterScanHook>>,
+    lock_acquisition_timeout: Duration,
 }
 
 impl fmt::Debug for WorktreeManager {
@@ -233,6 +241,7 @@ impl fmt::Debug for WorktreeManager {
         formatter
             .debug_struct("WorktreeManager")
             .field("has_after_scan_hook", &self.after_scan_hook.is_some())
+            .field("lock_acquisition_timeout", &self.lock_acquisition_timeout)
             .finish()
     }
 }
@@ -249,6 +258,7 @@ impl WorktreeManager {
     pub const fn new() -> Self {
         Self {
             after_scan_hook: None,
+            lock_acquisition_timeout: DEFAULT_LOCK_ACQUISITION_TIMEOUT,
         }
     }
 
@@ -260,6 +270,19 @@ impl WorktreeManager {
     pub fn with_after_scan_hook(hook: Arc<AfterScanHook>) -> Self {
         Self {
             after_scan_hook: Some(hook),
+            lock_acquisition_timeout: DEFAULT_LOCK_ACQUISITION_TIMEOUT,
+        }
+    }
+
+    /// Creates a manager with a bounded repository-lock acquisition attempt.
+    ///
+    /// This seam exists for deterministic lock-lifecycle tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn with_lock_acquisition_timeout(lock_acquisition_timeout: Duration) -> Self {
+        Self {
+            after_scan_hook: None,
+            lock_acquisition_timeout,
         }
     }
 
@@ -270,7 +293,7 @@ impl WorktreeManager {
     /// Returns [`GitError::WorktreeConflict`] when the oca branch or worktree
     /// already exists, or a git/filesystem error when creation cannot complete.
     pub fn create(&self, reference: &RefId, base: &Path) -> Result<WorktreeRecord, GitError> {
-        let _lock = RepositoryLock::acquire(base)?;
+        let _lock = RepositoryLock::acquire(base, self.lock_acquisition_timeout)?;
         let branch = format!("oca/{reference}");
         let path = base.join(".oca").join("wt").join(reference.as_str());
 
@@ -348,16 +371,28 @@ struct RepositoryLock {
 }
 
 impl RepositoryLock {
-    fn acquire(base: &Path) -> Result<Self, GitError> {
+    fn acquire(base: &Path, timeout: Duration) -> Result<Self, GitError> {
         let oca_directory = base.join(".oca");
         fs::create_dir_all(&oca_directory)?;
         let path = oca_directory.join("worktree.lock");
+        let deadline = Instant::now() + timeout;
 
         loop {
             match fs::create_dir(&path) {
-                Ok(()) => return Ok(Self { path }),
+                Ok(()) => {
+                    write_lock_owner_record(&path)?;
+                    return Ok(Self { path });
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                    thread::sleep(LOCK_RETRY_DELAY);
+                    if lock_owner_is_known_dead(&path)? {
+                        reclaim_lock(&path)?;
+                        continue;
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(GitError::LockTimeout);
+                    }
+                    thread::sleep(LOCK_RETRY_DELAY.min(remaining));
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -365,9 +400,56 @@ impl RepositoryLock {
     }
 }
 
+/// The lock owner record is `<decimal process id>\\n` in `worktree.lock/owner`.
+/// A lock is reclaimable only when this record parses and its process is known dead.
+fn write_lock_owner_record(lock_path: &Path) -> Result<(), GitError> {
+    fs::write(
+        lock_path.join(LOCK_OWNER_RECORD),
+        lock_owner_record(std::process::id()),
+    )?;
+    Ok(())
+}
+
+fn lock_owner_record(pid: u32) -> String {
+    format!("{pid}\n")
+}
+
+fn lock_owner_is_known_dead(lock_path: &Path) -> Result<bool, GitError> {
+    let owner = match fs::read_to_string(lock_path.join(LOCK_OWNER_RECORD)) {
+        Ok(owner) => owner,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let Some(owner) = owner.strip_suffix('\n') else {
+        return Ok(false);
+    };
+    let Ok(pid) = owner.parse::<u32>() else {
+        return Ok(false);
+    };
+    Ok(process_is_known_dead(pid))
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_known_dead(pid: u32) -> bool {
+    !Path::new("/proc").join(pid.to_string()).exists()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_is_known_dead(_pid: u32) -> bool {
+    false
+}
+
+fn reclaim_lock(lock_path: &Path) -> Result<(), GitError> {
+    match fs::remove_dir_all(lock_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 impl Drop for RepositoryLock {
     fn drop(&mut self) {
-        let _ = fs::remove_dir(&self.path);
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -404,6 +486,12 @@ fn changed_paths(worktree: &Path) -> Result<Vec<RelativePath>, GitError> {
             OsStr::new("-z"),
         ],
     )?;
+    if !output.status.success() {
+        return Err(GitError::GitCommand {
+            operation: "status --porcelain",
+            status: output.status,
+        });
+    }
     let mut records = output.stdout.split(|byte| *byte == b'\0');
     let mut paths = Vec::new();
     while let Some(record) = records.next() {
@@ -549,17 +637,45 @@ mod tests {
     use std::{
         env, fs,
         path::{Path, PathBuf},
-        process::Command,
+        process::{Child, Command},
         sync::atomic::{AtomicU64, Ordering},
-        time::{SystemTime, UNIX_EPOCH},
+        time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
-    use super::{GitError, RefId, RelativePath, WorktreeManager};
+    use super::{GitError, RefId, RelativePath, WorktreeManager, lock_owner_record};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
     struct TestRepository {
         path: PathBuf,
+    }
+
+    #[cfg(target_os = "linux")]
+    struct LiveLockOwner {
+        child: Child,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl LiveLockOwner {
+        fn start() -> Self {
+            let child = Command::new("sleep")
+                .arg("5")
+                .spawn()
+                .expect("the live lock-owner process should start");
+            Self { child }
+        }
+
+        fn pid(&self) -> u32 {
+            self.child.id()
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for LiveLockOwner {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 
     impl TestRepository {
@@ -764,6 +880,80 @@ mod tests {
             .expect_err("an unchanged worktree should fail validation");
 
         assert!(matches!(error, GitError::WorktreeEmpty));
+    }
+
+    #[test]
+    fn validate_returns_the_git_status_failure_before_empty_or_changed_results() {
+        let repository = TestRepository::new();
+        fs::rename(
+            repository.path.join(".git"),
+            repository.path.join(".git-hidden"),
+        )
+        .expect("the repository metadata should be hidden to make git status fail");
+        let manager = WorktreeManager::new();
+
+        let error = manager
+            .validate(&repository.path, &[])
+            .expect_err("a failing git status command should fail validation");
+
+        match error {
+            GitError::GitCommand { operation, status } => {
+                assert_eq!(operation, "status --porcelain");
+                assert!(!status.success());
+            }
+            GitError::WorktreeEmpty | GitError::WorktreeChanged { .. } => {
+                panic!("the git status failure must not be converted to a validation result");
+            }
+            other => panic!("expected a git status failure, got {other:?}"),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_times_out_without_changing_a_live_owner_lock_record() {
+        let repository = TestRepository::new();
+        let lock_path = repository.path.join(".oca/worktree.lock");
+        fs::create_dir_all(&lock_path).expect("the test lock directory should be created");
+        let owner = LiveLockOwner::start();
+        let owner_record = lock_owner_record(owner.pid()).into_bytes();
+        fs::write(lock_path.join("owner"), &owner_record)
+            .expect("the documented lock owner record should be written");
+        let reference = RefId::new("w4f2a1").expect("the reference should be valid");
+        let manager = WorktreeManager::with_lock_acquisition_timeout(Duration::from_millis(100));
+
+        let started = Instant::now();
+        let error = manager
+            .create(&reference, &repository.path)
+            .expect_err("a live owner should prevent worktree creation");
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "lock acquisition should honor the configured timeout"
+        );
+        assert!(matches!(error, GitError::LockTimeout));
+        assert!(lock_path.is_dir());
+        assert_eq!(
+            fs::read(lock_path.join("owner")).expect("the owner record should remain readable"),
+            owner_record
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_reclaims_a_lock_with_a_known_dead_owner() {
+        let repository = TestRepository::new();
+        let lock_path = repository.path.join(".oca/worktree.lock");
+        fs::create_dir_all(&lock_path).expect("the stale lock directory should be created");
+        fs::write(lock_path.join("owner"), lock_owner_record(u32::MAX))
+            .expect("the documented stale owner record should be written");
+        let reference = RefId::new("w4f2a1").expect("the reference should be valid");
+
+        let worktree = WorktreeManager::new()
+            .create(&reference, &repository.path)
+            .expect("a stale lock should be reclaimed before worktree creation");
+
+        assert_eq!(worktree.path(), repository.path.join(".oca/wt/w4f2a1"));
+        assert!(worktree.path().is_dir());
     }
 
     #[test]
