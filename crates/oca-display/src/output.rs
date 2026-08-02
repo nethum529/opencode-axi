@@ -1,6 +1,6 @@
 use std::fmt::Write;
 
-use oca_core::{OcaError, ResolvedModel, validate_error_envelope};
+use oca_core::{ResolvedModel, validate_error_envelope};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -299,41 +299,6 @@ impl EventPage {
     #[must_use]
     pub fn render_json(&self) -> String {
         render_json(self, "event page serialization cannot fail")
-    }
-}
-
-/// The single semantic output model shared by default TOON-compatible and
-/// `--json` renderers.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum OutputDocument {
-    Acknowledgement(Acknowledgement),
-    Completion(CompletionRecord),
-    List(ListDocument),
-    Events(EventPage),
-    Error(OcaError),
-}
-
-impl OutputDocument {
-    #[must_use]
-    pub fn render_toon(&self) -> String {
-        match self {
-            Self::Acknowledgement(document) => document.render_toon(),
-            Self::Completion(document) => document.render_toon(),
-            Self::List(document) => document.render_toon(),
-            Self::Events(document) => document.render_toon(),
-            Self::Error(document) => document.render_failure(),
-        }
-    }
-
-    #[must_use]
-    pub fn render_json(&self) -> String {
-        match self {
-            Self::Acknowledgement(document) => document.render_json(),
-            Self::Completion(document) => document.render_json(),
-            Self::List(document) => document.render_json(),
-            Self::Events(document) => document.render_json(),
-            Self::Error(document) => format!("{}\n", document.to_json()),
-        }
     }
 }
 
