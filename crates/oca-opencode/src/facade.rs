@@ -43,7 +43,6 @@ pub struct PromptRequest {
     pub role: String,
     pub parts: Vec<TextPart>,
     pub output_schema: Option<Value>,
-    pub permission: Option<Value>,
 }
 
 /// A minimally typed `OpenCode` session, retaining additive server fields.
@@ -301,6 +300,12 @@ impl OpenCodeClient {
                     .collect(),
             ),
         );
+        if let Some(schema) = request.output_schema {
+            body.insert(
+                "format".to_owned(),
+                json!({ "type": "json_schema", "schema": schema }),
+            );
+        }
         let path = format!("session/{session}/prompt_async");
         self.empty(
             Method::POST,
