@@ -13,7 +13,7 @@ fn schema_and_validator_reject_contract_violations() {
     let ack_with_an_added_field = json!({
         "ref": "w00001",
         "state": "accepted",
-        "model": "anthropic/claude-opus-4-1:low",
+        "model": "openai/gpt-5.6-luna:low",
         "extra": "not allowed"
     });
     assert!(validate_output_document(&ack_with_an_added_field).is_err());

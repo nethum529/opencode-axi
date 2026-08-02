@@ -103,10 +103,67 @@ impl ModelDefinition {
     }
 }
 
+/// One entry in the model catalog compiled into a first-run installation.
+///
+/// This is the single source for the resolver catalog and the state
+/// configuration defaults. Consumers should derive their representations from
+/// [`DEFAULT_MODEL_DEFINITIONS`] rather than copying this table.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DefaultModelDefinition {
+    pub alias: &'static str,
+    pub provider: &'static str,
+    pub model: &'static str,
+    pub ladder: &'static [&'static str],
+    pub synonyms: &'static [&'static str],
+}
+
+/// The model aliases available before a user supplies configuration.
+pub const DEFAULT_MODEL_DEFINITIONS: &[DefaultModelDefinition] = &[
+    DefaultModelDefinition {
+        alias: "luna",
+        provider: "openai",
+        model: "gpt-5.6-luna",
+        ladder: &["low", "medium", "high", "xhigh", "max"],
+        synonyms: &[],
+    },
+    DefaultModelDefinition {
+        alias: "sol",
+        provider: "openai",
+        model: "gpt-5.6-sol",
+        ladder: &["low", "medium", "high", "xhigh", "max"],
+        synonyms: &[],
+    },
+    DefaultModelDefinition {
+        alias: "terra",
+        provider: "openai",
+        model: "gpt-5.6-terra",
+        ladder: &["low", "medium", "high", "xhigh", "max"],
+        synonyms: &[],
+    },
+    DefaultModelDefinition {
+        alias: "flash",
+        provider: "opencode",
+        model: "deepseek-v4-flash-free",
+        ladder: &["high", "max"],
+        synonyms: &["deepseek"],
+    },
+];
+
+impl From<&DefaultModelDefinition> for ModelDefinition {
+    fn from(definition: &DefaultModelDefinition) -> Self {
+        Self::new(
+            definition.provider,
+            definition.model,
+            definition.ladder.iter().copied(),
+        )
+    }
+}
+
 /// The alias-to-model catalog used by the pure resolver.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ModelCatalog {
     pub models: BTreeMap<String, ModelDefinition>,
+    synonyms: BTreeMap<String, String>,
 }
 
 pub type Catalog = ModelCatalog;
@@ -133,36 +190,29 @@ impl ModelCatalog {
     pub fn aliases(&self) -> impl Iterator<Item = &str> {
         self.models.keys().map(String::as_str)
     }
+
+    fn canonical_alias(&self, alias: Alias) -> Alias {
+        self.synonyms.get(alias.as_str()).map_or(alias, Alias::new)
+    }
 }
 
 impl Default for ModelCatalog {
     fn default() -> Self {
-        let mut models = BTreeMap::new();
-        models.insert(
-            "opus".to_owned(),
-            ModelDefinition::new(
-                "anthropic",
-                "claude-opus-4-1",
-                ["low", "medium", "high", "xhigh", "max"],
-            ),
-        );
-        models.insert(
-            "sonnet".to_owned(),
-            ModelDefinition::new(
-                "anthropic",
-                "claude-sonnet-4",
-                ["low", "medium", "high", "xhigh"],
-            ),
-        );
-        models.insert(
-            "haiku".to_owned(),
-            ModelDefinition::new("anthropic", "claude-haiku-3-5", ["low", "medium", "high"]),
-        );
-        models.insert(
-            "flash".to_owned(),
-            ModelDefinition::new("deepseek", "deepseek-v4-flash-free", ["high", "max"]),
-        );
-        Self { models }
+        let models = DEFAULT_MODEL_DEFINITIONS
+            .iter()
+            .map(|definition| (definition.alias.to_owned(), definition.into()))
+            .collect();
+        let synonyms = DEFAULT_MODEL_DEFINITIONS
+            .iter()
+            .flat_map(|definition| {
+                definition
+                    .synonyms
+                    .iter()
+                    .map(move |synonym| ((*synonym).to_owned(), definition.alias.to_owned()))
+            })
+            .collect();
+
+        Self { models, synonyms }
     }
 }
 
@@ -270,12 +320,8 @@ where
     C: Borrow<ModelCatalog>,
 {
     let requested_alias = Alias::new(alias);
-    let canonical_alias = if requested_alias.as_str() == "deepseek" {
-        Alias::new("flash")
-    } else {
-        requested_alias
-    };
     let catalog = catalog.borrow();
+    let canonical_alias = catalog.canonical_alias(requested_alias);
 
     // Alias validation intentionally precedes every effort validation.
     let definition = catalog.get(canonical_alias.as_str()).ok_or_else(|| {

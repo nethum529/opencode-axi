@@ -8,8 +8,8 @@ pub use error::{
     exit, parse_error_envelope, validate_error_envelope,
 };
 pub use resolver::{
-    Alias, Catalog, Effort, EffortInput, ModelCatalog, ModelDefinition, ModelEntry, ModelSpec,
-    ResolvedModel, resolve_model,
+    Alias, Catalog, DEFAULT_MODEL_DEFINITIONS, DefaultModelDefinition, Effort, EffortInput,
+    ModelCatalog, ModelDefinition, ModelEntry, ModelSpec, ResolvedModel, resolve_model,
 };
 
 /// A canonical short reference used by oca state and worktree operations.
@@ -97,14 +97,14 @@ mod tests {
 
         assert_eq!(
             catalog.aliases().collect::<Vec<_>>(),
-            ["flash", "haiku", "opus", "sonnet"]
+            ["flash", "luna", "sol", "terra"]
         );
 
         let flash = resolve_model("flash", "x", &catalog).expect("flash:x should resolve");
         let deepseek = resolve_model("deepseek", "x", &catalog).expect("deepseek:x should resolve");
 
         assert_eq!(flash, deepseek);
-        assert_eq!(flash.provider, "deepseek");
+        assert_eq!(flash.provider, "opencode");
         assert_eq!(flash.model, "deepseek-v4-flash-free");
         assert_eq!(flash.variant, "max");
     }
@@ -115,7 +115,7 @@ mod tests {
 
         assert_matrix(
             &catalog,
-            "opus",
+            "luna",
             [
                 ("l", Ok("low")),
                 ("m", Ok("medium")),
@@ -131,34 +131,34 @@ mod tests {
         );
         assert_matrix(
             &catalog,
-            "sonnet",
+            "sol",
             [
                 ("l", Ok("low")),
                 ("m", Ok("medium")),
                 ("h", Ok("high")),
                 ("x", Ok("xhigh")),
-                ("max", Ok("xhigh")),
+                ("max", Ok("max")),
                 ("low", Ok("low")),
                 ("medium", Ok("medium")),
                 ("high", Ok("high")),
                 ("xhigh", Ok("xhigh")),
-                ("max", Ok("xhigh")),
+                ("max", Ok("max")),
             ],
         );
         assert_matrix(
             &catalog,
-            "haiku",
+            "terra",
             [
                 ("l", Ok("low")),
                 ("m", Ok("medium")),
                 ("h", Ok("high")),
-                ("x", Ok("high")),
-                ("max", Ok("high")),
+                ("x", Ok("xhigh")),
+                ("max", Ok("max")),
                 ("low", Ok("low")),
                 ("medium", Ok("medium")),
                 ("high", Ok("high")),
-                ("xhigh", Ok("high")),
-                ("max", Ok("high")),
+                ("xhigh", Ok("xhigh")),
+                ("max", Ok("max")),
             ],
         );
         assert_matrix(
@@ -190,14 +190,14 @@ mod tests {
             "invalid_model"
         );
         assert_eq!(
-            resolve_model("opus", None::<&str>, &catalog)
+            resolve_model("luna", None::<&str>, &catalog)
                 .expect_err("effort is mandatory")
                 .code(),
             "effort_required"
         );
         assert_eq!(
             resolve_model(
-                "opus",
+                "luna",
                 EffortInput::both(Some("low"), Some("high")),
                 &catalog,
             )
@@ -217,7 +217,7 @@ mod tests {
     fn equal_inline_and_flag_efforts_are_accepted_once() {
         let catalog = ModelCatalog::default();
 
-        let resolved = resolve_model("opus", EffortInput::both(Some("h"), Some("high")), &catalog)
+        let resolved = resolve_model("luna", EffortInput::both(Some("h"), Some("high")), &catalog)
             .expect("equivalent effort sources are not a conflict");
 
         assert_eq!(resolved.variant, "high");

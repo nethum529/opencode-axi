@@ -6,31 +6,31 @@ fn acknowledgement_default_rendering_is_the_frozen_four_alias_golden() {
     let catalog = ModelCatalog::default();
     let cases = [
         (
-            "opus",
+            "luna",
             "low",
             "accepted",
-            "anthropic/claude-opus-4-1:low",
-            include_str!("goldens/ack-opus-accepted.toon"),
+            "openai/gpt-5.6-luna:low",
+            include_str!("goldens/ack-luna-accepted.toon"),
         ),
         (
-            "sonnet",
+            "sol",
             "medium",
             "queued",
-            "anthropic/claude-sonnet-4:medium",
-            include_str!("goldens/ack-sonnet-queued.toon"),
+            "openai/gpt-5.6-sol:medium",
+            include_str!("goldens/ack-sol-queued.toon"),
         ),
         (
-            "haiku",
+            "terra",
             "high",
             "running",
-            "anthropic/claude-haiku-3-5:high",
-            include_str!("goldens/ack-haiku-running.toon"),
+            "openai/gpt-5.6-terra:high",
+            include_str!("goldens/ack-terra-running.toon"),
         ),
         (
             "flash",
             "high",
             "accepted",
-            "deepseek/deepseek-v4-flash-free:high",
+            "opencode/deepseek-v4-flash-free:high",
             include_str!("goldens/ack-flash-accepted.toon"),
         ),
     ];

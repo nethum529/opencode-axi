@@ -4,14 +4,14 @@ use oca_display::{Event, EventPage, ListDocument, ListItem, OutputDocument};
 #[test]
 fn list_event_and_error_documents_have_frozen_default_and_json_renderings() {
     let list = ListDocument::new(
-        vec![ListItem::new("w00001", "completed").with_model("anthropic/claude-opus-4-1:low")],
+        vec![ListItem::new("w00001", "completed").with_model("openai/gpt-5.6-luna:low")],
         0,
         1,
     );
     assert_eq!(list.render_toon(), include_str!("goldens/list.toon"));
     assert_eq!(
         list.render_json(),
-        "{\"items\":[{\"ref\":\"w00001\",\"state\":\"completed\",\"model\":\"anthropic/claude-opus-4-1:low\"}],\"cursor\":0,\"total\":1}\n"
+        "{\"items\":[{\"ref\":\"w00001\",\"state\":\"completed\",\"model\":\"openai/gpt-5.6-luna:low\"}],\"cursor\":0,\"total\":1}\n"
     );
 
     let events = EventPage::new(

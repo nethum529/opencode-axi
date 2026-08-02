@@ -492,7 +492,7 @@ mod tests {
         let Command::Dispatch(command) = parse_from([
             "oca",
             "--json",
-            "opus:h",
+            "luna:h",
             "--role",
             "review",
             "-w",
@@ -508,7 +508,7 @@ mod tests {
         assert_eq!(
             command,
             DispatchCommand {
-                model: oca_core::resolve_model("opus", "h", oca_core::ModelCatalog::default())
+                model: oca_core::resolve_model("luna", "h", oca_core::ModelCatalog::default())
                     .unwrap(),
                 prompt: "write a test".to_owned(),
                 role: "review".to_owned(),
@@ -522,11 +522,11 @@ mod tests {
     #[test]
     fn model_effort_can_be_separate_from_the_alias() {
         let Command::Dispatch(command) =
-            parse_from(["oca", "sonnet", "-e", "x", "implement", "this"]).unwrap()
+            parse_from(["oca", "sol", "-e", "x", "implement", "this"]).unwrap()
         else {
             panic!("model grammar must produce dispatch");
         };
-        assert_eq!(command.model.alias, "sonnet");
+        assert_eq!(command.model.alias, "sol");
         assert_eq!(command.model.variant, "xhigh");
         assert_eq!(command.prompt, "implement this");
     }
@@ -538,9 +538,9 @@ mod tests {
                 vec!["oca", "unknown", "-e", "h", "prompt"],
                 ErrorCode::AliasUnknown,
             ),
-            (vec!["oca", "opus", "prompt"], ErrorCode::EffortMissing),
+            (vec!["oca", "luna", "prompt"], ErrorCode::EffortMissing),
             (
-                vec!["oca", "opus:h", "-e", "low", "prompt"],
+                vec!["oca", "luna:h", "-e", "low", "prompt"],
                 ErrorCode::EffortConflict,
             ),
             (
@@ -555,13 +555,13 @@ mod tests {
     #[test]
     fn end_of_options_keeps_a_dash_prefixed_prompt() {
         let Command::Dispatch(command) =
-            parse_from(["oca", "opus:h", "--", "--write", "this"]).unwrap()
+            parse_from(["oca", "luna:h", "--", "--write", "this"]).unwrap()
         else {
             panic!("model grammar must produce dispatch");
         };
         assert_eq!(command.prompt, "--write this");
         assert_eq!(
-            parse_from(["oca", "opus:h", "--write", "this"])
+            parse_from(["oca", "luna:h", "--write", "this"])
                 .unwrap_err()
                 .code(),
             ErrorCode::Usage.as_str()
@@ -585,7 +585,7 @@ mod tests {
             ErrorCode::AliasUnknown.as_str()
         );
         assert_eq!(
-            parse_from(["oca", "opus"]).unwrap_err().code(),
+            parse_from(["oca", "luna"]).unwrap_err().code(),
             ErrorCode::EffortMissing.as_str()
         );
     }
@@ -604,8 +604,8 @@ mod tests {
     fn grammar_validation_failures_are_usage_envelopes() {
         let invalid = [
             vec!["oca"],
-            vec!["oca", "opus:h"],
-            vec!["oca", "opus:h", "--unknown", "prompt"],
+            vec!["oca", "luna:h"],
+            vec!["oca", "luna:h", "--unknown", "prompt"],
             vec!["oca", "m"],
             vec!["oca", "m", "wabc12"],
             vec!["oca", "q", "wabc12", "-e", "h", "message"],
