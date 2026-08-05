@@ -82,4 +82,9 @@ fn canonical_ref_is_not_rejected_by_the_process() {
         "canonical ref failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        output.stderr.is_empty(),
+        "a successful run must not write a failure document: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
