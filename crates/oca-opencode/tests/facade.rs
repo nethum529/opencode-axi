@@ -177,7 +177,7 @@ async fn prompt_async_wraps_an_output_schema_in_the_pinned_format_envelope() {
 }
 
 #[tokio::test]
-async fn queue_uses_the_legacy_prompt_async_operation_with_queue_delivery() {
+async fn queue_uses_a_second_plain_legacy_prompt_async_request() {
     let server = FakeServer::once(response("204 No Content", "text/plain", ""));
     let client = OpenCodeClient::new(server.base_url.parse().expect("valid URL"));
 
@@ -193,7 +193,7 @@ async fn queue_uses_the_legacy_prompt_async_operation_with_queue_delivery() {
         .expect("request has a body")
         .1;
     let body = serde_json::from_str::<serde_json::Value>(body).expect("prompt body is JSON");
-    assert_eq!(body["delivery"], "queue");
+    assert!(body.get("delivery").is_none());
     assert_eq!(body["variant"], "high");
 }
 

@@ -618,6 +618,7 @@ dependencies = [
  "oca-server",
  "oca-state",
  "oca-testkit",
+ "reqwest",
  "serde_json",
  "sha2",
  "tempfile",
