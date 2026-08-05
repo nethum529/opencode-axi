@@ -634,6 +634,26 @@ mod tests {
                     .count(),
                 1
             );
+            assert_subscribed_before_every_prompt(&backend.calls);
+        }
+    }
+
+    /// The recovery paths recreate the session, so the subscribe-before-prompt
+    /// invariant has to hold against the session each prompt actually targets,
+    /// not merely somewhere earlier in the call log.
+    fn assert_subscribed_before_every_prompt(calls: &[&'static str]) {
+        let mut created = None;
+        let mut subscribed = None;
+        for (index, call) in calls.iter().enumerate() {
+            match *call {
+                "create" => created = Some(index),
+                "subscribe" => subscribed = Some(index),
+                "prompt" => assert!(
+                    subscribed > created,
+                    "prompt admitted with no subscription for the current session: {calls:?}"
+                ),
+                _ => {}
+            }
         }
     }
 
