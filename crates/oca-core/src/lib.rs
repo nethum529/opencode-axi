@@ -1,16 +1,30 @@
 use std::fmt;
 
 pub mod error;
+pub mod foreground;
+pub mod message_id;
+pub mod policy;
 pub mod reply;
+pub mod reply_decode;
 pub mod resolver;
 
 pub use error::{
     ERROR_ENVELOPE_SCHEMA, ErrorCode, ErrorEnvelope, FollowExit, OcaError, error_envelope_schema,
     exit, parse_error_envelope, validate_error_envelope,
 };
+pub use foreground::{
+    DispatchPrompt, ForegroundBackend, ForegroundOutcome, ForegroundRequest, TerminalReply,
+    run_foreground,
+};
+pub use message_id::{
+    MessageIdGenerator, OPENCODE_ID_SUFFIX_WIDTH, RANDOM_SUFFIX_WIDTH, TIME_PREFIX_WIDTH,
+    is_opencode_message_id,
+};
+pub use policy::{Denied, PermissionAction, PermissionProfile, PermissionRule, WorkerPolicy};
 pub use reply::{
     ImplReply, ReviewFinding, ReviewReply, RoleReply, WorkerState, validate_reply_floor,
 };
+pub use reply_decode::{ReplyContract, decode_role_reply};
 pub use resolver::{
     Catalog, DEFAULT_MODEL_DEFINITIONS, DefaultModelDefinition, Effort, EffortInput, ModelCatalog,
     ModelDefinition, ModelEntry, ModelSpec, ResolvedModel, normalize_alias, resolve_model,

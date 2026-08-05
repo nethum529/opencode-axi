@@ -9,10 +9,12 @@
 
 use std::{fmt, future::Future};
 
+mod dispatch;
 mod facade;
 #[allow(clippy::all, dead_code, renamed_and_removed_lints)]
 mod generated;
 
+pub use dispatch::{attributed_structured_reply, is_target_session_idle};
 pub use facade::{
     AbortAccepted, ControlAccepted, CreateSessionRequest, MessageId, MessageWithParts,
     OpenCodeClient, OpenCodeError, PromptAccepted, PromptRequest, Session, SessionId, Subscription,

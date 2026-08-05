@@ -6,6 +6,10 @@ use oca_core::{
 };
 use oca_state::OcaConfig;
 
+mod foreground;
+
+pub use foreground::execute_foreground;
+
 /// The fixed command grammar accepted by `oca`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Command {

@@ -14,7 +14,22 @@ fn main() -> ExitCode {
                 .with_error("could not determine the home directory")
                 .with_help("set the HOME environment variable and retry")
         })
-        .and_then(|home| oca_cli::parse_from_home(arguments, home));
+        .and_then(|home| {
+            let command = oca_cli::parse_from_home(arguments, &home)?;
+            match command {
+                oca_cli::Command::Dispatch(command) => {
+                    tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .map_err(|error| {
+                            oca_core::OcaError::new(oca_core::ErrorCode::ServerUnavailable)
+                                .with_error(format!("could not start async runtime: {error}"))
+                        })?
+                        .block_on(oca_cli::execute_foreground(command, home))
+                }
+                _ => Ok(()),
+            }
+        });
 
     match result {
         Ok(_) => ExitCode::SUCCESS,

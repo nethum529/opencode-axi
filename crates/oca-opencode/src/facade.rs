@@ -1,6 +1,6 @@
 use std::fmt;
 
-use oca_core::ResolvedModel;
+use oca_core::{PermissionProfile, ResolvedModel};
 use reqwest::{Method, StatusCode, header};
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
@@ -43,6 +43,11 @@ pub struct PromptRequest {
     pub role: String,
     pub parts: Vec<TextPart>,
     pub output_schema: Option<Value>,
+    /// The role's deny-not-ask profile. OpenCode's pinned prompt endpoint does
+    /// not accept a permission field, so the same profile is installed on the
+    /// session at creation; retaining it here makes every admitted prompt
+    /// self-describing and prevents policy loss in continuation pipelines.
+    pub permission: PermissionProfile,
 }
 
 /// A minimally typed `OpenCode` session, retaining additive server fields.
