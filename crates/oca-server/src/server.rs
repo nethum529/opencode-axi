@@ -1,4 +1,5 @@
 use std::{
+    fmt,
     fs::{self, OpenOptions},
     io::{self, Write},
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
@@ -56,6 +57,50 @@ pub enum RequestFailure<E> {
     Application(E),
 }
 
+/// The startup operation that rejected one candidate port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartupStage {
+    Spawn,
+    Readiness,
+}
+
+impl fmt::Display for StartupStage {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Spawn => formatter.write_str("spawn"),
+            Self::Readiness => formatter.write_str("readiness"),
+        }
+    }
+}
+
+/// A retained explanation for one rejected startup candidate.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartupDiagnostic {
+    pub port: u16,
+    pub stage: StartupStage,
+    pub reason: String,
+}
+
+impl StartupDiagnostic {
+    fn new(port: u16, stage: StartupStage, reason: impl Into<String>) -> Self {
+        Self {
+            port,
+            stage,
+            reason: reason.into(),
+        }
+    }
+}
+
+impl fmt::Display for StartupDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "port {} failed during {}: {}",
+            self.port, self.stage, self.reason
+        )
+    }
+}
+
 /// One real `OpenCode` command request.
 ///
 /// Implementations call an operation on the supplied [`OpenCodeClient`]. The
@@ -94,7 +139,12 @@ pub trait ServerRuntime {
     /// Returns an error when the server process cannot be created.
     fn spawn(&self, port: u16, log_path: &Path) -> Result<(), String>;
 
-    fn wait_until_ready(&self, port: u16, timeout: Duration) -> bool;
+    /// Waits for a successful loopback connection, retaining the last failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns the final concrete connection error when `timeout` expires.
+    fn wait_until_ready(&self, port: u16, timeout: Duration) -> Result<(), String>;
 
     fn warn(&self, message: &str);
 }
@@ -160,15 +210,14 @@ impl ServerRuntime for SystemRuntime {
             .map_err(|error| error.to_string())
     }
 
-    fn wait_until_ready(&self, port: u16, timeout: Duration) -> bool {
+    fn wait_until_ready(&self, port: u16, timeout: Duration) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
         let address = SocketAddr::new(LOOPBACK, port);
         loop {
-            if TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_ok() {
-                return true;
-            }
-            if Instant::now() >= deadline {
-                return false;
+            match TcpStream::connect_timeout(&address, Duration::from_millis(50)) {
+                Ok(_) => return Ok(()),
+                Err(error) if Instant::now() >= deadline => return Err(error.to_string()),
+                Err(_) => {}
             }
             thread::sleep(Duration::from_millis(20));
         }
@@ -287,8 +336,8 @@ impl ConnectOrStart {
     ///
     /// # Errors
     ///
-    /// Returns the request failure, a state I/O error, or
-    /// [`ConnectError::ServerUnavailable`] when every configured port fails.
+    /// Returns the request failure, a state I/O error, or typed startup
+    /// diagnostics when every configured port fails.
     pub async fn connect_or_start<R, Q>(
         &self,
         runtime: &R,
@@ -310,35 +359,50 @@ impl ConnectOrStart {
 
         let lock = self.acquire_start_lock().map_err(ConnectError::State)?;
         let record_after_lock = self.read_record().map_err(ConnectError::State)?;
-        let record = if initial_record.as_ref() == record_after_lock.as_ref() {
-            self.start_record(runtime).map_err(ConnectError::State)?
-        } else {
-            record_after_lock
-        };
+        let recovery: Result<ServerRecord, ConnectError<Q::Error>> =
+            if let Some(record) = record_after_lock.filter(Self::record_is_live) {
+                Ok(record)
+            } else {
+                match self.start_record(runtime).map_err(ConnectError::State)? {
+                    StartOutcome::Started(record) => Ok(record),
+                    StartOutcome::Failed(diagnostics) => Err(ConnectError::Startup(diagnostics)),
+                }
+            };
         lock.unlock().map_err(ConnectError::State)?;
+        let record = recovery?;
 
-        if let Some(record) = record {
-            Self::warn_if_mismatched(runtime, &record);
-            return Self::send(request, record.port)
-                .await
-                .map_err(ConnectError::from_failure);
-        }
-        Err(ConnectError::ServerUnavailable)
+        Self::warn_if_mismatched(runtime, &record);
+        Self::send(request, record.port)
+            .await
+            .map_err(ConnectError::from_failure)
     }
 
-    fn start_record<R>(&self, runtime: &R) -> io::Result<Option<ServerRecord>>
+    fn start_record<R>(&self, runtime: &R) -> io::Result<StartOutcome>
     where
         R: ServerRuntime,
     {
         let version = runtime.opencode_version().ok();
         let environment_hash = runtime.start_environment_hash();
+        let mut diagnostics = Vec::new();
         for port in self.candidate_ports() {
             if !runtime.port_is_available(port) {
+                diagnostics.push(StartupDiagnostic::new(
+                    port,
+                    StartupStage::Spawn,
+                    "loopback port is unavailable",
+                ));
                 continue;
             }
-            if runtime.spawn(port, &self.log_path()).is_err()
-                || !runtime.wait_until_ready(port, self.start_timeout)
-            {
+            if let Err(reason) = runtime.spawn(port, &self.log_path()) {
+                diagnostics.push(StartupDiagnostic::new(port, StartupStage::Spawn, reason));
+                continue;
+            }
+            if let Err(reason) = runtime.wait_until_ready(port, self.start_timeout) {
+                diagnostics.push(StartupDiagnostic::new(
+                    port,
+                    StartupStage::Readiness,
+                    reason,
+                ));
                 continue;
             }
             let record = ServerRecord::new(
@@ -347,9 +411,17 @@ impl ConnectOrStart {
                 environment_hash.clone(),
             );
             self.write_record(&record)?;
-            return Ok(Some(record));
+            for diagnostic in diagnostics {
+                runtime.warn(&format!("discarded startup diagnostic: {diagnostic}"));
+            }
+            return Ok(StartOutcome::Started(record));
         }
-        Ok(None)
+        Ok(StartOutcome::Failed(diagnostics))
+    }
+
+    fn record_is_live(record: &ServerRecord) -> bool {
+        let address = SocketAddr::new(LOOPBACK, record.port);
+        TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_ok()
     }
 
     async fn send<Q>(request: &mut Q, port: u16) -> Result<Q::Output, RequestFailure<Q::Error>>
@@ -405,6 +477,11 @@ impl ConnectOrStart {
     }
 }
 
+enum StartOutcome {
+    Started(ServerRecord),
+    Failed(Vec<StartupDiagnostic>),
+}
+
 fn ensure_private_directory(path: &Path) -> io::Result<()> {
     fs::create_dir_all(path)?;
     set_private_directory_permissions(path)
@@ -449,7 +526,7 @@ fn set_private_file_permissions(_path: &Path) -> io::Result<()> {
 pub enum ConnectError<E> {
     Request(E),
     RequestMayHaveBeenTransmitted(E),
-    ServerUnavailable,
+    Startup(Vec<StartupDiagnostic>),
     State(io::Error),
 }
 
@@ -469,10 +546,12 @@ mod tests {
     use std::{
         cell::{Cell, RefCell},
         future::Future,
+        net::TcpListener,
         path::Path,
         sync::{
-            Arc,
+            Arc, Barrier, Mutex,
             atomic::{AtomicU8, Ordering},
+            mpsc,
         },
         task::{Context, Poll, Waker},
         time::Duration,
@@ -480,6 +559,7 @@ mod tests {
 
     use super::{
         ConnectError, ConnectOrStart, OpenCodeRequest, RequestFailure, ServerRecord, ServerRuntime,
+        StartupStage, SystemRuntime,
     };
 
     struct Runtime {
@@ -503,7 +583,7 @@ mod tests {
             panic!("the warm path must not spawn")
         }
 
-        fn wait_until_ready(&self, _port: u16, _timeout: Duration) -> bool {
+        fn wait_until_ready(&self, _port: u16, _timeout: Duration) -> Result<(), String> {
             panic!("the warm path must not probe")
         }
 
@@ -551,13 +631,14 @@ mod tests {
     #[test]
     fn racing_cold_starts_spawn_once_and_the_loser_adopts_the_winner_record() {
         let directory = tempfile::tempdir().expect("temporary state directory");
+        let port = available_loopback_port();
         let runtime = Arc::new(RacingRuntime::default());
         let first_directory = directory.path().to_path_buf();
         let first_runtime = Arc::clone(&runtime);
         let first = std::thread::spawn(move || {
             let mut request = ReadyRequest;
             block_on(
-                ConnectOrStart::new(first_directory, 4096, [], Duration::from_millis(50))
+                ConnectOrStart::new(first_directory, port, [], Duration::from_millis(50))
                     .connect_or_start(first_runtime.as_ref(), &mut request),
             )
         });
@@ -567,13 +648,144 @@ mod tests {
 
         let mut request = ReadyRequest;
         block_on(
-            ConnectOrStart::new(directory.path(), 4096, [], Duration::from_millis(50))
+            ConnectOrStart::new(directory.path(), port, [], Duration::from_millis(50))
                 .connect_or_start(runtime.as_ref(), &mut request),
         )
         .expect("loser adopts the winner");
         first.join().expect("winner thread").expect("winner starts");
 
         assert_eq!(runtime.spawned.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn racing_stale_field_equal_records_spawn_once_and_both_callers_recover() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let port = available_loopback_port();
+        let manager = ConnectOrStart::new(directory.path(), port, [], Duration::from_millis(50));
+        manager
+            .write_record(&ServerRecord::new(port, "1.18.10", "environment"))
+            .expect("stale field-equal discovery hint");
+        let runtime = Arc::new(RacingRuntime::default());
+        let barrier = Arc::new(Barrier::new(2));
+        let first_directory = directory.path().to_path_buf();
+        let first_runtime = Arc::clone(&runtime);
+        let first_barrier = Arc::clone(&barrier);
+        let first = std::thread::spawn(move || {
+            let mut request = StaleOnceRequest::new(first_barrier);
+            block_on(
+                ConnectOrStart::new(first_directory, port, [], Duration::from_millis(50))
+                    .connect_or_start(first_runtime.as_ref(), &mut request),
+            )
+        });
+        let mut request = StaleOnceRequest::new(barrier);
+        let second = block_on(manager.connect_or_start(runtime.as_ref(), &mut request));
+
+        second.expect("second caller recovers");
+        first.join().expect("winner thread").expect("winner starts");
+
+        assert_eq!(runtime.spawned.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn equal_post_lock_record_is_adopted_only_when_its_port_is_live() {
+        post_lock_record_is_adopted_when_live(false);
+    }
+
+    #[test]
+    fn changed_post_lock_record_is_adopted_only_when_its_port_is_live() {
+        post_lock_record_is_adopted_when_live(true);
+    }
+
+    #[test]
+    fn dead_post_lock_record_is_not_adopted_and_starts_recovery() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let stale_port = available_loopback_port();
+        let recovery_port = available_loopback_port();
+        let manager = ConnectOrStart::new(
+            directory.path(),
+            recovery_port,
+            [],
+            Duration::from_millis(50),
+        );
+        manager
+            .write_record(&ServerRecord::new(stale_port, "1.18.10", "environment"))
+            .expect("stale discovery hint");
+        let lock = manager.acquire_start_lock().expect("held start lock");
+        let runtime = Arc::new(RacingRuntime::default());
+        let (failed_tx, failed_rx) = mpsc::channel();
+        let worker_manager = manager.clone();
+        let worker_runtime = Arc::clone(&runtime);
+        let worker = std::thread::spawn(move || {
+            let mut request = SignalledStaleRequest::new(failed_tx);
+            block_on(worker_manager.connect_or_start(worker_runtime.as_ref(), &mut request))
+        });
+
+        failed_rx.recv().expect("initial request failed");
+        manager
+            .write_record(&ServerRecord::new(stale_port, "1.18.10", "environment"))
+            .expect("still-dead field-equal record");
+        lock.unlock().expect("release start lock");
+
+        worker
+            .join()
+            .expect("recovery thread")
+            .expect("dead record triggers recovery");
+        assert_eq!(runtime.spawned.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn startup_error_retains_every_candidate_diagnostic() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let runtime = DiagnosticRuntime::all_fail();
+        let mut request = ReadyRequest;
+
+        let error = block_on(
+            ConnectOrStart::new(directory.path(), 4096, [4097, 4098], Duration::ZERO)
+                .connect_or_start(&runtime, &mut request),
+        )
+        .expect_err("all startup candidates fail");
+
+        let ConnectError::Startup(diagnostics) = error else {
+            panic!("expected typed startup diagnostics")
+        };
+        assert_eq!(diagnostics.len(), 3);
+        assert_eq!(diagnostics[0].port, 4096);
+        assert_eq!(diagnostics[0].stage, StartupStage::Spawn);
+        assert_eq!(diagnostics[0].reason, "permission denied");
+        assert_eq!(diagnostics[1].port, 4097);
+        assert_eq!(diagnostics[1].stage, StartupStage::Readiness);
+        assert_eq!(diagnostics[1].reason, "final connect error: refused");
+        assert_eq!(diagnostics[2].port, 4098);
+        assert_eq!(diagnostics[2].stage, StartupStage::Spawn);
+        assert!(diagnostics[2].reason.contains("unavailable"));
+    }
+
+    #[test]
+    fn successful_alternate_warns_with_the_discarded_primary_diagnostic() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let runtime = DiagnosticRuntime::alternate_succeeds();
+        let mut request = ReadyRequest;
+
+        block_on(
+            ConnectOrStart::new(directory.path(), 4096, [4097], Duration::ZERO)
+                .connect_or_start(&runtime, &mut request),
+        )
+        .expect("alternate starts");
+
+        let warnings = runtime.warnings.borrow();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("4096"));
+        assert!(warnings[0].contains("spawn"));
+        assert!(warnings[0].contains("permission denied"));
+    }
+
+    #[test]
+    fn system_readiness_timeout_returns_its_final_connection_error() {
+        let error = SystemRuntime::default()
+            .wait_until_ready(0, Duration::ZERO)
+            .expect_err("unused port never becomes ready");
+
+        assert!(!error.is_empty());
     }
 
     #[test]
@@ -687,8 +899,8 @@ mod tests {
             Ok(())
         }
 
-        fn wait_until_ready(&self, _port: u16, _timeout: Duration) -> bool {
-            true
+        fn wait_until_ready(&self, _port: u16, _timeout: Duration) -> Result<(), String> {
+            Ok(())
         }
 
         fn warn(&self, _message: &str) {}
@@ -697,6 +909,7 @@ mod tests {
     #[derive(Default)]
     struct RacingRuntime {
         spawned: AtomicU8,
+        listeners: Mutex<Vec<TcpListener>>,
     }
 
     impl ServerRuntime for RacingRuntime {
@@ -712,17 +925,224 @@ mod tests {
             true
         }
 
-        fn spawn(&self, _port: u16, _log_path: &Path) -> Result<(), String> {
+        fn spawn(&self, port: u16, _log_path: &Path) -> Result<(), String> {
             self.spawned.fetch_add(1, Ordering::SeqCst);
-            std::thread::sleep(Duration::from_millis(30));
+            self.listeners
+                .lock()
+                .expect("listener lock")
+                .push(TcpListener::bind(("127.0.0.1", port)).map_err(|error| error.to_string())?);
             Ok(())
         }
 
-        fn wait_until_ready(&self, _port: u16, _timeout: Duration) -> bool {
-            true
+        fn wait_until_ready(&self, _port: u16, _timeout: Duration) -> Result<(), String> {
+            Ok(())
         }
 
         fn warn(&self, _message: &str) {}
+    }
+
+    struct StaleOnceRequest {
+        first_failure: Arc<Barrier>,
+        attempts: u8,
+    }
+
+    impl StaleOnceRequest {
+        fn new(first_failure: Arc<Barrier>) -> Self {
+            Self {
+                first_failure,
+                attempts: 0,
+            }
+        }
+    }
+
+    impl OpenCodeRequest for StaleOnceRequest {
+        type Output = ();
+        type Error = &'static str;
+
+        fn send(
+            &mut self,
+            _client: &oca_opencode::OpenCodeClient,
+        ) -> impl Future<Output = Result<Self::Output, RequestFailure<Self::Error>>> + Send
+        {
+            self.attempts += 1;
+            if self.attempts == 1 {
+                self.first_failure.wait();
+                std::future::ready(Err(RequestFailure::Connection("stale record")))
+            } else {
+                std::future::ready(Ok(()))
+            }
+        }
+    }
+
+    struct SignalledStaleRequest {
+        failed: Option<mpsc::Sender<()>>,
+    }
+
+    impl SignalledStaleRequest {
+        fn new(failed: mpsc::Sender<()>) -> Self {
+            Self {
+                failed: Some(failed),
+            }
+        }
+    }
+
+    impl OpenCodeRequest for SignalledStaleRequest {
+        type Output = ();
+        type Error = &'static str;
+
+        fn send(
+            &mut self,
+            _client: &oca_opencode::OpenCodeClient,
+        ) -> impl Future<Output = Result<Self::Output, RequestFailure<Self::Error>>> + Send
+        {
+            if let Some(failed) = self.failed.take() {
+                failed.send(()).expect("signal initial failure");
+                std::future::ready(Err(RequestFailure::Connection("stale record")))
+            } else {
+                std::future::ready(Ok(()))
+            }
+        }
+    }
+
+    struct NeverSpawnRuntime;
+
+    impl ServerRuntime for NeverSpawnRuntime {
+        fn opencode_version(&self) -> Result<String, String> {
+            Ok("1.18.10".to_owned())
+        }
+
+        fn start_environment_hash(&self) -> String {
+            "environment".to_owned()
+        }
+
+        fn port_is_available(&self, _port: u16) -> bool {
+            panic!("a live post-lock record must be adopted")
+        }
+
+        fn spawn(&self, _port: u16, _log_path: &Path) -> Result<(), String> {
+            panic!("a live post-lock record must be adopted")
+        }
+
+        fn wait_until_ready(&self, _port: u16, _timeout: Duration) -> Result<(), String> {
+            panic!("a live post-lock record must be adopted")
+        }
+
+        fn warn(&self, _message: &str) {}
+    }
+
+    fn post_lock_record_is_adopted_when_live(changed: bool) {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let initial_listener = TcpListener::bind(("127.0.0.1", 0)).expect("live initial record");
+        let initial_port = initial_listener
+            .local_addr()
+            .expect("initial loopback address")
+            .port();
+        let replacement_listener = changed
+            .then(|| TcpListener::bind(("127.0.0.1", 0)).expect("live changed replacement record"));
+        let post_lock_port = replacement_listener
+            .as_ref()
+            .map_or(initial_port, |listener| {
+                listener
+                    .local_addr()
+                    .expect("replacement loopback address")
+                    .port()
+            });
+        if changed {
+            assert_ne!(initial_port, post_lock_port, "record port must change");
+        }
+        let manager = ConnectOrStart::new(
+            directory.path(),
+            initial_port,
+            [],
+            Duration::from_millis(50),
+        );
+        manager
+            .write_record(&ServerRecord::new(initial_port, "1.18.10", "environment"))
+            .expect("initial stale record");
+        let lock = manager.acquire_start_lock().expect("held start lock");
+        let runtime = Arc::new(NeverSpawnRuntime);
+        let (failed_tx, failed_rx) = mpsc::channel();
+        let worker_manager = manager.clone();
+        let worker_runtime = Arc::clone(&runtime);
+        let worker = std::thread::spawn(move || {
+            let mut request = SignalledStaleRequest::new(failed_tx);
+            block_on(worker_manager.connect_or_start(worker_runtime.as_ref(), &mut request))
+        });
+
+        failed_rx.recv().expect("initial request failed");
+        manager
+            .write_record(&ServerRecord::new(post_lock_port, "1.18.10", "environment"))
+            .expect("post-lock record");
+        lock.unlock().expect("release start lock");
+
+        worker
+            .join()
+            .expect("recovery thread")
+            .expect("live post-lock record is adopted");
+        drop((initial_listener, replacement_listener));
+    }
+
+    struct DiagnosticRuntime {
+        alternate_succeeds: bool,
+        warnings: RefCell<Vec<String>>,
+    }
+
+    impl DiagnosticRuntime {
+        fn all_fail() -> Self {
+            Self {
+                alternate_succeeds: false,
+                warnings: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn alternate_succeeds() -> Self {
+            Self {
+                alternate_succeeds: true,
+                warnings: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ServerRuntime for DiagnosticRuntime {
+        fn opencode_version(&self) -> Result<String, String> {
+            Ok("1.18.10".to_owned())
+        }
+
+        fn start_environment_hash(&self) -> String {
+            "environment".to_owned()
+        }
+
+        fn port_is_available(&self, port: u16) -> bool {
+            port != 4098
+        }
+
+        fn spawn(&self, port: u16, _log_path: &Path) -> Result<(), String> {
+            if port == 4096 {
+                Err("permission denied".to_owned())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn wait_until_ready(&self, port: u16, _timeout: Duration) -> Result<(), String> {
+            if port == 4097 && !self.alternate_succeeds {
+                Err("final connect error: refused".to_owned())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn warn(&self, message: &str) {
+            self.warnings.borrow_mut().push(message.to_owned());
+        }
+    }
+
+    fn available_loopback_port() -> u16 {
+        TcpListener::bind(("127.0.0.1", 0))
+            .expect("ephemeral loopback listener")
+            .local_addr()
+            .expect("loopback address")
+            .port()
     }
 
     struct ReadyRequest;
@@ -791,7 +1211,7 @@ mod tests {
             panic!("a warm record must not spawn")
         }
 
-        fn wait_until_ready(&self, _port: u16, _timeout: Duration) -> bool {
+        fn wait_until_ready(&self, _port: u16, _timeout: Duration) -> Result<(), String> {
             panic!("a warm record must not probe")
         }
 

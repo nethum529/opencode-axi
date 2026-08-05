@@ -4,5 +4,5 @@ mod server;
 
 pub use server::{
     ConnectError, ConnectOrStart, OpenCodeRequest, RequestFailure, ServerRecord, ServerRuntime,
-    SystemRuntime, default_start_environment_hash,
+    StartupDiagnostic, StartupStage, SystemRuntime, default_start_environment_hash,
 };
