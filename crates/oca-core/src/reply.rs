@@ -43,7 +43,8 @@ pub struct ReviewFinding {
 }
 
 /// A reply whose JSON shape has already passed the role's structural schema.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
 pub enum RoleReply {
     Impl(ImplReply),
     Review(ReviewReply),

@@ -340,6 +340,7 @@ fn prepare_attach_home(home: &Path, socket: &Path, port: u16) {
             commit_subject: None,
             display: None,
             herdr_tab: None,
+            completion: None,
             tombstoned: false,
         })
         .unwrap();

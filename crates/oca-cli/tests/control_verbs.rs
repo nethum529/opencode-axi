@@ -266,6 +266,7 @@ fn prepared_home(port: u16, state: RefState, effort: &str) -> tempfile::TempDir 
             commit_subject: None,
             display: None,
             herdr_tab: None,
+            completion: None,
             tombstoned: false,
         })
         .expect("seed ref");

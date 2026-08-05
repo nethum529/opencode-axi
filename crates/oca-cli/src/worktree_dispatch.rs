@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use oca_core::{ErrorCode, ForegroundRequest, OcaError, WorkerPolicy, WorkerState};
+use oca_core::{ErrorCode, ForegroundRequest, OcaError, RoleReply, WorkerPolicy, WorkerState};
 use oca_git::{GitError, RefId, RelativePath, TaskSummary, WorktreeManager, commit};
 use oca_state::{NewRef, RefPatch, RefState, RefStore};
 
@@ -116,16 +116,21 @@ impl WorktreeDispatch {
 pub(crate) fn finalize_turn(
     refs: &RefStore,
     reference: &str,
-    state: WorkerState,
+    reply: &RoleReply,
 ) -> Result<(), OcaError> {
     let record = refs
         .resolve(reference)
         .map_err(|error| state_error("could not read terminal ref", error))?
         .ok_or_else(|| OcaError::new(ErrorCode::UnknownRef).with_ref(reference))?;
-    let ref_state = ref_state(state);
+    let ref_state = ref_state(reply_state(reply));
     let Some(worktree) = record.worktree.as_deref() else {
         return refs
-            .patch(reference, RefPatch::default().with_last_state(ref_state))
+            .patch(
+                reference,
+                RefPatch::default()
+                    .with_last_state(ref_state)
+                    .with_completion(reply.clone()),
+            )
             .map(|_| ())
             .map_err(|error| state_error("could not update terminal ref state", error));
     };
@@ -146,7 +151,8 @@ pub(crate) fn finalize_turn(
         reference,
         RefPatch::default()
             .with_last_state(ref_state)
-            .with_commit(committed.id()),
+            .with_commit(committed.id())
+            .with_completion(reply.clone()),
     )
     .map(|_| ())
     .map_err(|error| state_error("could not store committed turn", error))
@@ -175,9 +181,11 @@ fn git_error(error: GitError) -> OcaError {
         GitError::WorktreeEmpty => ErrorCode::WorktreeEmpty,
         GitError::InvalidRef { .. } | GitError::InvalidRelativePath { .. } => ErrorCode::Usage,
         GitError::WorktreeChanged { .. }
+        | GitError::DirtyWorktree
         | GitError::LockTimeout
         | GitError::Io(_)
         | GitError::GitCommand { .. } => ErrorCode::WorktreeDirty,
+        GitError::RemoteMissing { .. } => ErrorCode::ServerUnavailable,
     };
     OcaError::new(code).with_error(error.to_string())
 }
@@ -190,7 +198,7 @@ fn state_error(context: &str, error: impl std::fmt::Display) -> OcaError {
 mod tests {
     use std::{path::Path, process::Command};
 
-    use oca_core::WorkerState;
+    use oca_core::{ImplReply, RoleReply, WorkerState};
     use oca_state::{NewRef, RefPatch, RefState, RefStore, RefStorePaths};
 
     use super::finalize_turn;
@@ -213,7 +221,7 @@ mod tests {
             .acknowledge_with(|_| Ok::<(), std::io::Error>(()))
             .expect("finish ref allocation");
 
-        finalize_turn(&store, &reference, WorkerState::Done)
+        finalize_turn(&store, &reference, &reply(WorkerState::Done))
             .expect("non-worktree state finalization must not invoke git");
 
         assert_eq!(
@@ -260,7 +268,7 @@ mod tests {
             .unwrap();
 
         std::fs::write(repository.path().join("first.txt"), "partial\n").unwrap();
-        finalize_turn(&store, &reference, WorkerState::Partial).unwrap();
+        finalize_turn(&store, &reference, &reply(WorkerState::Partial)).unwrap();
         let first = store.resolve(&reference).unwrap().unwrap().commit.unwrap();
 
         store
@@ -270,8 +278,17 @@ mod tests {
             )
             .unwrap();
         std::fs::write(repository.path().join("second.txt"), "review\n").unwrap();
-        finalize_turn(&store, &reference, WorkerState::Done).unwrap();
+        finalize_turn(&store, &reference, &reply(WorkerState::Done)).unwrap();
         let second = store.resolve(&reference).unwrap().unwrap().commit.unwrap();
+        assert!(
+            store
+                .resolve(&reference)
+                .unwrap()
+                .unwrap()
+                .completion
+                .is_some(),
+            "the validated completion record must be available to publication"
+        );
 
         assert_ne!(first, second, "the review checkpoint must be a new commit");
         let subjects = git_output(repository.path(), ["log", "-2", "--format=%s"]);
@@ -303,5 +320,14 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "git {arguments:?} failed");
         String::from_utf8(output.stdout).unwrap()
+    }
+
+    fn reply(status: WorkerState) -> RoleReply {
+        ImplReply {
+            status,
+            files: Vec::new(),
+            note: "A deterministic completion note is persisted for later publication. The test verifies commit finalization remains coupled to that validated record.".to_owned(),
+        }
+        .into()
     }
 }

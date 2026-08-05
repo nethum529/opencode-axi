@@ -13,8 +13,10 @@ use std::{
 };
 
 mod commit;
+mod publish;
 
 pub use commit::{CommitRecord, TaskSummary, commit};
+pub use publish::{PublishRepository, branch_matches, is_protected_branch};
 
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
 const DEFAULT_LOCK_ACQUISITION_TIMEOUT: Duration = Duration::from_secs(10);
@@ -157,6 +159,10 @@ pub enum GitError {
     WorktreeEmpty,
     /// The worktree changed after its initial scan and before commit handoff.
     WorktreeChanged { paths: Vec<RelativePath> },
+    /// A publish was attempted from a worktree with uncommitted changes.
+    DirtyWorktree,
+    /// The configured publication remote does not exist in this repository.
+    RemoteMissing { remote: String },
     /// Another live process retained the repository lock past the acquisition timeout.
     LockTimeout,
     /// An operating-system operation failed.
@@ -180,6 +186,8 @@ impl GitError {
             Self::ZeroByteOutput { .. } => "zero_byte_output",
             Self::WorktreeEmpty => "worktree_empty",
             Self::WorktreeChanged { .. } => "worktree_changed",
+            Self::DirtyWorktree => "worktree_dirty",
+            Self::RemoteMissing { .. } => "remote_missing",
             Self::LockTimeout => "lock_timeout",
             Self::Io(_) | Self::GitCommand { .. } => "git_error",
         }
@@ -206,6 +214,10 @@ impl fmt::Display for GitError {
             Self::WorktreeChanged { paths } => {
                 write!(formatter, "worktree changed during validation: {paths:?}")
             }
+            Self::DirtyWorktree => formatter.write_str("worktree has uncommitted changes"),
+            Self::RemoteMissing { remote } => {
+                write!(formatter, "configured remote `{remote}` does not exist")
+            }
             Self::LockTimeout => formatter.write_str("timed out waiting for the repository lock"),
             Self::Io(error) => write!(formatter, "filesystem operation failed: {error}"),
             Self::GitCommand { operation, status } => {
@@ -226,6 +238,8 @@ impl std::error::Error for GitError {
             | Self::ZeroByteOutput { .. }
             | Self::WorktreeEmpty
             | Self::WorktreeChanged { .. }
+            | Self::DirtyWorktree
+            | Self::RemoteMissing { .. }
             | Self::LockTimeout
             | Self::GitCommand { .. } => None,
         }

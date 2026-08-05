@@ -13,6 +13,8 @@ mod events;
 mod follow;
 mod foreground;
 mod list;
+mod publish;
+mod pull_request;
 mod scope;
 mod transport;
 mod worktree_dispatch;
@@ -24,6 +26,7 @@ pub use events::execute_events;
 pub use follow::{FollowCommandOutput, execute_follow};
 pub use foreground::execute_foreground;
 pub use list::execute_list;
+pub use publish::{PublishCommandOutput, execute_pull_request, execute_push};
 
 /// The fixed command grammar accepted by `oca`.
 #[derive(Clone, Debug, Eq, PartialEq)]

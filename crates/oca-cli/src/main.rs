@@ -89,7 +89,24 @@ fn main() -> ExitCode {
             runtime.block_on(oca_cli::execute_attach(&command, home));
             ExitCode::SUCCESS
         }
-        Ok(_) => ExitCode::SUCCESS,
+        Ok((home, oca_cli::Command::Push(command))) => {
+            match oca_cli::execute_push(&command, home) {
+                Ok(output) => {
+                    print!("{}", output.stdout);
+                    ExitCode::SUCCESS
+                }
+                Err(error) => render_error(&error, json),
+            }
+        }
+        Ok((home, oca_cli::Command::PullRequest(command))) => {
+            match oca_cli::execute_pull_request(&command, home) {
+                Ok(output) => {
+                    print!("{}", output.stdout);
+                    ExitCode::SUCCESS
+                }
+                Err(error) => render_error(&error, json),
+            }
+        }
         Err(error) => render_error(&error, json),
     }
 }

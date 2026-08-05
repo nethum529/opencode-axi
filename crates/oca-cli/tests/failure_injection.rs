@@ -171,6 +171,7 @@ fn every_429_is_terminal_rate_limited_with_retry_metadata_and_no_replay() {
             commit_subject: None,
             display: None,
             herdr_tab: None,
+            completion: None,
             tombstoned: false,
         })
         .expect("follow ref");

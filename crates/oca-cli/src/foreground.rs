@@ -24,7 +24,7 @@ use crate::{
     DispatchCommand,
     scope::Scope,
     transport::{CreateSessionOperation, connect_error, open_code_error, prompt_error},
-    worktree_dispatch::{WorktreeDispatch, finalize_turn, reply_state},
+    worktree_dispatch::{WorktreeDispatch, finalize_turn},
 };
 
 /// Executes a parsed foreground dispatch using the user's local state root.
@@ -446,7 +446,7 @@ impl ForegroundBackend for ProductionBackend {
     }
 
     fn finalize(&mut self, reference: &str, reply: &RoleReply) -> Result<(), OcaError> {
-        finalize_turn(&self.refs, reference, reply_state(reply))
+        finalize_turn(&self.refs, reference, reply)
     }
 
     fn print_final(

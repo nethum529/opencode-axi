@@ -290,6 +290,7 @@ mod tests {
                 commit_subject: None,
                 display: None,
                 herdr_tab: None,
+                completion: None,
                 tombstoned: false,
             })
             .unwrap();
