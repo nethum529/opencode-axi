@@ -15,6 +15,8 @@ const TEST_TIMEOUT: Duration = Duration::from_millis(20);
 enum FakeResponse {
     Result(Value),
     MalformedEnvelope,
+    WrongResultType,
+    MismatchedId,
     Never,
 }
 
@@ -84,6 +86,28 @@ fn workspace_rejects_a_malformed_response_envelope() {
     let fixture = Fixture::new(1, |_, request| {
         assert_request(request, "workspace.list");
         FakeResponse::MalformedEnvelope
+    });
+
+    assert_malformed(run(fixture.client().workspace("oca")).unwrap_err());
+    fixture.finish();
+}
+
+#[test]
+fn a_well_formed_envelope_carrying_another_call_s_result_type_is_rejected() {
+    let fixture = Fixture::new(1, |_, request| {
+        assert_request(request, "workspace.list");
+        FakeResponse::WrongResultType
+    });
+
+    assert_malformed(run(fixture.client().workspace("oca")).unwrap_err());
+    fixture.finish();
+}
+
+#[test]
+fn a_response_correlated_to_another_request_id_is_rejected() {
+    let fixture = Fixture::new(1, |_, request| {
+        assert_request(request, "workspace.list");
+        FakeResponse::MismatchedId
     });
 
     assert_malformed(run(fixture.client().workspace("oca")).unwrap_err());
@@ -378,6 +402,24 @@ fn serve(mut stream: UnixStream, request_id: &str, response: FakeResponse) {
         }
         FakeResponse::MalformedEnvelope => {
             writeln!(stream, "{}", json!({"id":request_id,"result":{}})).unwrap();
+        }
+        // Structurally valid for `workspace_list`, so only the declared result
+        // type distinguishes it from a genuine reply.
+        FakeResponse::WrongResultType => {
+            writeln!(
+                stream,
+                "{}",
+                json!({"id":request_id,"result":{"type":"tab_created","workspaces":[]}})
+            )
+            .unwrap();
+        }
+        FakeResponse::MismatchedId => {
+            writeln!(
+                stream,
+                "{}",
+                json!({"id":"herdr:someone-elses-request","result":{"type":"workspace_list","workspaces":[]}})
+            )
+            .unwrap();
         }
         FakeResponse::Never => thread::sleep(Duration::from_millis(50)),
     }
