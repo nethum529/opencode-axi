@@ -588,6 +588,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_redelivered_event_id_is_journaled_only_once() {
+        let transport = ScriptedTransport {
+            subscriptions: Mutex::new(VecDeque::from([subscription([
+                Ok(Some(event("evt-part", "message.part.updated", None))),
+                Ok(Some(event("evt-part", "message.part.updated", None))),
+                Ok(Some(event(
+                    "evt-own",
+                    "message.updated",
+                    Some(message("msg_this_dispatch", "done", true)),
+                ))),
+                Ok(Some(event("evt-idle-own", "session.idle", None))),
+            ])])),
+            reconciliations: Mutex::new(VecDeque::from([Ok(Vec::new())])),
+            cursors: Mutex::new(Vec::new()),
+        };
+        let mut journal = Journal::default();
+
+        let outcome = follow_until_terminal_with_policy(
+            &transport,
+            &target(),
+            None,
+            Some(&mut journal),
+            test_policy(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.exit(), FollowExit::Success);
+        assert_eq!(
+            journal.0,
+            ["message.part.updated", "message.updated", "session.idle"],
+            "a redelivered event id is dropped before the journal"
+        );
+    }
+
+    #[tokio::test]
     async fn reconnect_uses_last_event_id_without_a_second_reconciliation() {
         let transport = ScriptedTransport {
             subscriptions: Mutex::new(VecDeque::from([

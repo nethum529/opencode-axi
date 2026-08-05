@@ -139,17 +139,13 @@ fn render_terminal(reference: &str, terminal: &FollowTerminal, json: bool) -> St
             writeln!(output, "status: {status}").expect("writing to a String cannot fail");
         }
         if let Some(files) = object.get("files").and_then(Value::as_array) {
+            let count = files.len();
             let files = files
                 .iter()
                 .filter_map(Value::as_str)
                 .collect::<Vec<_>>()
                 .join(", ");
-            writeln!(
-                output,
-                "files[{}]: {files}",
-                object["files"].as_array().unwrap().len()
-            )
-            .expect("writing to a String cannot fail");
+            writeln!(output, "files[{count}]: {files}").expect("writing to a String cannot fail");
         }
         if let Some(note) = object.get("note").and_then(Value::as_str) {
             writeln!(
