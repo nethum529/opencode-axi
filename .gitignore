@@ -4,3 +4,4 @@
 # `.claude/consult.enabled` is tracked repo config and must stay tracked, so this is scoped
 # to the one file rather than to the directory.
 /.claude/consult-ledger.md
+/.codegraph/
