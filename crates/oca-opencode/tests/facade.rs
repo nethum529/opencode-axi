@@ -177,7 +177,7 @@ async fn prompt_async_wraps_an_output_schema_in_the_pinned_format_envelope() {
 }
 
 #[tokio::test]
-async fn queue_uses_the_legacy_prompt_async_operation_with_the_native_variant() {
+async fn queue_uses_the_legacy_prompt_async_operation_with_queue_delivery() {
     let server = FakeServer::once(response("204 No Content", "text/plain", ""));
     let client = OpenCodeClient::new(server.base_url.parse().expect("valid URL"));
 
@@ -188,7 +188,13 @@ async fn queue_uses_the_legacy_prompt_async_operation_with_the_native_variant() 
 
     let request = server.finish();
     assert!(request.starts_with("POST /session/ses_target/prompt_async HTTP/1.1\r\n"));
-    assert_prompt_body(&request);
+    let body = request
+        .split_once("\r\n\r\n")
+        .expect("request has a body")
+        .1;
+    let body = serde_json::from_str::<serde_json::Value>(body).expect("prompt body is JSON");
+    assert_eq!(body["delivery"], "queue");
+    assert_eq!(body["variant"], "high");
 }
 
 #[tokio::test]

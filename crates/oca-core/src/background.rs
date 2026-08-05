@@ -120,6 +120,7 @@ mod tests {
             &mut self,
             _session_id: &str,
             _message_id: &str,
+            _request: &crate::ForegroundRequest,
         ) -> Result<Self::PendingRef, OcaError> {
             self.calls.push("write_ref");
             Ok("wback1".to_owned())

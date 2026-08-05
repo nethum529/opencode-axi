@@ -8,7 +8,7 @@ use oca_core::{
 };
 use oca_opencode::OpenCodeClient;
 use oca_server::ConnectOrStart;
-use oca_state::{EventJournal, OcaConfig, RefStore, RefStorePaths};
+use oca_state::{EventJournal, OcaConfig, RefPatch, RefState, RefStore, RefStorePaths};
 use serde_json::{Map, Value};
 use url::Url;
 
@@ -90,14 +90,22 @@ pub async fn execute_follow(
         .map_err(|error| journal_error(&command.reference, &error.to_string()))?;
 
     match outcome {
-        FollowOutcome::Terminal(terminal) => Ok(FollowCommandOutput {
-            exit: if terminal.state == WorkerState::Blocked {
-                FollowExit::Blocked
-            } else {
-                FollowExit::Success
-            },
-            stdout: render_terminal(&command.reference, &terminal, command.json),
-        }),
+        FollowOutcome::Terminal(terminal) => {
+            store
+                .patch(
+                    &command.reference,
+                    RefPatch::default().with_last_state(ref_state(terminal.state)),
+                )
+                .map_err(|error| state_error(&command.reference, &error.to_string()))?;
+            Ok(FollowCommandOutput {
+                exit: if terminal.state == WorkerState::Blocked {
+                    FollowExit::Blocked
+                } else {
+                    FollowExit::Success
+                },
+                stdout: render_terminal(&command.reference, &terminal, command.json),
+            })
+        }
         FollowOutcome::Timeout => Ok(FollowCommandOutput {
             exit: FollowExit::Timeout,
             stdout: format!("oca wake ref={} state=timeout\n", command.reference),
@@ -106,6 +114,14 @@ pub async fn execute_follow(
             &command.reference,
             "the OpenCode server could not be reached",
         )),
+    }
+}
+
+const fn ref_state(state: WorkerState) -> RefState {
+    match state {
+        WorkerState::Done => RefState::Done,
+        WorkerState::Blocked => RefState::Blocked,
+        WorkerState::Partial => RefState::Partial,
     }
 }
 

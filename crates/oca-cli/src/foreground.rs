@@ -18,7 +18,9 @@ use oca_opencode::{
     attributed_structured_reply, is_target_session_idle,
 };
 use oca_server::ConnectOrStart;
-use oca_state::{NewRef, OcaConfig, PendingRefAllocation, RefStore, RefStorePaths};
+use oca_state::{
+    NewRef, OcaConfig, PendingRefAllocation, RefPatch, RefState, RefStore, RefStorePaths,
+};
 
 use crate::DispatchCommand;
 
@@ -216,9 +218,20 @@ impl ForegroundBackend for ProductionBackend {
         &mut self,
         session_id: &str,
         message_id: &str,
+        request: &ForegroundRequest,
     ) -> Result<Self::PendingRef, OcaError> {
         self.refs
-            .allocate(NewRef::for_session(session_id).with_message_id(message_id))
+            .allocate(
+                NewRef::for_session(session_id)
+                    .with_message_id(message_id)
+                    .with_control_metadata(
+                        &request.model.alias,
+                        &request.model.effort,
+                        &request.role,
+                        request.cwd.display().to_string(),
+                        RefState::Running,
+                    ),
+            )
             .map_err(|error| state_error("could not write ref record", error))
     }
 
@@ -317,9 +330,21 @@ impl ForegroundBackend for ProductionBackend {
         }
     }
 
-    fn finalize(&mut self, _reference: &str, _reply: &RoleReply) -> Result<(), OcaError> {
+    fn finalize(&mut self, reference: &str, reply: &RoleReply) -> Result<(), OcaError> {
         // Non-worktree dispatch has no git finalization side effect.
-        Ok(())
+        let state = match reply {
+            RoleReply::Impl(reply) => reply.status,
+            RoleReply::Review(reply) => reply.status,
+        };
+        let state = match state {
+            WorkerState::Done => RefState::Done,
+            WorkerState::Blocked => RefState::Blocked,
+            WorkerState::Partial => RefState::Partial,
+        };
+        self.refs
+            .patch(reference, RefPatch::default().with_last_state(state))
+            .map(|_| ())
+            .map_err(|error| state_error("could not update terminal ref state", error))
     }
 
     fn print_final(
