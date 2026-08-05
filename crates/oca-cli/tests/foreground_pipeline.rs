@@ -26,8 +26,8 @@ fn end_to_end_foreground_has_one_turn_one_terminal_and_one_golden_final_result()
         state.join("server.json"),
         serde_json::to_vec(&json!({
             "port": port,
-            "version": "1.18.10",
-            "environment_hash": "fake"
+            "version": installed_opencode_version(),
+            "environment_hash": environment_hash_for(home.path())
         }))
         .unwrap(),
     )
@@ -199,4 +199,37 @@ fn write_response(stream: &mut TcpStream, status: &str, content_type: &str, body
         body.len()
     )
     .expect("fake response");
+}
+
+fn installed_opencode_version() -> String {
+    Command::new("opencode")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_else(|| "1.18.10".to_owned())
+}
+
+fn environment_hash_for(home: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for key in [
+        "HOME",
+        "OPENCODE_CONFIG",
+        "OPENCODE_CONFIG_DIR",
+        "PATH",
+        "XDG_CONFIG_HOME",
+    ] {
+        hasher.update(key.as_bytes());
+        hasher.update([0]);
+        if key == "HOME" {
+            hasher.update(home.as_os_str().to_string_lossy().as_bytes());
+        } else if let Some(value) = std::env::var_os(key) {
+            hasher.update(value.to_string_lossy().as_bytes());
+        }
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
 }

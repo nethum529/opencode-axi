@@ -13,6 +13,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod failure;
+
+pub use failure::{FailureAction, FailureHttpServer};
+
 /// A transport-neutral HTTP request captured by the recorder or accepted by replay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpRequest {

@@ -6,7 +6,9 @@ use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::{Map, Value, json};
 use url::Url;
 
-use crate::{SseChunkSource, SseError, SseEvent, SseStream, generated};
+use crate::{
+    RateLimit, SseChunkSource, SseError, SseEvent, SseStream, TransmissionStage, generated,
+};
 
 /// A session identifier assigned by `OpenCode`.
 pub type SessionId = String;
@@ -84,9 +86,21 @@ pub struct AbortAccepted {
 /// Failures produced while adapting the `OpenCode` HTTP API.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum OpenCodeError {
-    ProtocolMismatch { message: String },
-    Server { status: u16, body: String },
-    Transport { message: String },
+    ProtocolMismatch {
+        message: String,
+    },
+    Server {
+        status: u16,
+        body: String,
+    },
+    RateLimited {
+        body: String,
+        limit: RateLimit,
+    },
+    Transport {
+        stage: TransmissionStage,
+        message: String,
+    },
 }
 
 impl fmt::Display for OpenCodeError {
@@ -96,7 +110,10 @@ impl fmt::Display for OpenCodeError {
             Self::Server { status, body } => {
                 write!(formatter, "OpenCode returned HTTP {status}: {body}")
             }
-            Self::Transport { message } => {
+            Self::RateLimited { body, .. } => {
+                write!(formatter, "OpenCode returned HTTP 429: {body}")
+            }
+            Self::Transport { message, .. } => {
                 write!(formatter, "OpenCode transport failed: {message}")
             }
         }
@@ -431,6 +448,11 @@ fn protocol_mismatch(message: impl Into<String>) -> OpenCodeError {
 
 fn transport_error(error: &reqwest::Error) -> OpenCodeError {
     OpenCodeError::Transport {
+        stage: if error.is_connect() {
+            TransmissionStage::BeforeTransmission
+        } else {
+            TransmissionStage::PossiblyTransmitted
+        },
         message: error.to_string(),
     }
 }
@@ -449,6 +471,10 @@ async fn status_error(response: reqwest::Response, expected_status: StatusCode) 
 
 async fn server_error(response: reqwest::Response) -> OpenCodeError {
     let status = response.status().as_u16();
+    let limit = (status == 429).then(|| RateLimit::from_headers(response.headers()));
     let body = response.text().await.unwrap_or_default();
-    OpenCodeError::Server { status, body }
+    match limit {
+        Some(limit) => OpenCodeError::RateLimited { body, limit },
+        None => OpenCodeError::Server { status, body },
+    }
 }

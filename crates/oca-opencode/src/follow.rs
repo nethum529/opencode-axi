@@ -166,8 +166,11 @@ impl FollowTransport for OpenCodeClient {
 
 fn map_client_error(error: OpenCodeError) -> FollowTransportError {
     match error {
-        OpenCodeError::Transport { message } => FollowTransportError::unreachable(message),
+        OpenCodeError::Transport { message, .. } => FollowTransportError::unreachable(message),
         OpenCodeError::ProtocolMismatch { message } => FollowTransportError::protocol(message),
+        OpenCodeError::RateLimited { body, limit } => {
+            FollowTransportError::rate_limited(body, limit.retry_after_ms())
+        }
         OpenCodeError::Server { status, body } => FollowTransportError::protocol(format!(
             "OpenCode returned HTTP {status} while following: {body}"
         )),

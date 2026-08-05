@@ -438,3 +438,27 @@ async fn create_session_preserves_a_base_url_path_stem() {
     let request = server.finish();
     assert!(request.starts_with("POST /api/session HTTP/1.1\r\n"));
 }
+
+#[tokio::test]
+async fn every_operation_preserves_429_retry_metadata() {
+    let server = FakeServer::once(concat!(
+        "HTTP/1.1 429 Too Many Requests\r\n",
+        "content-type: application/json\r\n",
+        "retry-after: 3\r\n",
+        "content-length: 19\r\n\r\n",
+        "{\"error\":\"limited\"}"
+    ));
+    let client = OpenCodeClient::new(server.base_url.parse().expect("valid URL"));
+
+    let error = client
+        .messages("ses_target")
+        .await
+        .expect_err("HTTP 429 is an application failure");
+
+    assert!(matches!(
+        error,
+        OpenCodeError::RateLimited { limit, .. } if limit.retry_after_ms() == Some(3_000)
+    ));
+    let request = server.finish();
+    assert!(request.starts_with("GET /session/ses_target/message HTTP/1.1\r\n"));
+}

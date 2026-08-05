@@ -13,6 +13,7 @@ mod follow;
 mod foreground;
 mod list;
 mod scope;
+mod transport;
 
 pub use background::execute_background;
 pub use control::{ControlCommandOutput, execute_abort, execute_message, execute_queue};

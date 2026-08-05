@@ -21,4 +21,5 @@ url = "2"
 
 [dev-dependencies]
 oca-testkit = { path = "../oca-testkit" }
+sha2 = "0.10"
 tempfile = "3.23"

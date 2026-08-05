@@ -89,6 +89,7 @@ fn retention(days: u16) -> Duration {
 enum ListState {
     Blocked,
     Running,
+    Unknown,
     Queued,
     Partial,
     Done,
@@ -100,7 +101,7 @@ impl ListState {
     const fn rank(self) -> u8 {
         match self {
             Self::Blocked => 0,
-            Self::Running | Self::Queued => 1,
+            Self::Running | Self::Unknown | Self::Queued => 1,
             Self::Partial => 2,
             Self::Done | Self::Idle => 3,
             Self::Aborted => 4,
@@ -111,6 +112,7 @@ impl ListState {
         match self {
             Self::Blocked => "blocked",
             Self::Running => "running",
+            Self::Unknown => "unknown",
             Self::Queued => "queued",
             Self::Partial => "partial",
             Self::Done => "done",
@@ -125,6 +127,7 @@ impl From<Option<RefState>> for ListState {
         match state.unwrap_or(RefState::Running) {
             RefState::Blocked => Self::Blocked,
             RefState::Running => Self::Running,
+            RefState::Unknown => Self::Unknown,
             RefState::Queued => Self::Queued,
             RefState::Partial => Self::Partial,
             RefState::Done => Self::Done,

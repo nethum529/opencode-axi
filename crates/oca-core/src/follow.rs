@@ -1,6 +1,15 @@
 //! Transport-independent follow state machine and turn attribution.
 
-use std::{collections::HashSet, fmt, future::Future, time::Duration};
+use std::{
+    collections::HashSet,
+    fmt,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use serde_json::Value;
 
@@ -124,8 +133,16 @@ impl FollowOutcome {
 /// A transport failure classified at the facade boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FollowTransportError {
-    Unreachable { message: String },
-    Protocol { message: String },
+    Unreachable {
+        message: String,
+    },
+    Protocol {
+        message: String,
+    },
+    RateLimited {
+        message: String,
+        retry_after_ms: Option<u64>,
+    },
 }
 
 impl FollowTransportError {
@@ -140,6 +157,14 @@ impl FollowTransportError {
     pub fn protocol(message: impl Into<String>) -> Self {
         Self::Protocol {
             message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn rate_limited(message: impl Into<String>, retry_after_ms: Option<u64>) -> Self {
+        Self::RateLimited {
+            message: message.into(),
+            retry_after_ms,
         }
     }
 }
@@ -192,8 +217,16 @@ impl Default for FollowPolicy {
 /// Non-outcome failures produced while following.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FollowError {
-    Protocol { message: String },
-    Journal { message: String },
+    Protocol {
+        message: String,
+    },
+    Journal {
+        message: String,
+    },
+    RateLimited {
+        message: String,
+        retry_after_ms: Option<u64>,
+    },
 }
 
 impl fmt::Display for FollowError {
@@ -201,6 +234,7 @@ impl fmt::Display for FollowError {
         match self {
             Self::Protocol { message } => write!(formatter, "protocol mismatch: {message}"),
             Self::Journal { message } => write!(formatter, "event journal failed: {message}"),
+            Self::RateLimited { message, .. } => write!(formatter, "rate limited: {message}"),
         }
     }
 }
@@ -237,10 +271,20 @@ where
     T: FollowTransport,
     J: EventJournalWriter,
 {
-    let follow = follow_inner(transport, target, journal, policy);
+    let connection_failed = Arc::new(AtomicBool::new(false));
+    let follow = follow_inner(
+        transport,
+        target,
+        journal,
+        policy,
+        Arc::clone(&connection_failed),
+    );
     match timeout {
         Some(timeout) => match tokio::time::timeout(timeout, follow).await {
             Ok(result) => result,
+            Err(_) if connection_failed.load(Ordering::Relaxed) => {
+                Ok(FollowOutcome::ServerUnreachable)
+            }
             Err(_) => Ok(FollowOutcome::Timeout),
         },
         None => follow.await,
@@ -252,22 +296,31 @@ async fn follow_inner<T, J>(
     target: &FollowTarget,
     mut journal: Option<&mut J>,
     policy: FollowPolicy,
+    connection_failed: Arc<AtomicBool>,
 ) -> Result<FollowOutcome, FollowError>
 where
     T: FollowTransport,
     J: EventJournalWriter,
 {
     let mut subscription = match transport.subscribe(None).await {
-        Ok(subscription) => subscription,
+        Ok(subscription) => {
+            connection_failed.store(false, Ordering::Relaxed);
+            subscription
+        }
         Err(FollowTransportError::Unreachable { .. }) => {
+            connection_failed.store(true, Ordering::Relaxed);
             return Ok(FollowOutcome::ServerUnreachable);
         }
         Err(error) => return Err(protocol_error(error)),
     };
     let mut tracker = TurnTracker::new(target);
     let messages = match transport.messages(&target.session_id).await {
-        Ok(messages) => messages,
+        Ok(messages) => {
+            connection_failed.store(false, Ordering::Relaxed);
+            messages
+        }
         Err(FollowTransportError::Unreachable { .. }) => {
+            connection_failed.store(true, Ordering::Relaxed);
             return Ok(FollowOutcome::ServerUnreachable);
         }
         Err(error) => return Err(protocol_error(error)),
@@ -285,6 +338,7 @@ where
     loop {
         match subscription.next().await {
             Ok(Some(event)) => {
+                connection_failed.store(false, Ordering::Relaxed);
                 if let Some(cursor) = event.cursor.as_ref() {
                     last_event_id = Some(cursor.clone());
                 }
@@ -306,17 +360,21 @@ where
                 }
             }
             Ok(None) | Err(FollowTransportError::Unreachable { .. }) => {
+                connection_failed.store(true, Ordering::Relaxed);
                 let reconnect_started =
                     *reconnect_started.get_or_insert_with(tokio::time::Instant::now);
                 if last_event_id.is_none() && !no_cursor_reconciled {
                     no_cursor_reconciled = true;
                     match transport.messages(&target.session_id).await {
                         Ok(messages) => {
+                            connection_failed.store(false, Ordering::Relaxed);
                             if let Some(terminal) = tracker.reconcile(messages)? {
                                 return Ok(FollowOutcome::Terminal(terminal));
                             }
                         }
-                        Err(FollowTransportError::Unreachable { .. }) => {}
+                        Err(FollowTransportError::Unreachable { .. }) => {
+                            connection_failed.store(true, Ordering::Relaxed);
+                        }
                         Err(error) => return Err(protocol_error(error)),
                     }
                 }
@@ -341,9 +399,11 @@ where
                     Ok(reconnected) => {
                         subscription = reconnected;
                         last_reconnect_succeeded = true;
+                        connection_failed.store(false, Ordering::Relaxed);
                     }
                     Err(FollowTransportError::Unreachable { .. }) => {
                         last_reconnect_succeeded = false;
+                        connection_failed.store(true, Ordering::Relaxed);
                     }
                     Err(error) => return Err(protocol_error(error)),
                 }
@@ -364,6 +424,15 @@ fn protocol_error(error: FollowTransportError) -> FollowError {
     let message = match error {
         FollowTransportError::Protocol { message }
         | FollowTransportError::Unreachable { message } => message,
+        FollowTransportError::RateLimited {
+            message,
+            retry_after_ms,
+        } => {
+            return FollowError::RateLimited {
+                message,
+                retry_after_ms,
+            };
+        }
     };
     FollowError::Protocol { message }
 }

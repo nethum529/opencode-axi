@@ -217,5 +217,17 @@ fn follow_error(reference: &str, error: FollowError) -> OcaError {
             .with_ref(reference)
             .with_error(format!("OpenCode follow protocol mismatch: {message}")),
         FollowError::Journal { message } => journal_error(reference, &message),
+        FollowError::RateLimited {
+            message,
+            retry_after_ms,
+        } => {
+            let error = OcaError::new(ErrorCode::RateLimited)
+                .with_ref(reference)
+                .with_error(message);
+            match retry_after_ms {
+                Some(delay) => error.with_retry_after_ms(delay),
+                None => error,
+            }
+        }
     }
 }
