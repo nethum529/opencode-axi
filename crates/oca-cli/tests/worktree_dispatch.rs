@@ -4,8 +4,10 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Output},
     thread,
+    time::Duration,
 };
 
+use oca_server::{ConnectOrStart, ServerRecord};
 use serde_json::{Value, json};
 
 struct CapturedRequest {
@@ -409,14 +411,46 @@ fn prepare_home(home: &Path, port: u16) {
     let state = home.join(".oca");
     std::fs::create_dir(&state).unwrap();
     std::fs::write(state.join("config.toml"), "").unwrap();
-    std::fs::write(
-        state.join("server.json"),
-        serde_json::to_vec(&json!({
-            "port":port, "version":"1.18.10", "environment_hash":"fake"
-        }))
-        .unwrap(),
-    )
-    .unwrap();
+    ConnectOrStart::new(&state, port, [], Duration::from_secs(1))
+        .write_record(&ServerRecord::new(
+            port,
+            installed_opencode_version(),
+            environment_hash_for(home),
+        ))
+        .unwrap();
+}
+
+fn installed_opencode_version() -> String {
+    Command::new("opencode")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        .unwrap_or_else(|| "1.18.10".to_owned())
+}
+
+fn environment_hash_for(home: &Path) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    for key in [
+        "HOME",
+        "OPENCODE_CONFIG",
+        "OPENCODE_CONFIG_DIR",
+        "PATH",
+        "XDG_CONFIG_HOME",
+    ] {
+        hasher.update(key.as_bytes());
+        hasher.update([0]);
+        if key == "HOME" {
+            hasher.update(home.as_os_str().to_string_lossy().as_bytes());
+        } else if let Some(value) = std::env::var_os(key) {
+            hasher.update(value.to_string_lossy().as_bytes());
+        }
+        hasher.update([0]);
+    }
+    format!("{:x}", hasher.finalize())
 }
 
 fn run_oca<const N: usize>(home: &Path, cwd: &Path, arguments: [&str; N]) -> Output {

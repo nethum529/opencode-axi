@@ -108,20 +108,24 @@ fn follow_exit_codes_are_frozen_at_the_real_process_boundary() {
         assert!(stdout.starts_with(&format!("oca wake ref=w4f2a1 state={status}\n")));
     }
 
-    let timeout = FollowFixture::disconnected();
-    let refs_before = std::fs::read(timeout.home.path().join(".oca/refs.json")).unwrap();
-    let output = run_oca_in_home(timeout.home.path(), &["f", "w4f2a1", "-t", "1"]);
-    timeout
+    let disconnected = FollowFixture::disconnected();
+    let refs_before = std::fs::read(disconnected.home.path().join(".oca/refs.json")).unwrap();
+    let output = run_oca_in_home(
+        disconnected.home.path(),
+        &["--json", "f", "w4f2a1", "-t", "1"],
+    );
+    disconnected
         .server
         .join()
         .expect("fake server thread must finish");
-    assert_eq!(output.status.code(), Some(exit::FOLLOW_TIMEOUT));
-    assert_eq!(output.stdout, b"oca wake ref=w4f2a1 state=timeout\n");
-    assert!(output.stderr.is_empty());
+    assert_eq!(output.status.code(), Some(exit::SERVER_UNREACHABLE));
+    assert!(output.stdout.is_empty());
+    let error = parse_error_envelope(String::from_utf8_lossy(&output.stderr).trim()).unwrap();
+    assert_eq!(error.code(), "server_unreachable");
     assert_eq!(
-        std::fs::read(timeout.home.path().join(".oca/refs.json")).unwrap(),
+        std::fs::read(disconnected.home.path().join(".oca/refs.json")).unwrap(),
         refs_before,
-        "exit 4 must not mark the ref aborted or otherwise mutate it"
+        "exit 5 must not mark the ref aborted or otherwise mutate it"
     );
 
     let home = prepared_home(unused_loopback_port());

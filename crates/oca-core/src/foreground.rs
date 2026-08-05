@@ -192,12 +192,25 @@ pub(crate) async fn start_dispatch<B>(
 where
     B: ForegroundBackend,
 {
+    // Preparation happens once, outside the recovery paths below: those re-call
+    // create_session only. The worktree backend's create_session records the
+    // session again on recovery, which is safe because that step patches an
+    // existing ref rather than allocating a new one.
     backend.prepare(&mut request)?;
-    let session_id = backend.create_session(&request).await?;
+    let mut session_id = backend.create_session(&request).await?;
+    let mut retried_session_creation = false;
 
     // This ordering is binding: the stream must be established before the
     // server is allowed to admit the prompt.
-    let subscription = backend.subscribe().await?;
+    let mut subscription = match backend.subscribe().await {
+        Ok(subscription) => subscription,
+        Err(error) if is_server_unreachable(&error) => {
+            retried_session_creation = true;
+            session_id = backend.create_session(&request).await?;
+            backend.subscribe().await?
+        }
+        Err(error) => return Err(error),
+    };
     let message_id = backend.mint_message_id()?;
     let prompt = DispatchPrompt {
         message_id: message_id.clone(),
@@ -208,7 +221,17 @@ where
         output_schema: request.contract.schema(),
         permission: request.policy.permission_profile(),
     };
-    backend.prompt_async(&session_id, &prompt).await?;
+    match backend.prompt_async(&session_id, &prompt).await {
+        Ok(()) => {}
+        Err(error) if is_server_unreachable(&error) && !retried_session_creation => {
+            // The transport proved that no prompt bytes were transmitted. A
+            // fresh session and subscription are therefore safe exactly once.
+            session_id = backend.create_session(&request).await?;
+            subscription = backend.subscribe().await?;
+            backend.prompt_async(&session_id, &prompt).await?;
+        }
+        Err(error) => return Err(error),
+    }
 
     let pending = backend.write_ref(&session_id, &message_id, &request)?;
     let reference = backend.acknowledge(pending, &request.model, request.json)?;
@@ -224,6 +247,10 @@ where
         session_id,
         message_id,
     })
+}
+
+fn is_server_unreachable(error: &OcaError) -> bool {
+    error.code() == crate::ErrorCode::ServerUnreachable.as_str()
 }
 
 #[cfg(test)]
@@ -409,6 +436,8 @@ mod tests {
         reconciled: Option<TerminalReply>,
         waited: Option<TerminalReply>,
         finalized: usize,
+        fail_subscribe_once: bool,
+        fail_prompt_before_transmission_once: bool,
     }
 
     impl FakeBackend {
@@ -449,6 +478,9 @@ mod tests {
 
         async fn subscribe(&mut self) -> Result<Self::Subscription, OcaError> {
             self.calls.push("subscribe");
+            if std::mem::take(&mut self.fail_subscribe_once) {
+                return Err(OcaError::new(ErrorCode::ServerUnreachable));
+            }
             Ok(())
         }
 
@@ -463,7 +495,9 @@ mod tests {
             prompt: &DispatchPrompt,
         ) -> Result<(), OcaError> {
             self.calls.push("prompt");
-            assert_eq!(self.calls[..2], ["create", "subscribe"]);
+            if std::mem::take(&mut self.fail_prompt_before_transmission_once) {
+                return Err(OcaError::new(ErrorCode::ServerUnreachable));
+            }
             assert!(is_opencode_message_id(&prompt.message_id));
             assert!(prompt.permission.0.iter().all(|rule| {
                 rule.action == crate::PermissionAction::Deny && rule.pattern == "*"
@@ -579,6 +613,86 @@ mod tests {
         assert!(backend.calls.contains(&"reconcile"));
         assert!(!backend.calls.contains(&"wait"));
         assert_eq!(backend.finalized, 1);
+    }
+
+    #[test]
+    fn pre_prompt_connection_loss_recreates_a_session_only_once() {
+        for mut backend in [
+            FakeBackend {
+                waited: Some(valid_terminal()),
+                fail_subscribe_once: true,
+                ..FakeBackend::default()
+            },
+            FakeBackend {
+                waited: Some(valid_terminal()),
+                fail_prompt_before_transmission_once: true,
+                ..FakeBackend::default()
+            },
+        ] {
+            block_on(run_foreground(&mut backend, request("luna", "h"))).unwrap();
+
+            assert_eq!(
+                backend
+                    .calls
+                    .iter()
+                    .filter(|call| **call == "create")
+                    .count(),
+                2
+            );
+            assert_eq!(
+                backend
+                    .calls
+                    .iter()
+                    .filter(|call| **call == "write_ref")
+                    .count(),
+                1
+            );
+            assert_subscribed_before_every_prompt(&backend.calls);
+        }
+    }
+
+    #[test]
+    fn the_recovery_budget_is_one_attempt_for_the_whole_dispatch() {
+        let mut backend = FakeBackend {
+            waited: Some(valid_terminal()),
+            fail_subscribe_once: true,
+            fail_prompt_before_transmission_once: true,
+            ..FakeBackend::default()
+        };
+
+        let error = block_on(run_foreground(&mut backend, request("luna", "h"))).unwrap_err();
+
+        assert_eq!(error.code_kind(), ErrorCode::ServerUnreachable);
+        assert_eq!(
+            backend
+                .calls
+                .iter()
+                .filter(|call| **call == "create")
+                .count(),
+            2,
+            "a second recovery would create a third session: {:?}",
+            backend.calls
+        );
+        assert!(!backend.calls.contains(&"write_ref"));
+    }
+
+    /// The recovery paths recreate the session, so the subscribe-before-prompt
+    /// invariant has to hold against the session each prompt actually targets,
+    /// not merely somewhere earlier in the call log.
+    fn assert_subscribed_before_every_prompt(calls: &[&'static str]) {
+        let mut created = None;
+        let mut subscribed = None;
+        for (index, call) in calls.iter().enumerate() {
+            match *call {
+                "create" => created = Some(index),
+                "subscribe" => subscribed = Some(index),
+                "prompt" => assert!(
+                    subscribed > created,
+                    "prompt admitted with no subscription for the current session: {calls:?}"
+                ),
+                _ => {}
+            }
+        }
     }
 
     #[test]

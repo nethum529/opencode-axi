@@ -14,6 +14,7 @@ mod follow;
 mod foreground;
 mod list;
 mod scope;
+mod transport;
 mod worktree_dispatch;
 
 pub use attach::execute_attach;

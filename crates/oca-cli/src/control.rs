@@ -10,14 +10,17 @@ use oca_core::{
     WorkerPolicy, resolve_model,
 };
 use oca_display::Acknowledgement;
-use oca_opencode::{OpenCodeClient, OpenCodeError, PromptRequest, TextPart};
+use oca_opencode::{OpenCodeClient, PromptRequest, TextPart};
 use oca_server::ConnectOrStart;
 use oca_state::{
     OcaConfig, RefPatch, RefRecord, RefState, RefStore, RefStorePaths, SessionTurnLock,
 };
 use url::Url;
 
-use crate::{AbortCommand, MessageCommand};
+use crate::{
+    AbortCommand, MessageCommand,
+    transport::{open_code_error, prompt_error},
+};
 
 /// The complete stdout emitted after a control request is accepted.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -50,6 +53,11 @@ pub async fn execute_message(
                 command.reference
             )));
     }
+    if state == RefState::Unknown {
+        return Err(OcaError::new(ErrorCode::PromptUncertain)
+            .with_ref(&command.reference)
+            .with_help(format!("Reconcile with `oca f {}`", command.reference)));
+    }
     if !state.accepts_new_turn() {
         return Err(OcaError::new(ErrorCode::SessionNotFound)
             .with_ref(&command.reference)
@@ -66,7 +74,7 @@ pub async fn execute_message(
             context.prompt_request(message_id.clone(), command.message.clone()),
         )
         .await
-        .map_err(|error| open_code_error(&command.reference, error))?;
+        .map_err(|error| prompt_error(error).with_ref(&command.reference))?;
 
     let mut patch = RefPatch::default()
         .with_message_id(message_id)
@@ -100,8 +108,16 @@ pub async fn execute_queue(
     let _turn_lock = acquire_turn_lock(&state_directory, &command.reference)?;
     let store = RefStore::with_paths(RefStorePaths::in_directory(&state_directory));
     let record = resolve_active_ref(&store, &command.reference)?;
-    if required_state(&record, &command.reference)? == RefState::Aborted {
-        return Err(OcaError::new(ErrorCode::SessionNotFound).with_ref(&command.reference));
+    match required_state(&record, &command.reference)? {
+        RefState::Aborted => {
+            return Err(OcaError::new(ErrorCode::SessionNotFound).with_ref(&command.reference));
+        }
+        RefState::Unknown => {
+            return Err(OcaError::new(ErrorCode::PromptUncertain)
+                .with_ref(&command.reference)
+                .with_help(format!("Reconcile with `oca f {}`", command.reference)));
+        }
+        _ => {}
     }
 
     let config = load_config(home)?;
@@ -114,7 +130,7 @@ pub async fn execute_queue(
             context.prompt_request(message_id.clone(), command.message.clone()),
         )
         .await
-        .map_err(|error| open_code_error(&command.reference, error))?;
+        .map_err(|error| prompt_error(error).with_ref(&command.reference))?;
     store
         .patch(
             &command.reference,
@@ -150,7 +166,7 @@ pub async fn execute_abort(
     let accepted = client
         .abort(&record.session_id)
         .await
-        .map_err(|error| open_code_error(&command.reference, error))?;
+        .map_err(|error| open_code_error(error).with_ref(&command.reference))?;
     if !accepted.aborted {
         return Err(OcaError::new(ErrorCode::ProtocolMismatch)
             .with_ref(&command.reference)
@@ -327,23 +343,6 @@ fn accepted_output(
             acknowledgement.render_toon()
         },
     }
-}
-
-fn open_code_error(reference: &str, error: OpenCodeError) -> OcaError {
-    match error {
-        OpenCodeError::ProtocolMismatch { message } => {
-            OcaError::new(ErrorCode::ProtocolMismatch).with_error(message)
-        }
-        OpenCodeError::Server { status: 429, body } => {
-            OcaError::new(ErrorCode::RateLimited).with_error(body)
-        }
-        OpenCodeError::Server { status, body } => OcaError::new(ErrorCode::ServerUnavailable)
-            .with_error(format!("OpenCode returned HTTP {status}: {body}")),
-        OpenCodeError::Transport { message } => {
-            OcaError::new(ErrorCode::ServerUnreachable).with_error(message)
-        }
-    }
-    .with_ref(reference)
 }
 
 fn state_error(reference: &str, context: &str, error: impl std::fmt::Display) -> OcaError {

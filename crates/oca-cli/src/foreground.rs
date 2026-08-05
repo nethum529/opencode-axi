@@ -14,15 +14,16 @@ use oca_core::{
 };
 use oca_display::{Acknowledgement, CompletionRecord};
 use oca_opencode::{
-    CreateSessionRequest, OpenCodeClient, OpenCodeError, PromptRequest, Subscription, TextPart,
+    CreateSessionRequest, OpenCodeClient, PromptRequest, Subscription, TextPart,
     attributed_structured_reply, is_target_session_idle,
 };
-use oca_server::ConnectOrStart;
+use oca_server::{ConnectOrStart, SystemRuntime};
 use oca_state::{NewRef, OcaConfig, PendingRefAllocation, RefState, RefStore, RefStorePaths};
 
 use crate::{
     DispatchCommand,
     scope::Scope,
+    transport::{CreateSessionOperation, connect_error, open_code_error, prompt_error},
     worktree_dispatch::{WorktreeDispatch, finalize_turn, reply_state},
 };
 
@@ -87,28 +88,8 @@ pub(crate) fn prepare_dispatch(
 
     // Server discovery happens only after every local parse/resolve failure.
     let manager = ConnectOrStart::from_home(home, &config.server);
-    let record = manager
-        .read_record()
-        .map_err(|error| server_state_error("could not read server record", error))?
-        .ok_or_else(|| {
-            OcaError::new(ErrorCode::ServerUnavailable)
-                .with_error("no OpenCode server record is available")
-                .with_help("start `opencode serve` and retry")
-        })?;
-    let base_url = format!("http://127.0.0.1:{}", record.port)
-        .parse()
-        .map_err(|error| {
-            OcaError::new(ErrorCode::ProtocolMismatch)
-                .with_error(format!("invalid recorded OpenCode URL: {error}"))
-        })?;
     let refs = RefStore::with_paths(RefStorePaths::in_directory(home.join(".oca")));
-    let backend = ProductionBackend::new(
-        OpenCodeClient::new(base_url),
-        refs,
-        post_ack_durability,
-        scope,
-        worktree,
-    );
+    let backend = ProductionBackend::new(manager, refs, post_ack_durability, scope, worktree);
     let request = ForegroundRequest {
         model: command.model,
         prompt: command.prompt,
@@ -124,12 +105,15 @@ pub(crate) fn prepare_dispatch(
 }
 
 pub(crate) struct ProductionBackend {
-    client: OpenCodeClient,
+    manager: ConnectOrStart,
+    runtime: SystemRuntime,
+    client: Option<OpenCodeClient>,
     refs: RefStore,
     message_ids: MessageIdGenerator,
     post_ack_durability: PostAckDurability,
     scope: Scope,
     worktree: Option<WorktreeDispatch>,
+    dispatch_cwd: Option<PathBuf>,
 }
 
 pub(crate) enum PendingProductionRef {
@@ -139,20 +123,62 @@ pub(crate) enum PendingProductionRef {
 
 impl ProductionBackend {
     fn new(
-        client: OpenCodeClient,
+        manager: ConnectOrStart,
         refs: RefStore,
         post_ack_durability: PostAckDurability,
         scope: Scope,
         worktree: Option<WorktreeDispatch>,
     ) -> Self {
         Self {
-            client,
+            manager,
+            runtime: SystemRuntime::default(),
+            client: None,
             refs,
             message_ids: MessageIdGenerator::new(),
             post_ack_durability,
             scope,
             worktree,
+            dispatch_cwd: None,
         }
+    }
+
+    fn client(&self) -> Result<&OpenCodeClient, OcaError> {
+        self.client.as_ref().ok_or_else(|| {
+            OcaError::new(ErrorCode::ProtocolMismatch)
+                .with_error("OpenCode client used before session creation")
+        })
+    }
+
+    fn persist_uncertain_ref(
+        &self,
+        session_id: &str,
+        prompt: &DispatchPrompt,
+    ) -> Result<String, OcaError> {
+        let record = NewRef::for_session(session_id)
+            .with_message_id(prompt.message_id.clone())
+            .with_control_metadata(
+                &prompt.model.alias,
+                &prompt.model.effort,
+                &prompt.role,
+                self.dispatch_cwd
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new("."))
+                    .display()
+                    .to_string(),
+                RefState::Unknown,
+            )
+            .with_repo(&self.scope.repo)
+            .with_spawner_tag(&self.scope.spawner_tag);
+        let pending = self
+            .refs
+            .allocate(record)
+            .map_err(|error| state_error("could not preserve uncertain prompt ref", error))?;
+        let reference = pending.record().id.clone();
+        // There is deliberately no success acknowledgement for an uncertain
+        // prompt. Dropping transfers the pending directory sync while leaving
+        // the content-synced, atomically renamed ref visible for reconciliation.
+        drop(pending);
+        Ok(reference)
     }
 
     async fn read_attributed_reply(
@@ -161,7 +187,7 @@ impl ProductionBackend {
         message_id: &str,
     ) -> Result<Option<TerminalReply>, OcaError> {
         let messages = self
-            .client
+            .client()?
             .messages(session_id)
             .await
             .map_err(open_code_error)?;
@@ -189,31 +215,50 @@ impl ForegroundBackend for ProductionBackend {
                 OcaError::new(ErrorCode::ProtocolMismatch)
                     .with_error(format!("permission profile could not be encoded: {error}"))
             })?;
-        let session_id = self
-            .client
-            .create_session(CreateSessionRequest {
-                directory: Some(request.cwd.display().to_string()),
-                title: Some(format!("oca:{}", self.scope.spawner_tag)),
-                agent: Some(request.role.clone()),
-                model: Some(request.model.clone()),
-                permission: Some(permission),
-                metadata: serde_json::Map::from_iter([(
-                    "oca_spawner".to_owned(),
-                    serde_json::Value::String(self.scope.spawner_tag.clone()),
-                )]),
-                ..CreateSessionRequest::default()
-            })
+        self.dispatch_cwd = Some(request.cwd.clone());
+        let mut operation = CreateSessionOperation::new(CreateSessionRequest {
+            directory: Some(request.cwd.display().to_string()),
+            title: Some(format!("oca:{}", self.scope.spawner_tag)),
+            agent: Some(request.role.clone()),
+            model: Some(request.model.clone()),
+            permission: Some(permission),
+            metadata: serde_json::Map::from_iter([(
+                "oca_spawner".to_owned(),
+                serde_json::Value::String(self.scope.spawner_tag.clone()),
+            )]),
+            ..CreateSessionRequest::default()
+        });
+        let session = self
+            .manager
+            .connect_or_start(&self.runtime, &mut operation)
             .await
-            .map(|session| session.id)
-            .map_err(open_code_error)?;
+            .map_err(connect_error)?;
+        let record = self
+            .manager
+            .read_record()
+            .map_err(|error| server_state_error("could not read recovered server record", error))?
+            .ok_or_else(|| {
+                OcaError::new(ErrorCode::ServerUnavailable)
+                    .with_error("session creation succeeded without a server discovery record")
+            })?;
+        let base_url = format!("http://127.0.0.1:{}", record.port)
+            .parse()
+            .map_err(|error| {
+                OcaError::new(ErrorCode::ProtocolMismatch)
+                    .with_error(format!("invalid recovered OpenCode URL: {error}"))
+            })?;
+        self.client = Some(OpenCodeClient::new(base_url));
         if let Some(worktree) = &self.worktree {
-            worktree.record_session(&self.refs, &session_id)?;
+            worktree.record_session(&self.refs, &session.id)?;
         }
-        Ok(session_id)
+        Ok(session.id)
     }
 
     async fn subscribe(&mut self) -> Result<Self::Subscription, OcaError> {
-        self.client.subscribe(None).await.map_err(open_code_error)
+        self.client()?
+            .subscribe(None)
+            .await
+            .map_err(open_code_error)
     }
 
     fn mint_message_id(&mut self) -> Result<String, OcaError> {
@@ -237,7 +282,8 @@ impl ForegroundBackend for ProductionBackend {
         session_id: &str,
         prompt: &DispatchPrompt,
     ) -> Result<(), OcaError> {
-        self.client
+        let result = self
+            .client()?
             .prompt_async(
                 session_id,
                 PromptRequest {
@@ -252,9 +298,19 @@ impl ForegroundBackend for ProductionBackend {
                     permission: prompt.permission.clone(),
                 },
             )
-            .await
-            .map(|_| ())
-            .map_err(open_code_error)
+            .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(error) => {
+                let error = prompt_error(error);
+                if error.code() == ErrorCode::PromptUncertain.as_str() {
+                    let reference = self.persist_uncertain_ref(session_id, prompt)?;
+                    Err(error.with_ref(reference))
+                } else {
+                    Err(error)
+                }
+            }
+        }
     }
 
     fn write_ref(
@@ -430,22 +486,6 @@ fn print_ack(reference: &str, model: &ResolvedModel, json: bool) -> io::Result<(
     let mut stdout = io::stdout().lock();
     stdout.write_all(rendered.as_bytes())?;
     stdout.flush()
-}
-
-fn open_code_error(error: OpenCodeError) -> OcaError {
-    match error {
-        OpenCodeError::ProtocolMismatch { message } => {
-            OcaError::new(ErrorCode::ProtocolMismatch).with_error(message)
-        }
-        OpenCodeError::Server { status: 429, body } => {
-            OcaError::new(ErrorCode::RateLimited).with_error(body)
-        }
-        OpenCodeError::Server { status, body } => OcaError::new(ErrorCode::ServerUnavailable)
-            .with_error(format!("OpenCode returned HTTP {status}: {body}")),
-        OpenCodeError::Transport { message } => {
-            OcaError::new(ErrorCode::ServerUnreachable).with_error(message)
-        }
-    }
 }
 
 fn io_error(error: io::Error) -> OcaError {

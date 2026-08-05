@@ -18,6 +18,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 pub enum RefState {
     Idle,
     Running,
+    Unknown,
     Done,
     Blocked,
     Partial,
@@ -30,6 +31,7 @@ impl RefState {
         match self {
             Self::Idle => "idle",
             Self::Running => "running",
+            Self::Unknown => "unknown",
             Self::Done => "done",
             Self::Blocked => "blocked",
             Self::Partial => "partial",
@@ -91,7 +93,7 @@ mod tests {
         ] {
             assert!(state.accepts_new_turn());
         }
-        for state in [RefState::Running, RefState::Aborted] {
+        for state in [RefState::Running, RefState::Unknown, RefState::Aborted] {
             assert!(!state.accepts_new_turn());
         }
     }
