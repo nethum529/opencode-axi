@@ -55,7 +55,7 @@ fn is_publish_attempt(event: &str) -> bool {
 }
 
 fn render_plugin() -> &'static str {
-    r#"const destructive = /\b(rm\s+-[rf]|rmdir|truncate|mkfs|dd\s+if=|git\s+(reset\s+--hard|clean\s+-[fdx])|drop\s+(table|database))\b/i;
+    r#"const destructive = /\b(rm\s+-[rf]{1,2}|rmdir|truncate|mkfs|dd\s+if=\S+|git\s+(reset\s+--hard|clean\s+-[fdx]+)|drop\s+(table|database))\b/i;
 const publish = /\bgit\s+push\b|\bgh\s+(pr|repo)\b|\bgit\s+remote\b/i;
 
 function classify(event) {
