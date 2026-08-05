@@ -6,7 +6,7 @@ use oca_cli::{
     AgentCommand, Command, CommandGrammar, DispatchAliasGrammar, EndOfOptionsGrammar, FlagGrammar,
     FlagValueForm, OperandForm, grammar_contract, parse_from, public_commands,
 };
-use oca_core::{ErrorCode, ModelCatalog};
+use oca_core::{DEFAULT_MODEL_DEFINITIONS, ErrorCode};
 
 const PUBLIC_COMMANDS: &[&str] = public_commands();
 
@@ -118,24 +118,35 @@ fn assert_dispatch_contract_matches_resolver() {
         );
     }
 
-    let catalog = ModelCatalog::default();
-    let catalog_aliases = catalog
-        .aliases()
-        .chain(std::iter::once("deepseek"))
-        .collect::<BTreeSet<_>>();
+    let expected_aliases = DEFAULT_MODEL_DEFINITIONS
+        .iter()
+        .flat_map(|definition| {
+            std::iter::once((definition.alias, definition.ladder)).chain(
+                definition
+                    .synonyms
+                    .iter()
+                    .copied()
+                    .map(|synonym| (synonym, definition.ladder)),
+            )
+        })
+        .collect::<Vec<_>>();
     let published_aliases = contract
         .dispatch_aliases
         .iter()
-        .map(|published| published.alias)
-        .collect::<BTreeSet<_>>();
+        .map(|published| (published.alias, published.effort_ladder))
+        .collect::<Vec<_>>();
     assert_eq!(
+        published_aliases
+            .iter()
+            .map(|(alias, _)| *alias)
+            .collect::<BTreeSet<_>>()
+            .len(),
         published_aliases.len(),
-        contract.dispatch_aliases.len(),
         "dispatch aliases must not contain duplicates"
     );
     assert_eq!(
-        published_aliases, catalog_aliases,
-        "dispatch aliases must equal the default model catalog plus its deepseek synonym"
+        published_aliases, expected_aliases,
+        "dispatch aliases and ladders must be derived from the default model definitions"
     );
 
     for published in contract.dispatch_aliases {
@@ -147,22 +158,6 @@ fn assert_dispatch_contract_matches_resolver() {
             published.alias
         );
 
-        let catalog_alias = if published.alias == "deepseek" {
-            "flash"
-        } else {
-            published.alias
-        };
-        let catalog_ladder = catalog
-            .get(catalog_alias)
-            .expect("published aliases are present in the catalog")
-            .ladder()
-            .collect::<Vec<_>>();
-        assert_eq!(
-            published.effort_ladder,
-            catalog_ladder.as_slice(),
-            "the published ladder for `{}` must match the resolver catalog",
-            published.alias
-        );
         assert!(
             !published.effort_ladder.is_empty(),
             "dispatch aliases need at least one effort"

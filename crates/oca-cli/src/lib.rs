@@ -1,10 +1,8 @@
-use std::{
-    path::{Path, PathBuf},
-    sync::OnceLock,
-};
+use std::path::{Path, PathBuf};
 
 use oca_core::{
-    EffortInput, ErrorCode, ModelCatalog, OcaError, RefId, ResolvedModel, resolve_model,
+    DEFAULT_MODEL_DEFINITIONS, EffortInput, ErrorCode, ModelCatalog, OcaError, RefId,
+    ResolvedModel, resolve_model,
 };
 use oca_state::OcaConfig;
 
@@ -131,28 +129,49 @@ pub struct AgentGrammar {
 }
 
 const EFFORT_FORMS: &[&str] = &["l", "m", "h", "x", "max", "low", "medium", "high", "xhigh"];
-const DISPATCH_ALIASES: &[DispatchAliasGrammar] = &[
-    DispatchAliasGrammar {
-        alias: "opus",
-        effort_ladder: &["low", "medium", "high", "xhigh", "max"],
-    },
-    DispatchAliasGrammar {
-        alias: "sonnet",
-        effort_ladder: &["low", "medium", "high", "xhigh"],
-    },
-    DispatchAliasGrammar {
-        alias: "haiku",
-        effort_ladder: &["low", "medium", "high"],
-    },
-    DispatchAliasGrammar {
-        alias: "flash",
-        effort_ladder: &["high", "max"],
-    },
-    DispatchAliasGrammar {
-        alias: "deepseek",
-        effort_ladder: &["high", "max"],
-    },
-];
+
+const fn dispatch_alias_count() -> usize {
+    let mut count = DEFAULT_MODEL_DEFINITIONS.len();
+    let mut definition_index = 0;
+    while definition_index < DEFAULT_MODEL_DEFINITIONS.len() {
+        count += DEFAULT_MODEL_DEFINITIONS[definition_index].synonyms.len();
+        definition_index += 1;
+    }
+    count
+}
+
+const DISPATCH_ALIAS_COUNT: usize = dispatch_alias_count();
+
+const fn derive_dispatch_aliases() -> [DispatchAliasGrammar; DISPATCH_ALIAS_COUNT] {
+    let mut aliases = [DispatchAliasGrammar {
+        alias: "",
+        effort_ladder: &[],
+    }; DISPATCH_ALIAS_COUNT];
+    let mut definition_index = 0;
+    let mut alias_index = 0;
+    while definition_index < DEFAULT_MODEL_DEFINITIONS.len() {
+        let definition = DEFAULT_MODEL_DEFINITIONS[definition_index];
+        aliases[alias_index] = DispatchAliasGrammar {
+            alias: definition.alias,
+            effort_ladder: definition.ladder,
+        };
+        alias_index += 1;
+
+        let mut synonym_index = 0;
+        while synonym_index < definition.synonyms.len() {
+            aliases[alias_index] = DispatchAliasGrammar {
+                alias: definition.synonyms[synonym_index],
+                effort_ladder: definition.ladder,
+            };
+            alias_index += 1;
+            synonym_index += 1;
+        }
+        definition_index += 1;
+    }
+    aliases
+}
+
+const DISPATCH_ALIASES: [DispatchAliasGrammar; DISPATCH_ALIAS_COUNT] = derive_dispatch_aliases();
 const DISPATCH_OPERANDS: &[OperandGrammar] = &[OperandGrammar {
     name: "prompt",
     form: OperandForm::OneOrMore,
@@ -173,20 +192,20 @@ const REF_AND_MESSAGE_OPERANDS: &[OperandGrammar] = &[
 ];
 
 const DISPATCH_EXAMPLES: &[&[&str]] = &[
-    &["oca", "opus:h", "implement", "the", "ticket"],
-    &["oca", "sonnet", "-e", "x", "review", "the", "diff"],
-    &["oca", "haiku:medium", "summarize", "the", "change"],
+    &["oca", "luna:h", "implement", "the", "ticket"],
+    &["oca", "sol", "-e", "x", "review", "the", "diff"],
+    &["oca", "terra:medium", "summarize", "the", "change"],
     &["oca", "flash:max", "run", "the", "tests"],
     &["oca", "deepseek:h", "check", "the", "parser"],
-    &["oca", "--json", "opus:h", "--", "--literal", "prompt"],
+    &["oca", "--json", "luna:h", "--", "--literal", "prompt"],
 ];
 const DISPATCH_FLAGS: &[FlagGrammar] = &[
     FlagGrammar {
         spellings: &["--json"],
         value: FlagValueForm::None,
         argv_examples: &[
-            &["oca", "opus:h", "--json", "emit", "json"],
-            &["oca", "--json", "opus:h", "emit", "global", "json"],
+            &["oca", "luna:h", "--json", "emit", "json"],
+            &["oca", "--json", "luna:h", "emit", "global", "json"],
         ],
     },
     FlagGrammar {
@@ -195,8 +214,8 @@ const DISPATCH_FLAGS: &[FlagGrammar] = &[
             placeholder: "<effort>",
         },
         argv_examples: &[
-            &["oca", "opus", "-e", "high", "use", "short", "effort"],
-            &["oca", "opus", "--effort", "h", "use", "long", "effort"],
+            &["oca", "sol", "-e", "high", "use", "short", "effort"],
+            &["oca", "sol", "--effort", "h", "use", "long", "effort"],
         ],
     },
     FlagGrammar {
@@ -206,22 +225,22 @@ const DISPATCH_FLAGS: &[FlagGrammar] = &[
             accepted_values: &[],
         },
         argv_examples: &[
-            &["oca", "opus:h", "-r", "review", "inspect", "this"],
-            &["oca", "opus:h", "--role", "impl", "build", "this"],
+            &["oca", "terra:h", "-r", "review", "inspect", "this"],
+            &["oca", "terra:h", "--role", "impl", "build", "this"],
         ],
     },
     FlagGrammar {
         spellings: &["-w", "--worktree"],
         value: FlagValueForm::None,
         argv_examples: &[
-            &["oca", "opus:h", "-w", "make", "an", "isolated", "change"],
-            &["oca", "opus:h", "--worktree", "make", "another", "change"],
+            &["oca", "luna:h", "-w", "make", "an", "isolated", "change"],
+            &["oca", "luna:h", "--worktree", "make", "another", "change"],
         ],
     },
     FlagGrammar {
         spellings: &["--headless"],
         value: FlagValueForm::None,
-        argv_examples: &[&["oca", "opus:h", "--headless", "run", "without", "a", "tui"]],
+        argv_examples: &[&["oca", "flash:h", "--headless", "run", "without", "a", "tui"]],
     },
 ];
 
@@ -251,7 +270,7 @@ const MESSAGE_FLAGS: &[FlagGrammar] = &[
 const DISPATCH_END_OF_OPTIONS: EndOfOptionsGrammar = EndOfOptionsGrammar {
     token: "--",
     trailing_operand: "prompt",
-    argv_examples: &[&["oca", "opus:h", "--", "--literal", "prompt"]],
+    argv_examples: &[&["oca", "luna:h", "--", "--literal", "prompt"]],
 };
 
 const MESSAGE_END_OF_OPTIONS: EndOfOptionsGrammar = EndOfOptionsGrammar {
@@ -436,7 +455,7 @@ const PUBLIC_COMMANDS: [&str; PUBLIC_COMMAND_COUNT] = derive_public_commands();
 /// The public parser-owned grammar for agent construction of `oca` argv.
 pub static AGENT_GRAMMAR: AgentGrammar = AgentGrammar {
     commands: AGENT_COMMANDS,
-    dispatch_aliases: DISPATCH_ALIASES,
+    dispatch_aliases: &DISPATCH_ALIASES,
     effort_forms: EFFORT_FORMS,
 };
 
