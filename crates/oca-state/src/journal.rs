@@ -6,10 +6,12 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
+use fs2::FileExt;
 use oca_core::{EventJournalWriter, OcaEvent, RefId};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 #[cfg(unix)]
@@ -23,6 +25,30 @@ pub struct EventJournal {
     path: PathBuf,
     file: File,
     next_sequence: u64,
+    access: JournalAccess,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JournalAccess {
+    Reader,
+    Writer,
+}
+
+/// One decoded public event from a journal page.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournalEvent {
+    pub sequence: u64,
+    pub event: String,
+    pub session_id: Option<String>,
+    pub payload: Option<Value>,
+}
+
+/// One bounded, point-in-time read of an event journal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct JournalPage {
+    pub events: Vec<JournalEvent>,
+    pub cursor: u64,
+    pub total: u64,
 }
 
 impl fmt::Debug for EventJournal {
@@ -31,6 +57,7 @@ impl fmt::Debug for EventJournal {
             .debug_struct("EventJournal")
             .field("path", &self.path)
             .field("next_sequence", &self.next_sequence)
+            .field("access", &self.access)
             .finish_non_exhaustive()
     }
 }
@@ -56,7 +83,6 @@ impl EventJournal {
         })?;
         set_directory_mode(&events)?;
         let path = events.join(format!("{reference}.{turn}.jsonl"));
-        let next_sequence = next_sequence(&path)?;
         let mut options = OpenOptions::new();
         options.create(true).append(true);
         set_creation_mode(&mut options);
@@ -64,11 +90,54 @@ impl EventJournal {
             path: path.clone(),
             source,
         })?;
+        FileExt::try_lock_exclusive(&file).map_err(|source| {
+            if source.kind() == io::ErrorKind::WouldBlock {
+                JournalError::WriterActive { path: path.clone() }
+            } else {
+                JournalError::Io {
+                    path: path.clone(),
+                    source,
+                }
+            }
+        })?;
+        let next_sequence = next_sequence(&path)?;
         set_file_mode(&path)?;
         Ok(Self {
             path,
             file,
             next_sequence,
+            access: JournalAccess::Writer,
+        })
+    }
+
+    /// Opens an existing journal for point-in-time page reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unsafe turn id or filesystem failure. The
+    /// reader never creates a missing journal.
+    pub fn open(
+        state_directory: impl AsRef<Path>,
+        reference: &RefId,
+        turn: &str,
+    ) -> Result<Self, JournalError> {
+        validate_turn(turn)?;
+        let path = state_directory
+            .as_ref()
+            .join("events")
+            .join(format!("{reference}.{turn}.jsonl"));
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(|source| JournalError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        Ok(Self {
+            path,
+            file,
+            next_sequence: 0,
+            access: JournalAccess::Reader,
         })
     }
 
@@ -81,6 +150,11 @@ impl EventJournal {
     ///
     /// Returns an error when encoding, writing, or flushing the record fails.
     pub fn append(&mut self, event: &OcaEvent) -> Result<(), JournalError> {
+        if self.access != JournalAccess::Writer {
+            return Err(JournalError::ReadOnly {
+                path: self.path.clone(),
+            });
+        }
         if event.is_reasoning() {
             return Ok(());
         }
@@ -130,16 +204,176 @@ impl EventJournal {
     ///
     /// Returns an error when the file cannot be synchronized.
     pub fn finish(&self) -> Result<(), JournalError> {
+        if self.access != JournalAccess::Writer {
+            return Ok(());
+        }
         self.file.sync_all().map_err(|source| JournalError::Io {
             path: self.path.clone(),
             source,
         })
     }
 
+    /// Reads one bounded page containing only records whose sequence is
+    /// greater than `since`.
+    ///
+    /// A live writer is detected through its exclusive file lock. While that
+    /// lock is held, an incomplete or undecodable suffix is ignored. Once a
+    /// shared lock proves that the writer is gone, the same suffix is reported
+    /// as corruption.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for filesystem failures or corruption confirmed after
+    /// the writer has gone away.
+    pub fn page(&self, since: u64, limit: usize) -> Result<JournalPage, JournalError> {
+        let writer_live = self.writer_is_live()?;
+        let bytes = fs::read(&self.path).map_err(|source| JournalError::Io {
+            path: self.path.clone(),
+            source,
+        })?;
+        let complete_length = bytes
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |index| index + 1);
+        let has_incomplete_suffix = complete_length != bytes.len();
+        let mut decoded = Vec::new();
+        for line in bytes[..complete_length]
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+        {
+            match serde_json::from_slice::<OwnedJournalRecord>(line) {
+                Ok(record) => decoded.push(record),
+                Err(_) if writer_live => break,
+                Err(source) => {
+                    return Err(JournalError::Corrupt {
+                        path: self.path.clone(),
+                        source,
+                    });
+                }
+            }
+        }
+        if has_incomplete_suffix && !writer_live {
+            return Err(JournalError::TrailingIncomplete {
+                path: self.path.clone(),
+            });
+        }
+
+        let total = u64::try_from(decoded.len()).unwrap_or(u64::MAX);
+        let events = decoded
+            .into_iter()
+            .filter(|record| record.sequence > since)
+            .take(limit)
+            .map(JournalEvent::from)
+            .collect::<Vec<_>>();
+        let cursor = events.last().map_or(since, |event| event.sequence);
+        Ok(JournalPage {
+            events,
+            cursor,
+            total,
+        })
+    }
+
+    fn writer_is_live(&self) -> Result<bool, JournalError> {
+        if self.access == JournalAccess::Writer {
+            return Ok(true);
+        }
+        match FileExt::try_lock_shared(&self.file) {
+            // Keep the shared lock until the reader is dropped. This closes
+            // the check/read race: a new writer cannot begin after we have
+            // confirmed the previous writer is gone but before the snapshot
+            // has been read and validated.
+            Ok(()) => Ok(false),
+            Err(source) if source.kind() == io::ErrorKind::WouldBlock => Ok(true),
+            Err(source) => Err(JournalError::Io {
+                path: self.path.clone(),
+                source,
+            }),
+        }
+    }
+
     #[must_use]
     pub fn path(&self) -> &Path {
         &self.path
     }
+}
+
+/// Removes expired, inactive journal files from an `~/.oca`-style state root.
+///
+/// A journal whose writer still owns the exclusive lock is retained even when
+/// its modification time is older than the configured retention duration.
+///
+/// # Errors
+///
+/// Returns an error when directory inspection, metadata access, locking, or
+/// removal fails.
+pub fn prune_expired_journals(
+    state_directory: impl AsRef<Path>,
+    retention: Duration,
+) -> Result<usize, JournalError> {
+    let events = state_directory.as_ref().join("events");
+    let entries = match fs::read_dir(&events) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(source) => {
+            return Err(JournalError::Io {
+                path: events,
+                source,
+            });
+        }
+    };
+    let mut removed = 0;
+    for entry in entries {
+        let entry = entry.map_err(|source| JournalError::Io {
+            path: events.clone(),
+            source,
+        })?;
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("jsonl")
+            || !entry
+                .file_type()
+                .map_err(|source| JournalError::Io {
+                    path: path.clone(),
+                    source,
+                })?
+                .is_file()
+        {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .map_err(|source| JournalError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        if modified.elapsed().unwrap_or_default() < retention {
+            continue;
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .open(&path)
+            .map_err(|source| JournalError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        match FileExt::try_lock_shared(&file) {
+            Ok(()) => {
+                fs::remove_file(&path).map_err(|source| JournalError::Io {
+                    path: path.clone(),
+                    source,
+                })?;
+                removed += 1;
+            }
+            Err(source) if source.kind() == io::ErrorKind::WouldBlock => {}
+            Err(source) => {
+                return Err(JournalError::Io {
+                    path: path.clone(),
+                    source,
+                });
+            }
+        }
+    }
+    Ok(removed)
 }
 
 impl EventJournalWriter for EventJournal {
@@ -157,6 +391,29 @@ struct JournalRecord<'a> {
     session_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     payload: Option<Value>,
+}
+
+#[derive(Deserialize)]
+struct OwnedJournalRecord {
+    #[serde(rename = "schema_version")]
+    _schema_version: u32,
+    sequence: u64,
+    event: String,
+    #[serde(default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    payload: Option<Value>,
+}
+
+impl From<OwnedJournalRecord> for JournalEvent {
+    fn from(record: OwnedJournalRecord) -> Self {
+        Self {
+            sequence: record.sequence,
+            event: record.event,
+            session_id: record.session_id,
+            payload: record.payload,
+        }
+    }
 }
 
 fn encode_record(record: &JournalRecord<'_>) -> Result<Vec<u8>, JournalError> {
@@ -300,6 +557,10 @@ pub enum JournalError {
     MissingSequence { path: PathBuf },
     #[error("journal {path} ends with an incomplete record")]
     TrailingIncomplete { path: PathBuf },
+    #[error("journal writer is already active at {path}")]
+    WriterActive { path: PathBuf },
+    #[error("journal {path} was opened read-only")]
+    ReadOnly { path: PathBuf },
     #[error("unsafe journal turn id `{0}`")]
     UnsafeTurn(String),
 }
@@ -438,5 +699,63 @@ mod tests {
             EventJournal::create(state.path(), &reference, "msg_turn"),
             Err(JournalError::TrailingIncomplete { .. })
         ));
+    }
+
+    #[test]
+    fn page_tolerates_live_trailing_line_and_reports_it_after_writer_exit() {
+        let state = tempfile::tempdir().unwrap();
+        let reference = RefId::new("w4f2a1").unwrap();
+        let mut writer = EventJournal::create(state.path(), &reference, "msg_turn").unwrap();
+        writer
+            .append(&event("session.busy", Some(json!({})), true))
+            .unwrap();
+        OpenOptions::new()
+            .append(true)
+            .open(writer.path())
+            .unwrap()
+            .write_all(b"{\"schema_version\":1,\"sequence\":2")
+            .unwrap();
+
+        let reader = EventJournal::open(state.path(), &reference, "msg_turn").unwrap();
+        let live_page = reader.page(0, 100).unwrap();
+        assert_eq!(live_page.events.len(), 1);
+        assert_eq!(live_page.cursor, 1);
+        drop(reader);
+        drop(writer);
+
+        let reader = EventJournal::open(state.path(), &reference, "msg_turn").unwrap();
+        assert!(matches!(
+            reader.page(0, 100),
+            Err(JournalError::TrailingIncomplete { .. })
+        ));
+    }
+
+    #[test]
+    fn page_filters_strictly_after_since_and_retention_skips_live_writers() {
+        let state = tempfile::tempdir().unwrap();
+        let reference = RefId::new("w4f2a1").unwrap();
+        let mut writer = EventJournal::create(state.path(), &reference, "msg_turn").unwrap();
+        writer
+            .append(&event("session.busy", Some(json!({ "n": 1 })), true))
+            .unwrap();
+        writer
+            .append(&event("session.idle", Some(json!({ "n": 2 })), true))
+            .unwrap();
+        let page = writer.page(1, 100).unwrap();
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].sequence, 2);
+        assert_eq!(page.total, 2);
+
+        assert_eq!(
+            prune_expired_journals(state.path(), Duration::ZERO).unwrap(),
+            0
+        );
+        let path = writer.path().to_path_buf();
+        drop(writer);
+        assert_eq!(
+            prune_expired_journals(state.path(), Duration::ZERO).unwrap(),
+            1
+        );
+        assert!(!path.exists());
     }
 }

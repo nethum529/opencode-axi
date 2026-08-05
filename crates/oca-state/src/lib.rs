@@ -10,7 +10,10 @@ pub use config::{
     OcaConfig, PermissionMode, PublishConfig, PublishOverride, PublishSettings, RetentionConfig,
     RoleConfig, ServerConfig,
 };
-pub use journal::{EventJournal, JournalError, MAX_JOURNAL_RECORD_BYTES};
+pub use journal::{
+    EventJournal, JournalError, JournalEvent, JournalPage, MAX_JOURNAL_RECORD_BYTES,
+    prune_expired_journals,
+};
 pub use refs::{
     AtomicWriteHook, NewRef, PendingRefAllocation, RefAllocationCompletion, RefDurabilityWarning,
     RefIdSource, RefListFilter, RefPatch, RefRecord, RefStore, RefStoreError, RefStorePaths,

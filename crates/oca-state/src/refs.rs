@@ -13,7 +13,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use fs2::FileExt;
@@ -651,6 +651,41 @@ impl RefStore {
         })
     }
 
+    /// Opportunistically removes tombstones once the ref store has been
+    /// inactive for at least the configured retention duration.
+    ///
+    /// The current on-disk schema predates per-tombstone timestamps. Using the
+    /// store modification time is deliberately conservative: any ref update
+    /// restarts the retention clock rather than deleting a tombstone early.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when metadata, locking, or persistence fails.
+    pub fn prune_tombstones(&self, retention: Duration) -> Result<usize, RefStoreError> {
+        let modified = match fs::metadata(&self.paths.refs_file) {
+            Ok(metadata) => metadata.modified().map_err(|source| RefStoreError::Io {
+                path: self.paths.refs_file.clone(),
+                source,
+            })?,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+            Err(source) => {
+                return Err(RefStoreError::Io {
+                    path: self.paths.refs_file.clone(),
+                    source,
+                });
+            }
+        };
+        if modified.elapsed().unwrap_or_default() < retention {
+            return Ok(0);
+        }
+        self.with_locked_records(|records| {
+            let before = records.len();
+            records.retain(|record| !record.tombstoned);
+            let removed = before.saturating_sub(records.len());
+            Ok((removed, removed != 0))
+        })
+    }
+
     fn with_locked_records<T>(
         &self,
         operation: impl FnOnce(&mut Vec<RefRecord>) -> Result<(T, bool), RefStoreError>,
@@ -1150,6 +1185,34 @@ mod tests {
             store.insert(RefRecord { id: "w0a1b2".to_string(), session_id: "new-session".to_string(), message_id: None, alias: None, effort: None, role: None, cwd: None, last_state: None, repo: None, spawner_tag: None, tombstoned: false }),
             Err(RefStoreError::RefAlreadyExists(id)) if id == "w0a1b2"
         ));
+    }
+
+    #[test]
+    fn zero_day_housekeeping_prunes_tombstones_without_touching_active_refs() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RefStore::with_paths(RefStorePaths::in_directory(directory.path()));
+        for id in ["w0a1b2", "w0a1b3"] {
+            store
+                .insert(RefRecord {
+                    id: id.to_owned(),
+                    session_id: format!("session-{id}"),
+                    message_id: None,
+                    alias: None,
+                    effort: None,
+                    role: None,
+                    cwd: None,
+                    last_state: None,
+                    repo: None,
+                    spawner_tag: None,
+                    tombstoned: false,
+                })
+                .unwrap();
+        }
+        store.tombstone("w0a1b2").unwrap();
+
+        assert_eq!(store.prune_tombstones(Duration::ZERO).unwrap(), 1);
+        assert!(store.resolve("w0a1b2").unwrap().is_none());
+        assert!(store.resolve("w0a1b3").unwrap().is_some());
     }
 
     #[test]

@@ -8,13 +8,18 @@ use oca_state::OcaConfig;
 
 mod background;
 mod control;
+mod events;
 mod follow;
 mod foreground;
+mod list;
+mod scope;
 
 pub use background::execute_background;
 pub use control::{ControlCommandOutput, execute_abort, execute_message, execute_queue};
+pub use events::execute_events;
 pub use follow::{FollowCommandOutput, execute_follow};
 pub use foreground::execute_foreground;
+pub use list::execute_list;
 
 /// The fixed command grammar accepted by `oca`.
 #[derive(Clone, Debug, Eq, PartialEq)]

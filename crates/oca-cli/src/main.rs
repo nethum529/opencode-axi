@@ -54,6 +54,24 @@ fn main() -> ExitCode {
                 Err(error) => render_error(&error, json),
             }
         }
+        Ok((home, oca_cli::Command::List(command))) => {
+            match oca_cli::execute_list(&command, home) {
+                Ok(output) => {
+                    print!("{output}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => render_error(&error, json),
+            }
+        }
+        Ok((home, oca_cli::Command::Events(command))) => {
+            match oca_cli::execute_events(&command, home) {
+                Ok(output) => {
+                    print!("{output}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => render_error(&error, json),
+            }
+        }
         Ok((home, oca_cli::Command::Message(command))) => {
             run_control(oca_cli::execute_message(&command, home), json)
         }
