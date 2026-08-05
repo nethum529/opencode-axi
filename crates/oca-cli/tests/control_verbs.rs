@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use oca_core::is_opencode_message_id;
 use oca_server::{ConnectOrStart, ServerRecord};
 use oca_state::{RefPatch, RefRecord, RefState, RefStore, RefStorePaths};
 use serde_json::Value;
@@ -132,7 +133,12 @@ fn queue_sends_queue_delivery_returns_on_acceptance_without_state_or_effort_chan
     );
     let record = stored_record(home.path());
     assert_eq!(record.last_state, Some(RefState::Running));
-    assert_ne!(record.message_id.as_deref(), Some("msg_prior_turn"));
+    let patched_message_id = record
+        .message_id
+        .as_deref()
+        .expect("queue patches message_id");
+    assert_ne!(patched_message_id, "msg_prior_turn");
+    assert!(is_opencode_message_id(patched_message_id));
     assert_eq!(record.effort.as_deref(), Some("high"));
 }
 
