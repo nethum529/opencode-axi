@@ -751,7 +751,7 @@ mod tests {
     use std::{
         env, fs,
         path::{Path, PathBuf},
-        process::{Child, Command},
+        process::{Child, Command, Stdio},
         sync::{
             Arc, Barrier,
             atomic::{AtomicU64, Ordering},
@@ -775,13 +775,10 @@ mod tests {
     impl LiveLockOwner {
         fn start() -> Self {
             let child = Command::new(env::current_exe().expect("the test executable should exist"))
-                .args([
-                    "--exact",
-                    "tests::live_lock_owner_process",
-                    "--ignored",
-                    "--nocapture",
-                ])
+                .args(["--exact", "tests::live_lock_owner_process", "--ignored"])
                 .env(LIVE_LOCK_OWNER_ENV, "1")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
                 .spawn()
                 .expect("the live lock-owner process should start");
             Self { child: Some(child) }
