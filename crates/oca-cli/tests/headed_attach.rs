@@ -80,6 +80,32 @@ fn headed_attach_records_and_closes_the_tab_after_terminal_state() {
 }
 
 #[test]
+fn an_absent_herdr_socket_ends_the_attach_helper_quietly() {
+    let home = tempfile::tempdir().unwrap();
+    // Never created, so discovery must decline rather than dial it.
+    let socket = home.path().join("herdr-was-never-started.sock");
+    prepare_attach_home(home.path(), &socket, 1);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["__attach", "wabc12", "ses_target", "/worker"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(
+        output.stderr.is_empty(),
+        "an absent herdr is the normal headless case, not a warning: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record = ref_store(home.path()).resolve("wabc12").unwrap().unwrap();
+    assert_eq!(record.display, None);
+    assert_eq!(record.herdr_tab, None);
+}
+
+#[test]
 fn a_never_responding_herdr_socket_does_not_delay_dispatch_ack_or_completion() {
     let home = tempfile::tempdir().unwrap();
     let socket = home.path().join("hung-herdr.sock");
