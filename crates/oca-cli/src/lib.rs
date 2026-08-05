@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
 
 use oca_core::{
-    EffortInput, ErrorCode, ModelCatalog, OcaError, RefId, ResolvedModel, resolve_model,
+    DEFAULT_MODEL_DEFINITIONS, EffortInput, ErrorCode, ModelCatalog, OcaError, RefId,
+    ResolvedModel, resolve_model,
 };
 use oca_state::OcaConfig;
 
@@ -20,7 +21,449 @@ pub enum Command {
     Attach(AttachCommand),
 }
 
-const PUBLIC_COMMANDS: [&str; 8] = ["m", "q", "f", "k", "ls", "events", "push", "pr"];
+/// The kind of agent-visible command described by [`AgentGrammar`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentCommand {
+    /// A model alias and mandatory effort dispatch a new worker turn.
+    Dispatch,
+    /// A public control verb.
+    Control(&'static str),
+}
+
+/// The required shape of an operand in an agent-visible command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OperandForm {
+    /// Exactly one token is required.
+    Required,
+    /// One or more tokens are required and are joined as text by the parser.
+    OneOrMore,
+}
+
+/// One positional operand accepted by a command.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OperandGrammar {
+    /// The display name used for the operand.
+    pub name: &'static str,
+    /// Whether the parser requires one token or a non-empty text tail.
+    pub form: OperandForm,
+}
+
+/// The form of a value accepted after an option spelling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlagValueForm {
+    /// The option is a switch and takes no following value.
+    None,
+    /// The option requires a following value with the displayed form.
+    Required {
+        /// The visible placeholder for the value.
+        placeholder: &'static str,
+        /// Enumerated values when the parser has a finite accepted set.
+        accepted_values: &'static [&'static str],
+    },
+    /// The option requires a value from the selected alias's
+    /// [`DispatchAliasGrammar::effort_ladder`].
+    DispatchEffort {
+        /// The visible placeholder for the effort value.
+        placeholder: &'static str,
+    },
+}
+
+/// One accepted option spelling and executable examples of its use.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlagGrammar {
+    /// Equivalent spellings accepted by the parser.
+    pub spellings: &'static [&'static str],
+    /// Whether the option takes a value and, if known, its accepted forms.
+    pub value: FlagValueForm,
+    /// Complete accepted argv sequences exercising the listed spellings.
+    pub argv_examples: &'static [&'static [&'static str]],
+}
+
+/// The delimiter that stops option parsing for a trailing text operand.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EndOfOptionsGrammar {
+    /// The exact delimiter token accepted by the parser.
+    pub token: &'static str,
+    /// The trailing operand that receives all subsequent tokens literally.
+    pub trailing_operand: &'static str,
+    /// Complete accepted argv sequences exercising the delimiter.
+    pub argv_examples: &'static [&'static [&'static str]],
+}
+
+/// One model alias and its configured canonical effort ladder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DispatchAliasGrammar {
+    /// The exact alias spelling accepted in model-dispatch syntax.
+    pub alias: &'static str,
+    /// Canonical effort values that consumers can safely use for this alias.
+    pub effort_ladder: &'static [&'static str],
+}
+
+/// The grammar for one public command spelling.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CommandGrammar {
+    /// Whether this entry is dispatch syntax or one public control verb.
+    pub kind: AgentCommand,
+    /// Syntax tokens to show an agent when constructing the command.
+    pub display_tokens: &'static [&'static str],
+    /// Positional arguments accepted in order.
+    pub operands: &'static [OperandGrammar],
+    /// Accepted flags and their value forms.
+    pub flags: &'static [FlagGrammar],
+    /// A delimiter that makes the trailing text operand literal, when supported.
+    pub end_of_options: Option<EndOfOptionsGrammar>,
+    /// Complete accepted argv sequences for the command.
+    pub argv_examples: &'static [&'static [&'static str]],
+}
+
+/// Parser-owned, agent-visible command grammar.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgentGrammar {
+    /// Every command agents may invoke, including model dispatch.
+    pub commands: &'static [CommandGrammar],
+    /// Every model alias accepted in model-dispatch syntax.
+    pub dispatch_aliases: &'static [DispatchAliasGrammar],
+    /// Every lexical spelling accepted for an effort value. Dispatch consumers
+    /// should choose a canonical value from the selected alias's ladder.
+    pub effort_forms: &'static [&'static str],
+}
+
+const EFFORT_FORMS: &[&str] = &["l", "m", "h", "x", "max", "low", "medium", "high", "xhigh"];
+
+const fn dispatch_alias_count() -> usize {
+    let mut count = DEFAULT_MODEL_DEFINITIONS.len();
+    let mut definition_index = 0;
+    while definition_index < DEFAULT_MODEL_DEFINITIONS.len() {
+        count += DEFAULT_MODEL_DEFINITIONS[definition_index].synonyms.len();
+        definition_index += 1;
+    }
+    count
+}
+
+const DISPATCH_ALIAS_COUNT: usize = dispatch_alias_count();
+
+const fn derive_dispatch_aliases() -> [DispatchAliasGrammar; DISPATCH_ALIAS_COUNT] {
+    let mut aliases = [DispatchAliasGrammar {
+        alias: "",
+        effort_ladder: &[],
+    }; DISPATCH_ALIAS_COUNT];
+    let mut definition_index = 0;
+    let mut alias_index = 0;
+    while definition_index < DEFAULT_MODEL_DEFINITIONS.len() {
+        let definition = DEFAULT_MODEL_DEFINITIONS[definition_index];
+        aliases[alias_index] = DispatchAliasGrammar {
+            alias: definition.alias,
+            effort_ladder: definition.ladder,
+        };
+        alias_index += 1;
+
+        let mut synonym_index = 0;
+        while synonym_index < definition.synonyms.len() {
+            aliases[alias_index] = DispatchAliasGrammar {
+                alias: definition.synonyms[synonym_index],
+                effort_ladder: definition.ladder,
+            };
+            alias_index += 1;
+            synonym_index += 1;
+        }
+        definition_index += 1;
+    }
+    aliases
+}
+
+const DISPATCH_ALIASES: [DispatchAliasGrammar; DISPATCH_ALIAS_COUNT] = derive_dispatch_aliases();
+const DISPATCH_OPERANDS: &[OperandGrammar] = &[OperandGrammar {
+    name: "prompt",
+    form: OperandForm::OneOrMore,
+}];
+const REF_OPERAND: &[OperandGrammar] = &[OperandGrammar {
+    name: "ref",
+    form: OperandForm::Required,
+}];
+const REF_AND_MESSAGE_OPERANDS: &[OperandGrammar] = &[
+    OperandGrammar {
+        name: "ref",
+        form: OperandForm::Required,
+    },
+    OperandGrammar {
+        name: "message",
+        form: OperandForm::OneOrMore,
+    },
+];
+
+const DISPATCH_EXAMPLES: &[&[&str]] = &[
+    &["oca", "luna:h", "implement", "the", "ticket"],
+    &["oca", "sol", "-e", "x", "review", "the", "diff"],
+    &["oca", "terra:medium", "summarize", "the", "change"],
+    &["oca", "flash:max", "run", "the", "tests"],
+    &["oca", "deepseek:h", "check", "the", "parser"],
+    &["oca", "--json", "luna:h", "--", "--literal", "prompt"],
+];
+const DISPATCH_FLAGS: &[FlagGrammar] = &[
+    FlagGrammar {
+        spellings: &["--json"],
+        value: FlagValueForm::None,
+        argv_examples: &[
+            &["oca", "luna:h", "--json", "emit", "json"],
+            &["oca", "--json", "luna:h", "emit", "global", "json"],
+        ],
+    },
+    FlagGrammar {
+        spellings: &["-e", "--effort"],
+        value: FlagValueForm::DispatchEffort {
+            placeholder: "<effort>",
+        },
+        argv_examples: &[
+            &["oca", "sol", "-e", "high", "use", "short", "effort"],
+            &["oca", "sol", "--effort", "h", "use", "long", "effort"],
+        ],
+    },
+    FlagGrammar {
+        spellings: &["-r", "--role"],
+        value: FlagValueForm::Required {
+            placeholder: "<role>",
+            accepted_values: &[],
+        },
+        argv_examples: &[
+            &["oca", "terra:h", "-r", "review", "inspect", "this"],
+            &["oca", "terra:h", "--role", "impl", "build", "this"],
+        ],
+    },
+    FlagGrammar {
+        spellings: &["-w", "--worktree"],
+        value: FlagValueForm::None,
+        argv_examples: &[
+            &["oca", "luna:h", "-w", "make", "an", "isolated", "change"],
+            &["oca", "luna:h", "--worktree", "make", "another", "change"],
+        ],
+    },
+    FlagGrammar {
+        spellings: &["--headless"],
+        value: FlagValueForm::None,
+        argv_examples: &[&["oca", "flash:h", "--headless", "run", "without", "a", "tui"]],
+    },
+];
+
+const MESSAGE_EXAMPLES: &[&[&str]] = &[
+    &["oca", "m", "w4f2a1", "continue", "the", "work"],
+    &["oca", "m", "w4f2a1", "--", "--literal", "message"],
+];
+const MESSAGE_FLAGS: &[FlagGrammar] = &[
+    FlagGrammar {
+        spellings: &["--json"],
+        value: FlagValueForm::None,
+        argv_examples: &[&["oca", "m", "w4f2a1", "--json", "report", "json"]],
+    },
+    FlagGrammar {
+        spellings: &["-e", "--effort"],
+        value: FlagValueForm::Required {
+            placeholder: "<effort>",
+            accepted_values: EFFORT_FORMS,
+        },
+        argv_examples: &[
+            &["oca", "m", "w4f2a1", "-e", "h", "raise", "effort"],
+            &["oca", "m", "w4f2a1", "--effort", "high", "raise", "effort"],
+        ],
+    },
+];
+
+const DISPATCH_END_OF_OPTIONS: EndOfOptionsGrammar = EndOfOptionsGrammar {
+    token: "--",
+    trailing_operand: "prompt",
+    argv_examples: &[&["oca", "luna:h", "--", "--literal", "prompt"]],
+};
+
+const MESSAGE_END_OF_OPTIONS: EndOfOptionsGrammar = EndOfOptionsGrammar {
+    token: "--",
+    trailing_operand: "message",
+    argv_examples: &[&["oca", "m", "w4f2a1", "--", "--literal", "message"]],
+};
+
+const QUEUE_EXAMPLES: &[&[&str]] = &[&["oca", "q", "w4f2a1", "queue", "this", "message"]];
+const QUEUE_FLAGS: &[FlagGrammar] = &[FlagGrammar {
+    spellings: &["--json"],
+    value: FlagValueForm::None,
+    argv_examples: &[&["oca", "q", "w4f2a1", "--json", "queue", "json"]],
+}];
+
+const FOLLOW_EXAMPLES: &[&[&str]] = &[&["oca", "f", "w4f2a1"]];
+const FOLLOW_FLAGS: &[FlagGrammar] = &[FlagGrammar {
+    spellings: &["--json"],
+    value: FlagValueForm::None,
+    argv_examples: &[&["oca", "f", "w4f2a1", "--json"]],
+}];
+
+const ABORT_EXAMPLES: &[&[&str]] = &[&["oca", "k", "w4f2a1"]];
+const ABORT_FLAGS: &[FlagGrammar] = &[FlagGrammar {
+    spellings: &["--json"],
+    value: FlagValueForm::None,
+    argv_examples: &[&["oca", "k", "w4f2a1", "--json"]],
+}];
+
+const LIST_EXAMPLES: &[&[&str]] = &[&["oca", "ls"]];
+const LIST_FLAGS: &[FlagGrammar] = &[
+    FlagGrammar {
+        spellings: &["--all"],
+        value: FlagValueForm::None,
+        argv_examples: &[&["oca", "ls", "--all"]],
+    },
+    FlagGrammar {
+        spellings: &["--blocked"],
+        value: FlagValueForm::None,
+        argv_examples: &[&["oca", "ls", "--blocked"]],
+    },
+    FlagGrammar {
+        spellings: &["--count"],
+        value: FlagValueForm::None,
+        argv_examples: &[&["oca", "ls", "--count"]],
+    },
+    FlagGrammar {
+        spellings: &["--json"],
+        value: FlagValueForm::None,
+        argv_examples: &[&["oca", "ls", "--json"]],
+    },
+];
+
+const EVENTS_EXAMPLES: &[&[&str]] = &[&["oca", "events", "w4f2a1"]];
+const EVENTS_FLAGS: &[FlagGrammar] = &[
+    FlagGrammar {
+        spellings: &["--since"],
+        value: FlagValueForm::Required {
+            placeholder: "<non-negative-integer>",
+            accepted_values: &[],
+        },
+        argv_examples: &[&["oca", "events", "w4f2a1", "--since", "7"]],
+    },
+    FlagGrammar {
+        spellings: &["--json"],
+        value: FlagValueForm::None,
+        argv_examples: &[&["oca", "events", "w4f2a1", "--json"]],
+    },
+];
+
+const PUSH_EXAMPLES: &[&[&str]] = &[&["oca", "push", "w4f2a1"]];
+const PUSH_FLAGS: &[FlagGrammar] = &[FlagGrammar {
+    spellings: &["--json"],
+    value: FlagValueForm::None,
+    argv_examples: &[&["oca", "push", "w4f2a1", "--json"]],
+}];
+
+const PULL_REQUEST_EXAMPLES: &[&[&str]] = &[&["oca", "pr", "w4f2a1"]];
+const PULL_REQUEST_FLAGS: &[FlagGrammar] = &[FlagGrammar {
+    spellings: &["--json"],
+    value: FlagValueForm::None,
+    argv_examples: &[&["oca", "pr", "w4f2a1", "--json"]],
+}];
+
+const AGENT_COMMANDS: &[CommandGrammar] = &[
+    CommandGrammar {
+        kind: AgentCommand::Dispatch,
+        display_tokens: &["<alias>:<effort>", "<alias> -e <effort>"],
+        operands: DISPATCH_OPERANDS,
+        flags: DISPATCH_FLAGS,
+        end_of_options: Some(DISPATCH_END_OF_OPTIONS),
+        argv_examples: DISPATCH_EXAMPLES,
+    },
+    CommandGrammar {
+        kind: AgentCommand::Control("m"),
+        display_tokens: &["m"],
+        operands: REF_AND_MESSAGE_OPERANDS,
+        flags: MESSAGE_FLAGS,
+        end_of_options: Some(MESSAGE_END_OF_OPTIONS),
+        argv_examples: MESSAGE_EXAMPLES,
+    },
+    CommandGrammar {
+        kind: AgentCommand::Control("q"),
+        display_tokens: &["q"],
+        operands: REF_AND_MESSAGE_OPERANDS,
+        flags: QUEUE_FLAGS,
+        end_of_options: None,
+        argv_examples: QUEUE_EXAMPLES,
+    },
+    CommandGrammar {
+        kind: AgentCommand::Control("f"),
+        display_tokens: &["f"],
+        operands: REF_OPERAND,
+        flags: FOLLOW_FLAGS,
+        end_of_options: None,
+        argv_examples: FOLLOW_EXAMPLES,
+    },
+    CommandGrammar {
+        kind: AgentCommand::Control("k"),
+        display_tokens: &["k"],
+        operands: REF_OPERAND,
+        flags: ABORT_FLAGS,
+        end_of_options: None,
+        argv_examples: ABORT_EXAMPLES,
+    },
+    CommandGrammar {
+        kind: AgentCommand::Control("ls"),
+        display_tokens: &["ls"],
+        operands: &[],
+        flags: LIST_FLAGS,
+        end_of_options: None,
+        argv_examples: LIST_EXAMPLES,
+    },
+    CommandGrammar {
+        kind: AgentCommand::Control("events"),
+        display_tokens: &["events"],
+        operands: REF_OPERAND,
+        flags: EVENTS_FLAGS,
+        end_of_options: None,
+        argv_examples: EVENTS_EXAMPLES,
+    },
+    CommandGrammar {
+        kind: AgentCommand::Control("push"),
+        display_tokens: &["push"],
+        operands: REF_OPERAND,
+        flags: PUSH_FLAGS,
+        end_of_options: None,
+        argv_examples: PUSH_EXAMPLES,
+    },
+    CommandGrammar {
+        kind: AgentCommand::Control("pr"),
+        display_tokens: &["pr"],
+        operands: REF_OPERAND,
+        flags: PULL_REQUEST_FLAGS,
+        end_of_options: None,
+        argv_examples: PULL_REQUEST_EXAMPLES,
+    },
+];
+
+const PUBLIC_COMMAND_COUNT: usize = AGENT_COMMANDS.len() - 1;
+
+const fn derive_public_commands() -> [&'static str; PUBLIC_COMMAND_COUNT] {
+    let mut public_commands = [""; PUBLIC_COMMAND_COUNT];
+    let mut command_index = 0;
+    let mut public_index = 0;
+    while command_index < AGENT_COMMANDS.len() {
+        match AGENT_COMMANDS[command_index].kind {
+            AgentCommand::Dispatch => {}
+            AgentCommand::Control(verb) => {
+                public_commands[public_index] = verb;
+                public_index += 1;
+            }
+        }
+        command_index += 1;
+    }
+    assert!(public_index == PUBLIC_COMMAND_COUNT);
+    public_commands
+}
+
+const PUBLIC_COMMANDS: [&str; PUBLIC_COMMAND_COUNT] = derive_public_commands();
+
+/// The public parser-owned grammar for agent construction of `oca` argv.
+pub static AGENT_GRAMMAR: AgentGrammar = AgentGrammar {
+    commands: AGENT_COMMANDS,
+    dispatch_aliases: &DISPATCH_ALIASES,
+    effort_forms: EFFORT_FORMS,
+};
+
+/// Returns the public parser-owned grammar for agent construction of `oca` argv.
+#[must_use]
+pub const fn grammar_contract() -> &'static AgentGrammar {
+    &AGENT_GRAMMAR
+}
 
 /// The commands published to help, generated schemas, and the agent skill.
 #[must_use]
@@ -306,6 +749,9 @@ fn parse_message(arguments: &[String], permits_effort: bool) -> Result<MessageCo
             if value.starts_with('-') {
                 return Err(usage("`-e` requires an effort"));
             }
+            if !is_effort_form(value) {
+                return Err(usage(format!("unsupported effort `{value}`")));
+            }
             if effort.replace(value.clone()).is_some() {
                 return Err(usage("effort was provided more than once"));
             }
@@ -326,6 +772,13 @@ fn parse_message(arguments: &[String], permits_effort: bool) -> Result<MessageCo
         effort,
         json,
     })
+}
+
+fn is_effort_form(value: &str) -> bool {
+    let value = value.trim();
+    EFFORT_FORMS
+        .iter()
+        .any(|effort| value.eq_ignore_ascii_case(effort))
 }
 
 fn parse_follow(arguments: &[String]) -> Result<FollowCommand, OcaError> {
