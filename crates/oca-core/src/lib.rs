@@ -110,6 +110,20 @@ mod tests {
     }
 
     #[test]
+    fn catalog_synonyms_can_be_rebuilt_and_inspected() {
+        let mut catalog = ModelCatalog::default();
+        catalog.clear_synonyms();
+        assert_eq!(catalog.synonyms().collect::<Vec<_>>(), []);
+
+        assert_eq!(catalog.insert_synonym("  QUICK  ", "  FlAsH "), None);
+        assert_eq!(catalog.synonyms().collect::<Vec<_>>(), [("quick", "flash")]);
+
+        let quick = resolve_model("quick", "high", &catalog).expect("new synonym should resolve");
+        let flash = resolve_model("flash", "high", &catalog).expect("alias should resolve");
+        assert_eq!(quick, flash);
+    }
+
+    #[test]
     fn effort_matrix_resolves_each_default_ladder() {
         let catalog = ModelCatalog::default();
 

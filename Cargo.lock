@@ -743,6 +743,8 @@ name = "oca-cli"
 version = "0.1.0"
 dependencies = [
  "oca-core",
+ "oca-state",
+ "tempfile",
 ]
 
 [[package]]

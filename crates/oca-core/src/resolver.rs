@@ -164,6 +164,32 @@ impl ModelCatalog {
         self.models.keys().map(String::as_str)
     }
 
+    /// Adds or replaces a synonym for a canonical model alias.
+    ///
+    /// Both names are normalized in the same way as resolver lookups.
+    pub fn insert_synonym(
+        &mut self,
+        synonym: impl Into<String>,
+        alias: impl Into<String>,
+    ) -> Option<String> {
+        self.synonyms.insert(
+            normalize_alias(synonym.into()),
+            normalize_alias(alias.into()),
+        )
+    }
+
+    /// Removes every configured synonym while leaving model entries intact.
+    pub fn clear_synonyms(&mut self) {
+        self.synonyms.clear();
+    }
+
+    /// Iterates over normalized synonym-to-alias mappings.
+    pub fn synonyms(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.synonyms
+            .iter()
+            .map(|(synonym, alias)| (synonym.as_str(), alias.as_str()))
+    }
+
     fn canonical_alias(&self, alias: String) -> String {
         self.synonyms.get(&alias).cloned().unwrap_or(alias)
     }
