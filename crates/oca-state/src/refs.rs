@@ -1359,6 +1359,12 @@ mod tests {
                     .count(),
                 0
             );
+            #[cfg(unix)]
+            {
+                assert_eq!(mode(directory.path()), 0o700, "{failure:?}");
+                assert_eq!(mode(&paths.refs_file), 0o600, "{failure:?}");
+                assert_eq!(mode(&paths.lock_file), 0o600, "{failure:?}");
+            }
         }
     }
 
