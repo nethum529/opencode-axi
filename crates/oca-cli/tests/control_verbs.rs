@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use oca_core::is_opencode_message_id;
 use oca_server::{ConnectOrStart, ServerRecord};
 use oca_state::{RefPatch, RefRecord, RefState, RefStore, RefStorePaths};
 use serde_json::Value;
@@ -113,7 +114,7 @@ fn message_effort_override_applies_now_and_persists_for_later_turns() {
 }
 
 #[test]
-fn queue_sends_queue_delivery_returns_on_acceptance_and_keeps_effort() {
+fn queue_sends_queue_delivery_returns_on_acceptance_without_state_or_effort_change() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
     let port = listener.local_addr().expect("fake server address").port();
     let server = thread::spawn(move || serve_prompt(listener, "204 No Content", ""));
@@ -131,8 +132,42 @@ fn queue_sends_queue_delivery_returns_on_acceptance_and_keeps_effort() {
         "w4f2a1 queued openai/gpt-5.6-luna:high\n"
     );
     let record = stored_record(home.path());
-    assert_eq!(record.last_state, Some(RefState::Queued));
+    assert_eq!(record.last_state, Some(RefState::Running));
+    let patched_message_id = record
+        .message_id
+        .as_deref()
+        .expect("queue patches message_id");
+    assert_ne!(patched_message_id, "msg_prior_turn");
+    assert!(is_opencode_message_id(patched_message_id));
     assert_eq!(record.effort.as_deref(), Some("high"));
+}
+
+#[test]
+fn queue_on_idle_session_leaves_state_unchanged_so_message_can_follow() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
+    let port = listener.local_addr().expect("fake server address").port();
+    let server = thread::spawn(move || {
+        [
+            serve_one_prompt(&listener, "204 No Content", ""),
+            serve_one_prompt(&listener, "204 No Content", ""),
+        ]
+    });
+    let home = prepared_home(port, RefState::Idle, "high");
+
+    let queued = run_oca(home.path(), ["q", "w4f2a1", "first", "message"]);
+    assert_success(&queued);
+    assert_eq!(stored_record(home.path()).last_state, Some(RefState::Idle));
+
+    let message = run_oca(home.path(), ["m", "w4f2a1", "follow-up", "message"]);
+    assert_success(&message);
+    assert_eq!(
+        stored_record(home.path()).last_state,
+        Some(RefState::Running)
+    );
+
+    let requests = server.join().expect("fake server completes");
+    assert_eq!(requests[0].body["delivery"], "queue");
+    assert!(requests[1].body.get("delivery").is_none());
 }
 
 #[test]

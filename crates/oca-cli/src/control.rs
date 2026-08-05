@@ -30,7 +30,7 @@ pub struct ControlCommandOutput {
 /// # Errors
 ///
 /// Returns `worker_busy` before opening a connection when the stored session
-/// state is running or queued. Other local state, resolution, transport, and
+/// state is running. Other local state, resolution, transport, and
 /// persistence failures retain their stable oca error codes.
 pub async fn execute_message(
     command: &MessageCommand,
@@ -42,7 +42,7 @@ pub async fn execute_message(
     let store = RefStore::with_paths(RefStorePaths::in_directory(&state_directory));
     let record = resolve_active_ref(&store, &command.reference)?;
     let state = required_state(&record, &command.reference)?;
-    if matches!(state, RefState::Running | RefState::Queued) {
+    if state == RefState::Running {
         return Err(OcaError::new(ErrorCode::WorkerBusy)
             .with_ref(&command.reference)
             .with_help(format!(
@@ -80,7 +80,7 @@ pub async fn execute_message(
 
     Ok(accepted_output(
         &command.reference,
-        RefState::Running,
+        RefState::Running.as_str(),
         &context.model,
         command.json,
     ))
@@ -118,15 +118,13 @@ pub async fn execute_queue(
     store
         .patch(
             &command.reference,
-            RefPatch::default()
-                .with_message_id(message_id)
-                .with_last_state(RefState::Queued),
+            RefPatch::default().with_message_id(message_id),
         )
         .map_err(|error| state_error(&command.reference, "could not update ref", error))?;
 
     Ok(accepted_output(
         &command.reference,
-        RefState::Queued,
+        "queued",
         &context.model,
         command.json,
     ))
@@ -167,7 +165,7 @@ pub async fn execute_abort(
 
     Ok(accepted_output(
         &command.reference,
-        RefState::Aborted,
+        RefState::Aborted.as_str(),
         &context.model,
         command.json,
     ))
@@ -317,11 +315,11 @@ fn mint_message_id() -> Result<String, OcaError> {
 
 fn accepted_output(
     reference: &str,
-    state: RefState,
+    state: &str,
     model: &ResolvedModel,
     json: bool,
 ) -> ControlCommandOutput {
-    let acknowledgement = Acknowledgement::from_resolved(reference, state.as_str(), model);
+    let acknowledgement = Acknowledgement::from_resolved(reference, state, model);
     ControlCommandOutput {
         stdout: if json {
             acknowledgement.render_json()
