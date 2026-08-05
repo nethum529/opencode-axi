@@ -638,6 +638,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_recovery_budget_is_one_attempt_for_the_whole_dispatch() {
+        let mut backend = FakeBackend {
+            waited: Some(valid_terminal()),
+            fail_subscribe_once: true,
+            fail_prompt_before_transmission_once: true,
+            ..FakeBackend::default()
+        };
+
+        let error = block_on(run_foreground(&mut backend, request("luna", "h"))).unwrap_err();
+
+        assert_eq!(error.code_kind(), ErrorCode::ServerUnreachable);
+        assert_eq!(
+            backend
+                .calls
+                .iter()
+                .filter(|call| **call == "create")
+                .count(),
+            2,
+            "a second recovery would create a third session: {:?}",
+            backend.calls
+        );
+        assert!(!backend.calls.contains(&"write_ref"));
+    }
+
     /// The recovery paths recreate the session, so the subscribe-before-prompt
     /// invariant has to hold against the session each prompt actually targets,
     /// not merely somewhere earlier in the call log.
