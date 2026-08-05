@@ -1,7 +1,10 @@
+use fs2::FileExt;
 use oca_core::RefId as CanonicalRef;
 use std::{
     ffi::OsStr,
-    fmt, fs, io,
+    fmt, fs,
+    fs::File,
+    io,
     path::{Path, PathBuf},
     process::{Command, ExitStatus, Output},
     sync::Arc,
@@ -12,6 +15,7 @@ use std::{
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
 const DEFAULT_LOCK_ACQUISITION_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCK_OWNER_RECORD: &str = "owner";
+const LOCK_RECLAIM_MUTEX: &str = "worktree.reclaim.lock";
 type AfterScanHook = dyn Fn(&Path) + Send + Sync;
 
 /// A validated identifier used to name an oca branch and worktree.
@@ -233,6 +237,7 @@ impl From<io::Error> for GitError {
 /// Creates and validates oca-owned Git worktrees.
 pub struct WorktreeManager {
     after_scan_hook: Option<Arc<AfterScanHook>>,
+    before_lock_reclaim_hook: Option<Arc<AfterScanHook>>,
     lock_acquisition_timeout: Duration,
 }
 
@@ -241,6 +246,10 @@ impl fmt::Debug for WorktreeManager {
         formatter
             .debug_struct("WorktreeManager")
             .field("has_after_scan_hook", &self.after_scan_hook.is_some())
+            .field(
+                "has_before_lock_reclaim_hook",
+                &self.before_lock_reclaim_hook.is_some(),
+            )
             .field("lock_acquisition_timeout", &self.lock_acquisition_timeout)
             .finish()
     }
@@ -258,6 +267,7 @@ impl WorktreeManager {
     pub const fn new() -> Self {
         Self {
             after_scan_hook: None,
+            before_lock_reclaim_hook: None,
             lock_acquisition_timeout: DEFAULT_LOCK_ACQUISITION_TIMEOUT,
         }
     }
@@ -270,6 +280,7 @@ impl WorktreeManager {
     pub fn with_after_scan_hook(hook: Arc<AfterScanHook>) -> Self {
         Self {
             after_scan_hook: Some(hook),
+            before_lock_reclaim_hook: None,
             lock_acquisition_timeout: DEFAULT_LOCK_ACQUISITION_TIMEOUT,
         }
     }
@@ -282,6 +293,23 @@ impl WorktreeManager {
     pub const fn with_lock_acquisition_timeout(lock_acquisition_timeout: Duration) -> Self {
         Self {
             after_scan_hook: None,
+            before_lock_reclaim_hook: None,
+            lock_acquisition_timeout,
+        }
+    }
+
+    /// Creates a manager with a hook after stale-lock observation but before reclamation.
+    ///
+    /// This seam exists for deterministic stale-lock TOCTOU tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_lock_reclaim_hook(
+        lock_acquisition_timeout: Duration,
+        hook: Arc<AfterScanHook>,
+    ) -> Self {
+        Self {
+            after_scan_hook: None,
+            before_lock_reclaim_hook: Some(hook),
             lock_acquisition_timeout,
         }
     }
@@ -293,7 +321,11 @@ impl WorktreeManager {
     /// Returns [`GitError::WorktreeConflict`] when the oca branch or worktree
     /// already exists, or a git/filesystem error when creation cannot complete.
     pub fn create(&self, reference: &RefId, base: &Path) -> Result<WorktreeRecord, GitError> {
-        let _lock = RepositoryLock::acquire(base, self.lock_acquisition_timeout)?;
+        let _lock = RepositoryLock::acquire(
+            base,
+            self.lock_acquisition_timeout,
+            self.before_lock_reclaim_hook.as_deref(),
+        )?;
         let branch = format!("oca/{reference}");
         let path = base.join(".oca").join("wt").join(reference.as_str());
 
@@ -371,22 +403,32 @@ struct RepositoryLock {
 }
 
 impl RepositoryLock {
-    fn acquire(base: &Path, timeout: Duration) -> Result<Self, GitError> {
+    fn acquire(
+        base: &Path,
+        timeout: Duration,
+        before_reclaim_hook: Option<&AfterScanHook>,
+    ) -> Result<Self, GitError> {
         let oca_directory = base.join(".oca");
         fs::create_dir_all(&oca_directory)?;
         let path = oca_directory.join("worktree.lock");
+        let reclaim_mutex_path = oca_directory.join(LOCK_RECLAIM_MUTEX);
         let deadline = Instant::now() + timeout;
 
         loop {
             match fs::create_dir(&path) {
                 Ok(()) => {
-                    write_lock_owner_record(&path)?;
-                    return Ok(Self { path });
+                    let lock = Self { path };
+                    write_lock_owner_record(&lock.path)?;
+                    return Ok(lock);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                     if lock_owner_is_known_dead(&path)? {
-                        reclaim_lock(&path)?;
-                        continue;
+                        if let Some(hook) = before_reclaim_hook {
+                            hook(&path);
+                        }
+                        if reclaim_lock(&path, &reclaim_mutex_path, deadline)? {
+                            continue;
+                        }
                     }
                     let remaining = deadline.saturating_duration_since(Instant::now());
                     if remaining.is_zero() {
@@ -400,7 +442,8 @@ impl RepositoryLock {
     }
 }
 
-/// The lock owner record is `<decimal process id>\\n` in `worktree.lock/owner`.
+/// The lock owner record is a decimal process ID terminated by one LF byte (`0x0a`)
+/// in `worktree.lock/owner`.
 /// A lock is reclaimable only when this record parses and its process is known dead.
 fn write_lock_owner_record(lock_path: &Path) -> Result<(), GitError> {
     fs::write(
@@ -426,24 +469,95 @@ fn lock_owner_is_known_dead(lock_path: &Path) -> Result<bool, GitError> {
     let Ok(pid) = owner.parse::<u32>() else {
         return Ok(false);
     };
+    if pid == 0 {
+        return Ok(false);
+    }
     Ok(process_is_known_dead(pid))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn process_is_known_dead(pid: u32) -> bool {
-    !Path::new("/proc").join(pid.to_string()).exists()
+    let Ok(pid) = libc::pid_t::try_from(pid) else {
+        return true;
+    };
+    // SAFETY: signal 0 performs an existence/permission check and does not send a signal.
+    let result = unsafe { libc::kill(pid, 0) };
+    result == -1 && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(windows)]
+fn process_is_known_dead(pid: u32) -> bool {
+    use windows_sys::Win32::{
+        Foundation::{CloseHandle, ERROR_INVALID_PARAMETER, STILL_ACTIVE},
+        System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+
+    // SAFETY: the handle is checked before use and closed exactly once below.
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return io::Error::last_os_error().raw_os_error()
+            == i32::try_from(ERROR_INVALID_PARAMETER).ok();
+    }
+    let mut exit_code = 0;
+    // SAFETY: `handle` is valid and `exit_code` points to writable memory.
+    let queried = unsafe { GetExitCodeProcess(handle, &raw mut exit_code) } != 0;
+    // SAFETY: `handle` was returned by `OpenProcess` and has not been closed yet.
+    unsafe { CloseHandle(handle) };
+    queried && exit_code != STILL_ACTIVE
+}
+
+#[cfg(not(any(unix, windows)))]
 fn process_is_known_dead(_pid: u32) -> bool {
     false
 }
 
-fn reclaim_lock(lock_path: &Path) -> Result<(), GitError> {
+fn reclaim_lock(
+    lock_path: &Path,
+    reclaim_mutex_path: &Path,
+    deadline: Instant,
+) -> Result<bool, GitError> {
+    let _reclaim_mutex = ReclaimMutex::acquire(reclaim_mutex_path, deadline)?;
+    if !lock_owner_is_known_dead(lock_path)? {
+        return Ok(false);
+    }
     match fs::remove_dir_all(lock_path) {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
         Err(error) => Err(error.into()),
+    }
+}
+
+struct ReclaimMutex {
+    file: File,
+}
+
+impl ReclaimMutex {
+    fn acquire(path: &Path, deadline: Instant) -> Result<Self, GitError> {
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        loop {
+            match FileExt::try_lock_exclusive(&file) {
+                Ok(()) => return Ok(Self { file }),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        return Err(GitError::LockTimeout);
+                    }
+                    thread::sleep(LOCK_RETRY_DELAY.min(remaining));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+impl Drop for ReclaimMutex {
+    fn drop(&mut self) {
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -638,43 +752,74 @@ mod tests {
         env, fs,
         path::{Path, PathBuf},
         process::{Child, Command},
-        sync::atomic::{AtomicU64, Ordering},
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicU64, Ordering},
+        },
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
-    use super::{GitError, RefId, RelativePath, WorktreeManager, lock_owner_record};
+    use super::{GitError, RefId, RelativePath, WorktreeManager};
 
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
+    const LIVE_LOCK_OWNER_ENV: &str = "OCA_GIT_TEST_LIVE_LOCK_OWNER";
 
     struct TestRepository {
         path: PathBuf,
     }
 
-    #[cfg(target_os = "linux")]
     struct LiveLockOwner {
-        child: Child,
+        child: Option<Child>,
     }
 
-    #[cfg(target_os = "linux")]
     impl LiveLockOwner {
         fn start() -> Self {
-            let child = Command::new("sleep")
-                .arg("5")
+            let child = Command::new(env::current_exe().expect("the test executable should exist"))
+                .args([
+                    "--exact",
+                    "tests::live_lock_owner_process",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env(LIVE_LOCK_OWNER_ENV, "1")
                 .spawn()
                 .expect("the live lock-owner process should start");
-            Self { child }
+            Self { child: Some(child) }
         }
 
         fn pid(&self) -> u32 {
-            self.child.id()
+            self.child
+                .as_ref()
+                .expect("the lock-owner process should still be held")
+                .id()
+        }
+
+        fn stop(&mut self) {
+            if let Some(mut child) = self.child.take() {
+                child
+                    .kill()
+                    .expect("the lock-owner process should be stopped");
+                child
+                    .wait()
+                    .expect("the stopped lock-owner process should be reaped");
+            }
         }
     }
 
-    #[cfg(target_os = "linux")]
     impl Drop for LiveLockOwner {
         fn drop(&mut self) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            if let Some(child) = &mut self.child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "helper process for portable lock-owner lifecycle tests"]
+    fn live_lock_owner_process() {
+        if env::var_os(LIVE_LOCK_OWNER_ENV).is_some() {
+            std::thread::sleep(Duration::from_secs(30));
         }
     }
 
@@ -908,14 +1053,13 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn create_times_out_without_changing_a_live_owner_lock_record() {
         let repository = TestRepository::new();
         let lock_path = repository.path.join(".oca/worktree.lock");
         fs::create_dir_all(&lock_path).expect("the test lock directory should be created");
         let owner = LiveLockOwner::start();
-        let owner_record = lock_owner_record(owner.pid()).into_bytes();
+        let owner_record = format!("{}\n", owner.pid()).into_bytes();
         fs::write(lock_path.join("owner"), &owner_record)
             .expect("the documented lock owner record should be written");
         let reference = RefId::new("w4f2a1").expect("the reference should be valid");
@@ -938,13 +1082,15 @@ mod tests {
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn create_reclaims_a_lock_with_a_known_dead_owner() {
         let repository = TestRepository::new();
         let lock_path = repository.path.join(".oca/worktree.lock");
         fs::create_dir_all(&lock_path).expect("the stale lock directory should be created");
-        fs::write(lock_path.join("owner"), lock_owner_record(u32::MAX))
+        let mut owner = LiveLockOwner::start();
+        let dead_pid = owner.pid();
+        owner.stop();
+        fs::write(lock_path.join("owner"), format!("{dead_pid}\n"))
             .expect("the documented stale owner record should be written");
         let reference = RefId::new("w4f2a1").expect("the reference should be valid");
 
@@ -954,6 +1100,56 @@ mod tests {
 
         assert_eq!(worktree.path(), repository.path.join(".oca/wt/w4f2a1"));
         assert!(worktree.path().is_dir());
+    }
+
+    #[test]
+    fn stale_observation_never_deletes_a_replacement_live_owner_lock() {
+        let repository = TestRepository::new();
+        let lock_path = repository.path.join(".oca/worktree.lock");
+        fs::create_dir_all(&lock_path).expect("the stale lock directory should be created");
+        let mut dead_owner = LiveLockOwner::start();
+        let dead_pid = dead_owner.pid();
+        dead_owner.stop();
+        fs::write(lock_path.join("owner"), format!("{dead_pid}\n"))
+            .expect("the documented stale owner record should be written");
+
+        let stale_observed = Arc::new(Barrier::new(2));
+        let replacement_installed = Arc::new(Barrier::new(2));
+        let hook_observed = Arc::clone(&stale_observed);
+        let hook_replacement = Arc::clone(&replacement_installed);
+        let manager = WorktreeManager::with_lock_reclaim_hook(
+            Duration::from_millis(100),
+            Arc::new(move |_| {
+                hook_observed.wait();
+                hook_replacement.wait();
+            }),
+        );
+        let repository_path = repository.path.clone();
+        let contender = std::thread::spawn(move || {
+            let reference = RefId::new("w4f2a1").expect("the reference should be valid");
+            manager.create(&reference, &repository_path)
+        });
+
+        stale_observed.wait();
+        fs::remove_dir_all(&lock_path).expect("the stale lock should be reclaimed by the peer");
+        fs::create_dir(&lock_path).expect("the peer should acquire a replacement lock");
+        let live_owner = LiveLockOwner::start();
+        let live_owner_record = format!("{}\n", live_owner.pid()).into_bytes();
+        fs::write(lock_path.join("owner"), &live_owner_record)
+            .expect("the replacement owner record should be written");
+        replacement_installed.wait();
+
+        let error = contender
+            .join()
+            .expect("the stale-lock contender should not panic")
+            .expect_err("the replacement live owner should force a timeout");
+        assert!(matches!(error, GitError::LockTimeout));
+        assert!(lock_path.is_dir());
+        assert_eq!(
+            fs::read(lock_path.join("owner"))
+                .expect("the live owner record should remain readable"),
+            live_owner_record
+        );
     }
 
     #[test]
