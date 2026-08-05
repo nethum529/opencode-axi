@@ -8,7 +8,7 @@ use std::{
     sync::OnceLock,
 };
 
-use oca_core::DEFAULT_MODEL_DEFINITIONS;
+use oca_core::{DEFAULT_MODEL_DEFINITIONS, ModelCatalog, ModelDefinition};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -203,6 +203,25 @@ impl OcaConfig {
         );
 
         diagnostics
+    }
+
+    /// Builds the resolver catalog represented by the merged model configuration.
+    #[must_use]
+    pub fn model_catalog(&self) -> ModelCatalog {
+        let mut catalog = ModelCatalog::default();
+        catalog.clear_synonyms();
+
+        for (alias, model) in &self.models {
+            catalog.insert(
+                alias,
+                ModelDefinition::new(&model.provider, &model.model, &model.efforts),
+            );
+            for synonym in &model.synonyms {
+                catalog.insert_synonym(synonym, alias);
+            }
+        }
+
+        catalog
     }
 
     /// Returns the publication settings for a repository root. Overrides use
@@ -683,6 +702,38 @@ efforts = ["high"]
         assert_eq!(config.models.len(), 5);
         assert_eq!(config.models["custom"].provider, "example");
         assert_eq!(config.models["custom"].efforts, ["high"]);
+    }
+
+    #[test]
+    fn model_catalog_uses_configured_models_and_synonyms() {
+        let config = OcaConfig::from_toml_str(
+            r#"
+[models.custom]
+provider = "example"
+model = "custom-model"
+efforts = ["high"]
+synonyms = ["bespoke"]
+
+[models.flash]
+provider = "override"
+model = "flash-override"
+efforts = ["max"]
+synonyms = []
+"#,
+        )
+        .expect("custom models are valid");
+        let catalog = config.model_catalog();
+
+        let custom = oca_core::resolve_model("bespoke", "high", &catalog)
+            .expect("configured synonym should resolve");
+        assert_eq!(custom.alias, "custom");
+        assert_eq!(custom.provider, "example");
+        assert_eq!(custom.model, "custom-model");
+
+        assert!(
+            oca_core::resolve_model("deepseek", "max", &catalog).is_err(),
+            "clearing flash synonyms in config must clear the compiled default"
+        );
     }
 
     #[cfg(unix)]

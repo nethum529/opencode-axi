@@ -8,7 +8,15 @@ fn main() -> ExitCode {
     }
     let json = option_before_end(&arguments, "--json");
 
-    match oca_cli::parse_from(arguments) {
+    let result = home_directory()
+        .ok_or_else(|| {
+            oca_core::OcaError::new(oca_core::ErrorCode::Usage)
+                .with_error("could not determine the home directory")
+                .with_help("set the HOME environment variable and retry")
+        })
+        .and_then(|home| oca_cli::parse_from_home(arguments, home));
+
+    match result {
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => {
             if json {
@@ -19,6 +27,15 @@ fn main() -> ExitCode {
             ExitCode::from(u8::try_from(error.exit_code()).unwrap_or(1))
         }
     }
+}
+
+fn home_directory() -> Option<std::path::PathBuf> {
+    #[cfg(windows)]
+    const HOME_VARIABLE: &str = "USERPROFILE";
+    #[cfg(not(windows))]
+    const HOME_VARIABLE: &str = "HOME";
+
+    std::env::var_os(HOME_VARIABLE).map(Into::into)
 }
 
 fn option_before_end(arguments: &[String], option: &str) -> bool {

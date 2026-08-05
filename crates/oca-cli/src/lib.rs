@@ -1,8 +1,9 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use oca_core::{
     EffortInput, ErrorCode, ModelCatalog, OcaError, RefId, ResolvedModel, resolve_model,
 };
+use oca_state::OcaConfig;
 
 /// The fixed command grammar accepted by `oca`.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,12 +114,45 @@ where
     I: IntoIterator<Item = S>,
     S: Into<String>,
 {
-    let mut arguments = arguments.into_iter().map(Into::into);
-    let _program_name = arguments.next();
-    parse_arguments(arguments.collect())
+    parse_from_catalog(arguments, &ModelCatalog::default())
 }
 
-fn parse_arguments(mut arguments: Vec<String>) -> Result<Command, OcaError> {
+/// Parse an argv sequence using the configuration under `home/.oca`.
+///
+/// This is the production parser used by the `oca` binary. A missing config
+/// file preserves the compiled-in model catalog.
+///
+/// # Errors
+///
+/// Returns a structured error when configuration cannot be loaded or the
+/// command is invalid.
+pub fn parse_from_home<I, S>(arguments: I, home: impl AsRef<Path>) -> Result<Command, OcaError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let config = OcaConfig::load_from_home(home).map_err(|error| {
+        OcaError::new(ErrorCode::Usage)
+            .with_error(format!("failed to load configuration: {error}"))
+            .with_help("fix ~/.oca/config.toml and retry")
+    })?;
+    parse_from_catalog(arguments, &config.model_catalog())
+}
+
+fn parse_from_catalog<I, S>(arguments: I, catalog: &ModelCatalog) -> Result<Command, OcaError>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let mut arguments = arguments.into_iter().map(Into::into);
+    let _program_name = arguments.next();
+    parse_arguments(arguments.collect(), catalog)
+}
+
+fn parse_arguments(
+    mut arguments: Vec<String>,
+    catalog: &ModelCatalog,
+) -> Result<Command, OcaError> {
     let mut global_json = false;
     while arguments
         .first()
@@ -144,7 +178,7 @@ fn parse_arguments(mut arguments: Vec<String>) -> Result<Command, OcaError> {
         "pr" => parse_ref_command(tail).map(Command::PullRequest),
         "__attach" => parse_attach(tail).map(Command::Attach),
         "s" => Err(usage("`s` is not a supported command")),
-        _ => parse_dispatch(verb, tail).map(Command::Dispatch),
+        _ => parse_dispatch(verb, tail, catalog).map(Command::Dispatch),
     };
     command.map(|mut command| {
         if global_json {
@@ -169,7 +203,11 @@ impl Command {
     }
 }
 
-fn parse_dispatch(verb: &str, arguments: &[String]) -> Result<DispatchCommand, OcaError> {
+fn parse_dispatch(
+    verb: &str,
+    arguments: &[String],
+    catalog: &ModelCatalog,
+) -> Result<DispatchCommand, OcaError> {
     let (alias, inline_effort) = match verb.split_once(':') {
         Some((alias, effort)) => (alias, Some(effort.to_owned())),
         None => (verb, None),
@@ -226,7 +264,7 @@ fn parse_dispatch(verb: &str, arguments: &[String]) -> Result<DispatchCommand, O
     let model = resolve_model(
         alias,
         EffortInput::both(inline_effort, flagged_effort),
-        ModelCatalog::default(),
+        catalog,
     )?;
     if prompt.is_empty() {
         return Err(usage("a prompt is required"));

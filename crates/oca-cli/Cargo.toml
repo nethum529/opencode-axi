@@ -10,3 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 oca-core = { path = "../oca-core" }
+oca-state = { path = "../oca-state" }
+
+[dev-dependencies]
+tempfile = "3.23"
