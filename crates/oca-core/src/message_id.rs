@@ -49,8 +49,8 @@ impl MessageIdGenerator {
     }
 }
 
-/// Returns whether an ID has OpenCode's message prefix, lowercase 48-bit
-/// clock/counter field, and exact base-62 suffix width.
+/// Returns whether an ID has OpenCode's message prefix, nonzero lowercase
+/// 48-bit clock/counter field, and exact base-62 suffix width.
 #[must_use]
 pub fn is_opencode_message_id(value: &str) -> bool {
     let Some(suffix) = value.strip_prefix("msg_") else {
@@ -60,8 +60,10 @@ pub fn is_opencode_message_id(value: &str) -> bool {
         return false;
     }
     let (time, random) = suffix.split_at(TIME_PREFIX_WIDTH);
-    time.bytes()
-        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    time != "000000000000"
+        && time
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         && random.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
@@ -99,6 +101,7 @@ mod tests {
         for invalid in [
             "msg_oca_w4f2a1_1",
             "msg_zzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "msg_00000000000000000000000000",
             "msg_000000000001short",
             "msg_00000000000Gaaaaaaaaaaaaaa",
             "evt_000000000001aaaaaaaaaaaaaa",

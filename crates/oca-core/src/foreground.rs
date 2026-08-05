@@ -192,9 +192,165 @@ mod tests {
         DispatchPrompt, ForegroundBackend, ForegroundRequest, TerminalReply, run_foreground,
     };
     use crate::{
-        ErrorCode, ModelCatalog, OcaError, ReplyContract, ResolvedModel, RoleReply, WorkerPolicy,
-        is_opencode_message_id, resolve_model,
+        ErrorCode, MessageIdGenerator, ModelCatalog, OcaError, RANDOM_SUFFIX_WIDTH, ReplyContract,
+        ResolvedModel, RoleReply, WorkerPolicy, is_opencode_message_id, resolve_model,
     };
+
+    const REPLAY_PREVIOUS_ID: &str = "msg_f9a4a7900001AAAAAAAAAAAAAA";
+    const REPLAY_SERVER_REPLY_ID: &str = "msg_f9a4a7b00001BBBBBBBBBBBBBB";
+
+    enum ReplayMessageId {
+        ProductionAt(u64),
+        Injected(&'static str),
+    }
+
+    struct Gate0ServerReplay {
+        source: ReplayMessageId,
+        generator: MessageIdGenerator,
+        submitted_id: Option<String>,
+        prompts: usize,
+        assistant_messages: usize,
+        terminal_events: usize,
+        aborted: bool,
+        finalized: usize,
+    }
+
+    impl Gate0ServerReplay {
+        fn production_at(timestamp_ms: u64) -> Self {
+            Self::new(ReplayMessageId::ProductionAt(timestamp_ms))
+        }
+
+        fn injected(message_id: &'static str) -> Self {
+            Self::new(ReplayMessageId::Injected(message_id))
+        }
+
+        fn new(source: ReplayMessageId) -> Self {
+            Self {
+                source,
+                generator: MessageIdGenerator::new(),
+                submitted_id: None,
+                prompts: 0,
+                assistant_messages: 0,
+                terminal_events: 0,
+                aborted: false,
+                finalized: 0,
+            }
+        }
+    }
+
+    impl ForegroundBackend for Gate0ServerReplay {
+        type Subscription = ();
+        type PendingRef = String;
+
+        async fn create_session(
+            &mut self,
+            _request: &ForegroundRequest,
+        ) -> Result<String, OcaError> {
+            Ok("ses_gate0_replay".to_owned())
+        }
+
+        async fn subscribe(&mut self) -> Result<Self::Subscription, OcaError> {
+            Ok(())
+        }
+
+        fn mint_message_id(&mut self) -> Result<String, OcaError> {
+            Ok(match self.source {
+                ReplayMessageId::ProductionAt(timestamp_ms) => {
+                    self.generator.mint(timestamp_ms, [0; RANDOM_SUFFIX_WIDTH])
+                }
+                ReplayMessageId::Injected(message_id) => message_id.to_owned(),
+            })
+        }
+
+        async fn prompt_async(
+            &mut self,
+            _session_id: &str,
+            prompt: &DispatchPrompt,
+        ) -> Result<(), OcaError> {
+            self.submitted_id = Some(prompt.message_id.clone());
+            Ok(())
+        }
+
+        fn write_ref(
+            &mut self,
+            _session_id: &str,
+            _message_id: &str,
+        ) -> Result<Self::PendingRef, OcaError> {
+            Ok("wgate0".to_owned())
+        }
+
+        fn acknowledge(
+            &mut self,
+            pending: Self::PendingRef,
+            _model: &ResolvedModel,
+            _json: bool,
+        ) -> Result<String, OcaError> {
+            Ok(pending)
+        }
+
+        fn spawn_attach(
+            &mut self,
+            _reference: &str,
+            _session_id: &str,
+            _cwd: &std::path::Path,
+            _headless: bool,
+        ) -> Result<(), OcaError> {
+            Ok(())
+        }
+
+        async fn reconcile_once(
+            &mut self,
+            _session_id: &str,
+            _message_id: &str,
+        ) -> Result<Option<TerminalReply>, OcaError> {
+            Ok(None)
+        }
+
+        async fn wait_terminal(
+            &mut self,
+            _subscription: &mut Self::Subscription,
+            _session_id: &str,
+            _message_id: &str,
+        ) -> Result<TerminalReply, OcaError> {
+            let submitted_id = self.submitted_id.as_deref().expect("prompt was admitted");
+            if submitted_id <= REPLAY_PREVIOUS_ID {
+                // Recorded gate-0 case 3: all six prompts survived, but two
+                // adjacent pairs were merged into four assistant turns.
+                self.prompts = 6;
+                self.assistant_messages = 4;
+                self.terminal_events = 4;
+                return Ok(valid_terminal());
+            }
+            if submitted_id >= REPLAY_SERVER_REPLY_ID {
+                // Recorded gate-0 high-id run: the server stayed busy and
+                // regenerated until the experiment aborted after message 32.
+                self.prompts = 1;
+                self.assistant_messages = 32;
+                self.aborted = true;
+                return Err(OcaError::new(ErrorCode::Interrupted)
+                    .with_error("gate-0 replay aborted unterminated generation"));
+            }
+
+            self.prompts = 1;
+            self.assistant_messages = 1;
+            self.terminal_events = 1;
+            Ok(valid_terminal())
+        }
+
+        fn finalize(&mut self, _reference: &str, _reply: &RoleReply) -> Result<(), OcaError> {
+            self.finalized += 1;
+            Ok(())
+        }
+
+        fn print_final(
+            &mut self,
+            _reference: &str,
+            _reply: &RoleReply,
+            _json: bool,
+        ) -> Result<(), OcaError> {
+            Ok(())
+        }
+    }
 
     #[derive(Default)]
     struct FakeBackend {
@@ -395,41 +551,29 @@ mod tests {
 
     #[test]
     fn replay_pins_too_low_turn_merge_and_too_high_regeneration() {
-        #[derive(Debug, Eq, PartialEq)]
-        enum ReplayOutcome {
-            OneTurn,
-            TurnMerge,
-            RegenerationLoop,
-        }
-        fn replay(previous: &str, submitted: &str, server_reply: &str) -> ReplayOutcome {
-            if submitted <= previous {
-                ReplayOutcome::TurnMerge
-            } else if submitted >= server_reply {
-                ReplayOutcome::RegenerationLoop
-            } else {
-                ReplayOutcome::OneTurn
-            }
-        }
+        let mut valid = Gate0ServerReplay::production_at(1_785_000_000_000);
+        let outcome = block_on(run_foreground(&mut valid, request("luna", "h"))).unwrap();
+        assert_eq!(outcome.message_id, "msg_f9a4a7a0000100000000000000");
+        assert!(is_opencode_message_id(&outcome.message_id));
+        assert_eq!(valid.prompts, 1);
+        assert_eq!(valid.assistant_messages, 1);
+        assert_eq!(valid.terminal_events, 1);
+        assert_eq!(valid.finalized, 1);
 
-        let previous = "msg_f9a4a7900001AAAAAAAAAAAAAA";
-        let valid = "msg_f9a4a7a00001AAAAAAAAAAAAAA";
-        let server_reply = "msg_f9a4a7b00001AAAAAAAAAAAAAA";
-        assert_eq!(
-            replay(previous, valid, server_reply),
-            ReplayOutcome::OneTurn
-        );
-        assert_eq!(
-            replay(previous, "msg_00000000000000000000000000", server_reply),
-            ReplayOutcome::TurnMerge
-        );
-        assert_eq!(
-            replay(previous, "msg_zzzzzzzzzzzzzzzzzzzzzzzzzz", server_reply),
-            ReplayOutcome::RegenerationLoop
-        );
-        assert_eq!(
-            replay(previous, "msg_oca_w4f2a1_1", server_reply),
-            ReplayOutcome::RegenerationLoop
-        );
+        let mut too_low = Gate0ServerReplay::injected("msg_00000000000000000000000000");
+        block_on(run_foreground(&mut too_low, request("luna", "h"))).unwrap();
+        assert_eq!(too_low.prompts, 6);
+        assert_eq!(too_low.assistant_messages, 4);
+        assert_eq!(too_low.terminal_events, 4);
+
+        let mut too_high = Gate0ServerReplay::injected("msg_oca_t03_idem_0001");
+        let error = block_on(run_foreground(&mut too_high, request("luna", "h"))).unwrap_err();
+        assert_eq!(error.code_kind(), ErrorCode::Interrupted);
+        assert_eq!(too_high.prompts, 1);
+        assert_eq!(too_high.assistant_messages, 32);
+        assert_eq!(too_high.terminal_events, 0);
+        assert!(too_high.aborted);
+        assert_eq!(too_high.finalized, 0);
     }
 
     fn request(alias: &str, effort: &str) -> ForegroundRequest {
