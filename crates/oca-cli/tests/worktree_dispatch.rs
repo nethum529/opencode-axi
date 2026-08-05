@@ -49,6 +49,7 @@ fn partial_dispatch_and_second_oca_m_create_two_original_prompt_commits() {
     let first_record = stored_ref(home.path(), &reference);
     let worktree = PathBuf::from(first_record["worktree"].as_str().unwrap());
     assert_eq!(first_record["last_state"], "partial");
+    assert_eq!(first_record["display"], "headless");
     let first_commit = first_record["commit"].as_str().unwrap().to_owned();
 
     let message = run_oca(

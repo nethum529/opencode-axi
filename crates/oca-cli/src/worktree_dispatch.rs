@@ -44,7 +44,8 @@ impl WorktreeDispatch {
                         RefState::Running,
                     )
                     .with_repo(&scope.repo)
-                    .with_spawner_tag(&scope.spawner_tag),
+                    .with_spawner_tag(&scope.spawner_tag)
+                    .with_display(request.display.as_str()),
             )
             .map_err(|error| state_error("could not reserve worktree ref", error))?;
         let reference = RefId::new(&reservation.id).map_err(git_error)?;

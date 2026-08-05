@@ -2,8 +2,8 @@
 
 use std::{path::Path, time::Duration};
 
-use oca_core::{FollowOutcome, FollowTarget, follow_until_terminal};
-use oca_display::HerdrClient;
+use oca_core::{DisplayMode, FollowOutcome, FollowTarget, follow_until_terminal};
+use oca_display::{HerdrClient, TmuxClient};
 use oca_opencode::OpenCodeClient;
 use oca_server::ConnectOrStart;
 use oca_state::{EventJournal, OcaConfig, RefPatch, RefStore, RefStorePaths};
@@ -40,6 +40,17 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
     let message_id = record
         .message_id
         .ok_or_else(|| format!("ref `{}` has no attributed message id", command.reference))?;
+    let mode = match record.display.as_deref() {
+        Some("herdr") => DisplayMode::Herdr,
+        Some("tmux") => DisplayMode::Tmux,
+        Some("headless") | None => return Ok(()),
+        Some(mode) => {
+            return Err(format!(
+                "ref `{}` has unknown display mode `{mode}`",
+                command.reference
+            ));
+        }
+    };
     let server = ConnectOrStart::from_home(home, &config.server)
         .read_record()
         .map_err(|error| format!("could not read OpenCode server record: {error}"))?
@@ -47,6 +58,23 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
     let base_url = Url::parse(&format!("http://127.0.0.1:{}", server.port))
         .map_err(|error| format!("invalid OpenCode server URL: {error}"))?;
 
+    match mode {
+        DisplayMode::Herdr => {
+            run_herdr_attach(command, home, &config, &refs, &base_url, message_id).await
+        }
+        DisplayMode::Tmux => run_tmux_attach(command, &base_url, message_id).await,
+        DisplayMode::Headless => Ok(()),
+    }
+}
+
+async fn run_herdr_attach(
+    command: &AttachCommand,
+    home: &Path,
+    config: &OcaConfig,
+    refs: &RefStore,
+    base_url: &Url,
+    message_id: String,
+) -> Result<(), String> {
     let configured_socket =
         (!config.herdr.socket.is_empty()).then(|| Path::new(config.herdr.socket.as_str()));
     let Some(herdr) = HerdrClient::discover_from(
@@ -89,7 +117,7 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
             message_id,
         };
         follow_until_terminal::<_, EventJournal>(
-            &OpenCodeClient::new(base_url),
+            &OpenCodeClient::new(base_url.clone()),
             &target,
             None,
             None,
@@ -109,6 +137,42 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
             // A tab created before a launch or persistence failure would
             // otherwise be orphaned. Cleanup remains best effort.
             let _ = herdr.close_tab(&tab).await;
+            Err(error)
+        }
+    }
+}
+
+async fn run_tmux_attach(
+    command: &AttachCommand,
+    base_url: &Url,
+    message_id: String,
+) -> Result<(), String> {
+    let tmux = TmuxClient::default();
+    let window = tmux
+        .new_window(&command.reference, &command.session_id, &command.cwd)
+        .map_err(|error| error.to_string())?;
+    let target = FollowTarget {
+        session_id: command.session_id.clone(),
+        message_id,
+    };
+    let follow_result = follow_until_terminal::<_, EventJournal>(
+        &OpenCodeClient::new(base_url.clone()),
+        &target,
+        None,
+        None,
+    )
+    .await
+    .map_err(|error| format!("could not follow worker terminal state: {error}"));
+
+    match follow_result {
+        Ok(FollowOutcome::Terminal(_)) => tmux
+            .close_window(&window)
+            .map_err(|error| error.to_string()),
+        Ok(_) => Ok(()),
+        Err(error) => {
+            // A window created before follow failure would otherwise be
+            // orphaned. Cleanup remains best effort.
+            let _ = tmux.close_window(&window);
             Err(error)
         }
     }

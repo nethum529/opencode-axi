@@ -58,8 +58,8 @@ mod tests {
 
     use super::{BackgroundRequest, run_background};
     use crate::{
-        DispatchPrompt, ForegroundBackend, ModelCatalog, OcaError, ReplyContract, ResolvedModel,
-        RoleReply, TerminalReply, WorkerPolicy, resolve_model,
+        DispatchPrompt, DisplayMode, ForegroundBackend, ModelCatalog, OcaError, ReplyContract,
+        ResolvedModel, RoleReply, TerminalReply, WorkerPolicy, resolve_model,
     };
 
     struct Subscription(Arc<AtomicUsize>);
@@ -141,7 +141,7 @@ mod tests {
             _reference: &str,
             _session_id: &str,
             _cwd: &Path,
-            _headless: bool,
+            _display: DisplayMode,
         ) -> Result<(), OcaError> {
             self.calls.push("spawn");
             assert_eq!(self.calls[self.calls.len() - 2], "ack");
@@ -213,7 +213,7 @@ mod tests {
             contract: ReplyContract::Impl,
             policy: WorkerPolicy::restricted([cwd.clone()]),
             cwd,
-            headless: true,
+            display: DisplayMode::Headless,
             json: false,
         }
     }
