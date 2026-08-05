@@ -46,7 +46,7 @@ pub async fn execute_follow(
     if record.tombstoned {
         return Err(OcaError::new(ErrorCode::SessionNotFound).with_ref(&command.reference));
     }
-    let message_id: String = record.last_message_id.map(Into::into).ok_or_else(|| {
+    let message_id = record.message_id.ok_or_else(|| {
         OcaError::new(ErrorCode::PromptUncertain)
             .with_ref(&command.reference)
             .with_error("The ref has no dispatch message id to attribute")

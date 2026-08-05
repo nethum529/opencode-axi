@@ -402,6 +402,7 @@ impl<'a> TurnTracker<'a> {
     fn observe(&mut self, event: &OcaEvent) -> Result<Option<FollowTerminal>, FollowError> {
         if let Some(message) = event.message.as_ref()
             && self.is_attributed(message)
+            && message.completed
         {
             self.attributed = Some(message.clone());
         }
@@ -584,6 +585,55 @@ mod tests {
             journal.0.len(),
             4,
             "follow returns before the duplicate idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreign_idle_does_not_terminate_an_incomplete_attributed_message() {
+        let transport = ScriptedTransport {
+            subscriptions: Mutex::new(VecDeque::from([subscription([
+                Ok(Some(event(
+                    "evt-own-incomplete",
+                    "message.updated",
+                    Some(message("msg_this_dispatch", "partial", false)),
+                ))),
+                Ok(Some(event("evt-idle-foreign", "session.idle", None))),
+                Ok(Some(event(
+                    "evt-own-complete",
+                    "message.updated",
+                    Some(message("msg_this_dispatch", "done", true)),
+                ))),
+                Ok(Some(event("evt-idle-own", "session.idle", None))),
+            ])])),
+            reconciliations: Mutex::new(VecDeque::from([Ok(Vec::new())])),
+            cursors: Mutex::new(Vec::new()),
+        };
+        let mut journal = Journal::default();
+
+        let outcome = follow_until_terminal_with_policy(
+            &transport,
+            &target(),
+            None,
+            Some(&mut journal),
+            test_policy(),
+        )
+        .await
+        .unwrap();
+
+        let FollowOutcome::Terminal(terminal) = outcome else {
+            panic!("the completed attributed turn must terminate");
+        };
+        assert!(terminal.message.completed);
+        assert_eq!(terminal.state, WorkerState::Done);
+        assert_eq!(
+            journal.0,
+            [
+                "message.updated",
+                "session.idle",
+                "message.updated",
+                "session.idle"
+            ],
+            "the foreign idle must not end the follow on the incomplete snapshot"
         );
     }
 

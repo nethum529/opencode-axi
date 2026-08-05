@@ -202,7 +202,7 @@ fn prepared_home(port: u16) -> tempfile::TempDir {
         .insert(RefRecord {
             id: "w4f2a1".to_owned(),
             session_id: "ses_target".to_owned(),
-            last_message_id: Some("msg_dispatch".into()),
+            message_id: Some("msg_dispatch".into()),
             repo: None,
             spawner_tag: None,
             tombstoned: false,
