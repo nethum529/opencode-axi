@@ -5,7 +5,10 @@ use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -60,6 +63,7 @@ pub enum RequestFailure<E> {
 /// The startup operation that rejected one candidate port.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StartupStage {
+    Availability,
     Spawn,
     Readiness,
 }
@@ -67,6 +71,7 @@ pub enum StartupStage {
 impl fmt::Display for StartupStage {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Availability => formatter.write_str("availability"),
             Self::Spawn => formatter.write_str("spawn"),
             Self::Readiness => formatter.write_str("readiness"),
         }
@@ -153,6 +158,7 @@ pub trait ServerRuntime {
 #[derive(Clone, Debug)]
 pub struct SystemRuntime {
     executable: PathBuf,
+    version: Arc<OnceLock<Result<String, String>>>,
 }
 
 impl Default for SystemRuntime {
@@ -166,12 +172,11 @@ impl SystemRuntime {
     pub fn new(executable: impl Into<PathBuf>) -> Self {
         Self {
             executable: executable.into(),
+            version: Arc::new(OnceLock::new()),
         }
     }
-}
 
-impl ServerRuntime for SystemRuntime {
-    fn opencode_version(&self) -> Result<String, String> {
+    fn probe_opencode_version(&self) -> Result<String, String> {
         let output = Command::new(&self.executable)
             .arg("--version")
             .output()
@@ -183,6 +188,14 @@ impl ServerRuntime for SystemRuntime {
             ));
         }
         Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+}
+
+impl ServerRuntime for SystemRuntime {
+    fn opencode_version(&self) -> Result<String, String> {
+        self.version
+            .get_or_init(|| self.probe_opencode_version())
+            .clone()
     }
 
     fn start_environment_hash(&self) -> String {
@@ -289,17 +302,18 @@ impl ConnectOrStart {
     }
 
     /// Reads the current discovery hint. A malformed hint is ignored so a
-    /// damaged cache cannot prevent a fresh server from starting.
+    /// damaged cache cannot prevent a fresh server from starting. This reader
+    /// stays silent about the damage; [`Self::connect_or_start`] is what warns
+    /// with the parse failure before recovering.
     ///
     /// # Errors
     ///
     /// Returns an error when the hint cannot be read for a reason other than
     /// absence or invalid JSON.
     pub fn read_record(&self) -> io::Result<Option<ServerRecord>> {
-        match fs::read(self.record_path()) {
-            Ok(contents) => Ok(serde_json::from_slice(&contents).ok()),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
+        match self.read_record_state()? {
+            RecordRead::Found(record) => Ok(Some(record)),
+            RecordRead::Absent | RecordRead::Corrupt(_) => Ok(None),
         }
     }
 
@@ -347,7 +361,10 @@ impl ConnectOrStart {
         R: ServerRuntime,
         Q: OpenCodeRequest,
     {
-        let initial_record = self.read_record().map_err(ConnectError::State)?;
+        let mut warned_about_corrupt_record = false;
+        let initial_record = self
+            .read_record_for_connect(runtime, &mut warned_about_corrupt_record)
+            .map_err(ConnectError::State)?;
         if let Some(record) = initial_record.as_ref() {
             Self::warn_if_mismatched(runtime, record);
             match Self::send(request, record.port).await {
@@ -358,7 +375,9 @@ impl ConnectOrStart {
         }
 
         let lock = self.acquire_start_lock().map_err(ConnectError::State)?;
-        let record_after_lock = self.read_record().map_err(ConnectError::State)?;
+        let record_after_lock = self
+            .read_record_for_connect(runtime, &mut warned_about_corrupt_record)
+            .map_err(ConnectError::State)?;
         let recovery: Result<ServerRecord, ConnectError<Q::Error>> =
             if let Some(record) = record_after_lock.filter(Self::record_is_live) {
                 Ok(record)
@@ -388,7 +407,7 @@ impl ConnectOrStart {
             if !runtime.port_is_available(port) {
                 diagnostics.push(StartupDiagnostic::new(
                     port,
-                    StartupStage::Spawn,
+                    StartupStage::Availability,
                     "loopback port is unavailable",
                 ));
                 continue;
@@ -422,6 +441,41 @@ impl ConnectOrStart {
     fn record_is_live(record: &ServerRecord) -> bool {
         let address = SocketAddr::new(LOOPBACK, record.port);
         TcpStream::connect_timeout(&address, Duration::from_millis(50)).is_ok()
+    }
+
+    fn read_record_state(&self) -> io::Result<RecordRead> {
+        match fs::read(self.record_path()) {
+            Ok(contents) => match serde_json::from_slice(&contents) {
+                Ok(record) => Ok(RecordRead::Found(record)),
+                Err(error) => Ok(RecordRead::Corrupt(error)),
+            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(RecordRead::Absent),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn read_record_for_connect<R>(
+        &self,
+        runtime: &R,
+        warned_about_corrupt_record: &mut bool,
+    ) -> io::Result<Option<ServerRecord>>
+    where
+        R: ServerRuntime,
+    {
+        match self.read_record_state()? {
+            RecordRead::Found(record) => Ok(Some(record)),
+            RecordRead::Absent => Ok(None),
+            RecordRead::Corrupt(error) => {
+                if !*warned_about_corrupt_record {
+                    runtime.warn(&format!(
+                        "ignoring corrupt discovery hint {}: {error}",
+                        self.record_path().display()
+                    ));
+                    *warned_about_corrupt_record = true;
+                }
+                Ok(None)
+            }
+        }
     }
 
     async fn send<Q>(request: &mut Q, port: u16) -> Result<Q::Output, RequestFailure<Q::Error>>
@@ -480,6 +534,12 @@ impl ConnectOrStart {
 enum StartOutcome {
     Started(ServerRecord),
     Failed(Vec<StartupDiagnostic>),
+}
+
+enum RecordRead {
+    Absent,
+    Found(ServerRecord),
+    Corrupt(serde_json::Error),
 }
 
 fn ensure_private_directory(path: &Path) -> io::Result<()> {
@@ -631,10 +691,12 @@ mod tests {
     #[test]
     fn racing_cold_starts_spawn_once_and_the_loser_adopts_the_winner_record() {
         let directory = tempfile::tempdir().expect("temporary state directory");
-        let port = available_loopback_port();
+        let port_reservation = reserve_loopback_port();
+        let port = reserved_port(&port_reservation);
         let runtime = Arc::new(RacingRuntime::default());
         let first_directory = directory.path().to_path_buf();
         let first_runtime = Arc::clone(&runtime);
+        drop(port_reservation);
         let first = std::thread::spawn(move || {
             let mut request = ReadyRequest;
             block_on(
@@ -660,7 +722,8 @@ mod tests {
     #[test]
     fn racing_stale_field_equal_records_spawn_once_and_both_callers_recover() {
         let directory = tempfile::tempdir().expect("temporary state directory");
-        let port = available_loopback_port();
+        let port_reservation = reserve_loopback_port();
+        let port = reserved_port(&port_reservation);
         let manager = ConnectOrStart::new(directory.path(), port, [], Duration::from_millis(50));
         manager
             .write_record(&ServerRecord::new(port, "1.18.10", "environment"))
@@ -670,6 +733,7 @@ mod tests {
         let first_directory = directory.path().to_path_buf();
         let first_runtime = Arc::clone(&runtime);
         let first_barrier = Arc::clone(&barrier);
+        drop(port_reservation);
         let first = std::thread::spawn(move || {
             let mut request = StaleOnceRequest::new(first_barrier);
             block_on(
@@ -699,8 +763,10 @@ mod tests {
     #[test]
     fn dead_post_lock_record_is_not_adopted_and_starts_recovery() {
         let directory = tempfile::tempdir().expect("temporary state directory");
-        let stale_port = available_loopback_port();
-        let recovery_port = available_loopback_port();
+        let stale_port_reservation = reserve_loopback_port();
+        let stale_port = reserved_port(&stale_port_reservation);
+        let recovery_port_reservation = reserve_loopback_port();
+        let recovery_port = reserved_port(&recovery_port_reservation);
         let manager = ConnectOrStart::new(
             directory.path(),
             recovery_port,
@@ -715,6 +781,7 @@ mod tests {
         let (failed_tx, failed_rx) = mpsc::channel();
         let worker_manager = manager.clone();
         let worker_runtime = Arc::clone(&runtime);
+        drop((stale_port_reservation, recovery_port_reservation));
         let worker = std::thread::spawn(move || {
             let mut request = SignalledStaleRequest::new(failed_tx);
             block_on(worker_manager.connect_or_start(worker_runtime.as_ref(), &mut request))
@@ -756,7 +823,7 @@ mod tests {
         assert_eq!(diagnostics[1].stage, StartupStage::Readiness);
         assert_eq!(diagnostics[1].reason, "final connect error: refused");
         assert_eq!(diagnostics[2].port, 4098);
-        assert_eq!(diagnostics[2].stage, StartupStage::Spawn);
+        assert_eq!(diagnostics[2].stage, StartupStage::Availability);
         assert!(diagnostics[2].reason.contains("unavailable"));
     }
 
@@ -809,6 +876,124 @@ mod tests {
                 .port,
             4097
         );
+    }
+
+    #[test]
+    fn corrupt_discovery_hint_warns_once_and_attempts_one_fresh_start() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let manager = ConnectOrStart::new(directory.path(), 4096, [], Duration::from_millis(1));
+        let hint_path = directory.path().join("server.json");
+        std::fs::write(&hint_path, b"{").expect("corrupt discovery hint");
+        let runtime = ColdRuntime::new([4096]);
+        let mut request = ReadyRequest;
+
+        block_on(manager.connect_or_start(&runtime, &mut request))
+            .expect("corrupt hint recovers with a fresh start");
+
+        assert_eq!(runtime.spawned.borrow().as_slice(), &[4096]);
+        let warnings = runtime.warnings.borrow();
+        assert_eq!(warnings.len(), 1, "one warning line, got {warnings:?}");
+        assert!(warnings[0].contains(&hint_path.display().to_string()));
+        assert!(warnings[0].contains("EOF while parsing an object"));
+    }
+
+    /// The control for the corrupt case above: an absent hint takes the same
+    /// fresh-start path in silence, so the warning is what distinguishes
+    /// corruption from absence.
+    #[test]
+    fn absent_discovery_hint_starts_fresh_without_any_warning() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let manager = ConnectOrStart::new(directory.path(), 4096, [], Duration::from_millis(1));
+        let runtime = ColdRuntime::new([4096]);
+        let mut request = ReadyRequest;
+
+        block_on(manager.connect_or_start(&runtime, &mut request))
+            .expect("absent hint starts fresh");
+
+        assert_eq!(runtime.spawned.borrow().as_slice(), &[4096]);
+        assert!(runtime.warnings.borrow().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_runtime_caches_one_cold_version_probe_across_warm_dispatches() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let executable = directory.path().join("counted-opencode");
+        let probe_count = executable.with_extension("count");
+        let serve_marker = executable.with_extension("serve");
+        std::fs::write(
+            &executable,
+            concat!(
+                "#!/bin/sh\n",
+                "case \"$1\" in\n",
+                "  --version) printf 'probe\\n' >> \"$0.count\"; printf '1.19.0\\n' ;;\n",
+                "  serve) : > \"$0.serve\" ;;\n",
+                "  *) exit 2 ;;\n",
+                "esac\n",
+            ),
+        )
+        .expect("counted executable");
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
+            .expect("counted executable permissions");
+
+        let port_reservation = reserve_loopback_port();
+        let port = reserved_port(&port_reservation);
+        let (release_tx, release_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !serve_marker.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "counted executable did not receive serve"
+                );
+                std::thread::yield_now();
+            }
+            let listener = TcpListener::bind(("127.0.0.1", port))
+                .expect("test server claims the released port");
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
+            drop(listener);
+        });
+        let runtime = RecordingSystemRuntime::new(SystemRuntime::new(&executable));
+        let manager = ConnectOrStart::new(
+            directory.path().join("state"),
+            port,
+            [],
+            Duration::from_secs(2),
+        );
+        drop(port_reservation);
+
+        let mut cold_request = ReadyRequest;
+        block_on(manager.connect_or_start(&runtime, &mut cold_request))
+            .expect("cold start succeeds");
+        assert_eq!(probe_launches(&probe_count), 1);
+
+        for _ in 0..3 {
+            let mut warm_request = ReadyRequest;
+            block_on(manager.connect_or_start(&runtime, &mut warm_request))
+                .expect("warm dispatch succeeds");
+        }
+        assert_eq!(probe_launches(&probe_count), 1);
+
+        manager
+            .write_record(&ServerRecord::new(
+                port,
+                "1.18.10",
+                runtime.start_environment_hash(),
+            ))
+            .expect("version-mismatched discovery hint");
+        let mut mismatch_request = ReadyRequest;
+        block_on(manager.connect_or_start(&runtime, &mut mismatch_request))
+            .expect("cached version mismatch does not block warm dispatch");
+
+        assert_eq!(probe_launches(&probe_count), 1);
+        let warnings = runtime.warnings.borrow();
+        assert_eq!(warnings.len(), 1, "one warning line, got {warnings:?}");
+        assert!(warnings[0].contains("version"));
+
+        release_tx.send(()).expect("release test server");
+        server.join().expect("test server thread");
     }
 
     #[test]
@@ -866,6 +1051,7 @@ mod tests {
     struct ColdRuntime {
         available: Vec<u16>,
         spawned: RefCell<Vec<u16>>,
+        warnings: RefCell<Vec<String>>,
     }
 
     impl ColdRuntime {
@@ -873,6 +1059,7 @@ mod tests {
             Self {
                 available: available.into_iter().collect(),
                 spawned: RefCell::new(Vec::new()),
+                warnings: RefCell::new(Vec::new()),
             }
         }
     }
@@ -903,7 +1090,9 @@ mod tests {
             Ok(())
         }
 
-        fn warn(&self, _message: &str) {}
+        fn warn(&self, message: &str) {
+            self.warnings.borrow_mut().push(message.to_owned());
+        }
     }
 
     #[derive(Default)]
@@ -1137,12 +1326,63 @@ mod tests {
         }
     }
 
-    fn available_loopback_port() -> u16 {
-        TcpListener::bind(("127.0.0.1", 0))
-            .expect("ephemeral loopback listener")
-            .local_addr()
-            .expect("loopback address")
-            .port()
+    fn reserve_loopback_port() -> TcpListener {
+        TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral loopback listener")
+    }
+
+    fn reserved_port(listener: &TcpListener) -> u16 {
+        listener.local_addr().expect("loopback address").port()
+    }
+
+    #[cfg(unix)]
+    struct RecordingSystemRuntime {
+        inner: SystemRuntime,
+        warnings: RefCell<Vec<String>>,
+    }
+
+    #[cfg(unix)]
+    impl RecordingSystemRuntime {
+        fn new(inner: SystemRuntime) -> Self {
+            Self {
+                inner,
+                warnings: RefCell::new(Vec::new()),
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl ServerRuntime for RecordingSystemRuntime {
+        fn opencode_version(&self) -> Result<String, String> {
+            self.inner.opencode_version()
+        }
+
+        fn start_environment_hash(&self) -> String {
+            self.inner.start_environment_hash()
+        }
+
+        fn port_is_available(&self, port: u16) -> bool {
+            self.inner.port_is_available(port)
+        }
+
+        fn spawn(&self, port: u16, log_path: &Path) -> Result<(), String> {
+            self.inner.spawn(port, log_path)
+        }
+
+        fn wait_until_ready(&self, port: u16, timeout: Duration) -> Result<(), String> {
+            self.inner.wait_until_ready(port, timeout)
+        }
+
+        fn warn(&self, message: &str) {
+            self.warnings.borrow_mut().push(message.to_owned());
+        }
+    }
+
+    #[cfg(unix)]
+    fn probe_launches(path: &Path) -> usize {
+        std::fs::read_to_string(path)
+            .expect("version probe count")
+            .lines()
+            .count()
     }
 
     struct ReadyRequest;
