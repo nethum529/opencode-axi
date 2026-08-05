@@ -366,7 +366,7 @@ impl ConnectOrStart {
             .read_record_for_connect(runtime, &mut warned_about_corrupt_record)
             .map_err(ConnectError::State)?;
         if let Some(record) = initial_record.as_ref() {
-            Self::warn_if_mismatched(runtime, record);
+            Self::warn_if_environment_mismatched(runtime, record);
             match Self::send(request, record.port).await {
                 Ok(output) => return Ok(output),
                 Err(RequestFailure::Connection(_)) => {}
@@ -378,29 +378,44 @@ impl ConnectOrStart {
         let record_after_lock = self
             .read_record_for_connect(runtime, &mut warned_about_corrupt_record)
             .map_err(ConnectError::State)?;
-        let recovery: Result<ServerRecord, ConnectError<Q::Error>> =
-            if let Some(record) = record_after_lock.filter(Self::record_is_live) {
-                Ok(record)
-            } else {
-                match self.start_record(runtime).map_err(ConnectError::State)? {
+        let recovery: Result<ServerRecord, ConnectError<Q::Error>> = match record_after_lock {
+            Some(record) if Self::record_is_live(&record) => Ok(record),
+            replaced_record => {
+                match self
+                    .start_record(runtime, replaced_record.as_ref())
+                    .map_err(ConnectError::State)?
+                {
                     StartOutcome::Started(record) => Ok(record),
                     StartOutcome::Failed(diagnostics) => Err(ConnectError::Startup(diagnostics)),
                 }
-            };
+            }
+        };
         lock.unlock().map_err(ConnectError::State)?;
         let record = recovery?;
 
-        Self::warn_if_mismatched(runtime, &record);
+        Self::warn_if_environment_mismatched(runtime, &record);
         Self::send(request, record.port)
             .await
             .map_err(ConnectError::from_failure)
     }
 
-    fn start_record<R>(&self, runtime: &R) -> io::Result<StartOutcome>
+    fn start_record<R>(
+        &self,
+        runtime: &R,
+        replaced_record: Option<&ServerRecord>,
+    ) -> io::Result<StartOutcome>
     where
         R: ServerRuntime,
     {
         let version = runtime.opencode_version().ok();
+        if let (Some(version), Some(record)) = (&version, replaced_record)
+            && version != &record.version
+        {
+            runtime.warn(&format!(
+                "installed OpenCode version {version} differs from version {} recorded in server.json",
+                record.version
+            ));
+        }
         let environment_hash = runtime.start_environment_hash();
         let mut diagnostics = Vec::new();
         for port in self.candidate_ports() {
@@ -499,18 +514,13 @@ impl ConnectOrStart {
         Ok(lock)
     }
 
-    fn warn_if_mismatched<R>(runtime: &R, record: &ServerRecord)
+    fn warn_if_environment_mismatched<R>(runtime: &R, record: &ServerRecord)
     where
         R: ServerRuntime,
     {
-        let version_mismatch = runtime
-            .opencode_version()
-            .is_ok_and(|version| version != record.version);
         let environment_mismatch = runtime.start_environment_hash() != record.environment_hash;
-        if version_mismatch || environment_mismatch {
-            runtime.warn(
-                "server.json was created with a different OpenCode version or start environment",
-            );
+        if environment_mismatch {
+            runtime.warn("server.json was created with a different OpenCode start environment");
         }
     }
 
@@ -624,10 +634,12 @@ mod tests {
 
     struct Runtime {
         requests: Cell<u8>,
+        version_probes: Cell<u8>,
     }
 
     impl ServerRuntime for Runtime {
         fn opencode_version(&self) -> Result<String, String> {
+            self.version_probes.set(self.version_probes.get() + 1);
             Ok("1.18.10".to_owned())
         }
 
@@ -676,6 +688,7 @@ mod tests {
             .expect("discovery hint");
         let runtime = Runtime {
             requests: Cell::new(0),
+            version_probes: Cell::new(0),
         };
         let mut request = Request { runtime: &runtime };
 
@@ -686,6 +699,7 @@ mod tests {
         .expect("warm request succeeds");
 
         assert_eq!(runtime.requests.get(), 1);
+        assert_eq!(runtime.version_probes.get(), 0);
     }
 
     #[test]
@@ -914,9 +928,29 @@ mod tests {
         assert!(runtime.warnings.borrow().is_empty());
     }
 
+    #[test]
+    fn cold_start_warns_when_installed_version_differs_from_replaced_record() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let manager = ConnectOrStart::new(directory.path(), 4096, [], Duration::from_millis(1));
+        manager
+            .write_record(&ServerRecord::new(0, "1.18.10", "environment"))
+            .expect("stale discovery hint");
+        let runtime = ColdRuntime::with_version([4096], "1.19.0");
+        let mut request = ConnectionFailureOnceRequest::default();
+
+        block_on(manager.connect_or_start(&runtime, &mut request))
+            .expect("cold recovery succeeds after the stale warm dispatch");
+
+        assert_eq!(runtime.version_probes.get(), 1);
+        let warnings = runtime.warnings.borrow();
+        assert_eq!(warnings.len(), 1, "one warning line, got {warnings:?}");
+        assert!(warnings[0].contains("installed OpenCode version 1.19.0"));
+        assert!(warnings[0].contains("version 1.18.10 recorded in server.json"));
+    }
+
     #[cfg(unix)]
     #[test]
-    fn system_runtime_caches_one_cold_version_probe_across_warm_dispatches() {
+    fn system_runtime_probes_during_cold_start_but_not_warm_dispatches() {
         use std::os::unix::fs::PermissionsExt;
 
         let directory = tempfile::tempdir().expect("temporary state directory");
@@ -985,12 +1019,10 @@ mod tests {
             .expect("version-mismatched discovery hint");
         let mut mismatch_request = ReadyRequest;
         block_on(manager.connect_or_start(&runtime, &mut mismatch_request))
-            .expect("cached version mismatch does not block warm dispatch");
+            .expect("version mismatch does not trigger a warm probe");
 
         assert_eq!(probe_launches(&probe_count), 1);
-        let warnings = runtime.warnings.borrow();
-        assert_eq!(warnings.len(), 1, "one warning line, got {warnings:?}");
-        assert!(warnings[0].contains("version"));
+        assert!(runtime.warnings.borrow().is_empty());
 
         release_tx.send(()).expect("release test server");
         server.join().expect("test server thread");
@@ -1005,6 +1037,7 @@ mod tests {
             .expect("discovery hint");
         let runtime = Runtime {
             requests: Cell::new(0),
+            version_probes: Cell::new(0),
         };
         let mut request = TransmittedRequest;
 
@@ -1050,14 +1083,22 @@ mod tests {
 
     struct ColdRuntime {
         available: Vec<u16>,
+        version: String,
+        version_probes: Cell<u8>,
         spawned: RefCell<Vec<u16>>,
         warnings: RefCell<Vec<String>>,
     }
 
     impl ColdRuntime {
         fn new(available: impl IntoIterator<Item = u16>) -> Self {
+            Self::with_version(available, "1.18.10")
+        }
+
+        fn with_version(available: impl IntoIterator<Item = u16>, version: &str) -> Self {
             Self {
                 available: available.into_iter().collect(),
+                version: version.to_owned(),
+                version_probes: Cell::new(0),
                 spawned: RefCell::new(Vec::new()),
                 warnings: RefCell::new(Vec::new()),
             }
@@ -1066,7 +1107,8 @@ mod tests {
 
     impl ServerRuntime for ColdRuntime {
         fn opencode_version(&self) -> Result<String, String> {
-            Ok("1.18.10".to_owned())
+            self.version_probes.set(self.version_probes.get() + 1);
+            Ok(self.version.clone())
         }
 
         fn start_environment_hash(&self) -> String {
@@ -1400,6 +1442,29 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct ConnectionFailureOnceRequest {
+        attempts: u8,
+    }
+
+    impl OpenCodeRequest for ConnectionFailureOnceRequest {
+        type Output = ();
+        type Error = &'static str;
+
+        fn send(
+            &mut self,
+            _client: &oca_opencode::OpenCodeClient,
+        ) -> impl Future<Output = Result<Self::Output, RequestFailure<Self::Error>>> + Send
+        {
+            self.attempts += 1;
+            std::future::ready(if self.attempts == 1 {
+                Err(RequestFailure::Connection("stale record"))
+            } else {
+                Ok(())
+            })
+        }
+    }
+
     struct TransmittedRequest;
 
     impl OpenCodeRequest for TransmittedRequest {
@@ -1415,12 +1480,12 @@ mod tests {
         }
     }
 
-    /// A runtime whose installed version and start environment both differ from
-    /// whatever is recorded, recording every warning it is asked to print.
+    /// A warm-path runtime recording version probes and warning lines.
     #[derive(Default)]
     struct RecordingWarnRuntime {
         version: String,
         environment: String,
+        version_probes: Cell<u8>,
         warnings: RefCell<Vec<String>>,
     }
 
@@ -1429,6 +1494,7 @@ mod tests {
             Self {
                 version: version.to_owned(),
                 environment: environment.to_owned(),
+                version_probes: Cell::new(0),
                 warnings: RefCell::new(Vec::new()),
             }
         }
@@ -1436,6 +1502,7 @@ mod tests {
 
     impl ServerRuntime for RecordingWarnRuntime {
         fn opencode_version(&self) -> Result<String, String> {
+            self.version_probes.set(self.version_probes.get() + 1);
             Ok(self.version.clone())
         }
 
@@ -1476,33 +1543,23 @@ mod tests {
         runtime.warnings.borrow().clone()
     }
 
-    /// T14 (#14), criterion 5: a recorded version or start-environment mismatch
-    /// prints one warning line, and the request still goes through.
     #[test]
-    fn a_recorded_version_or_environment_mismatch_prints_exactly_one_warning_line() {
-        for runtime in [
-            RecordingWarnRuntime::new("1.19.0", "recorded-environment"),
-            RecordingWarnRuntime::new("1.18.10", "current-environment"),
-            RecordingWarnRuntime::new("1.19.0", "current-environment"),
-        ] {
-            let warnings = warnings_for_recorded_start(&runtime);
+    fn warm_dispatch_warns_on_environment_hash_mismatch_without_version_probe() {
+        let runtime = RecordingWarnRuntime::new("1.19.0", "current-environment");
 
-            assert_eq!(warnings.len(), 1, "one warning line, got {warnings:?}");
-            assert!(
-                warnings[0].contains("version") || warnings[0].contains("environment"),
-                "the warning names what drifted: {}",
-                warnings[0]
-            );
-        }
+        let warnings = warnings_for_recorded_start(&runtime);
+
+        assert_eq!(warnings.len(), 1, "one warning line, got {warnings:?}");
+        assert!(warnings[0].contains("OpenCode start environment"));
+        assert_eq!(runtime.version_probes.get(), 0);
     }
 
-    /// T14 (#14), criterion 5: a record that matches the current environment
-    /// warns about nothing, so the warning cannot be unconditional noise.
     #[test]
-    fn a_matching_server_record_prints_no_warning_line() {
-        let runtime = RecordingWarnRuntime::new("1.18.10", "recorded-environment");
+    fn warm_dispatch_ignores_recorded_version_without_probing() {
+        let runtime = RecordingWarnRuntime::new("1.19.0", "recorded-environment");
 
         assert!(warnings_for_recorded_start(&runtime).is_empty());
+        assert_eq!(runtime.version_probes.get(), 0);
     }
 
     fn block_on<T>(future: impl Future<Output = T>) -> T {
