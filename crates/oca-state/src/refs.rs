@@ -930,20 +930,29 @@ mod tests {
                 .env(CHILD_ENV, "1")
                 .output()
                 .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
             assert!(
                 output.status.success(),
                 "umask child failed: {}",
                 String::from_utf8_lossy(&output.stderr)
             );
+            // A stale `TEST_NAME` would match nothing and still exit zero.
+            assert!(
+                stdout.contains("1 passed"),
+                "umask child ran no test, so {TEST_NAME} is stale: {stdout}"
+            );
             return;
         }
+
+        // The temporary directory is created before the umask changes so that
+        // its own mode still permits the recursive cleanup on drop.
+        let directory = tempfile::tempdir().unwrap();
 
         // SAFETY: this test executes in a dedicated child process, so changing
         // the process-global umask cannot affect concurrently running tests.
         let original_umask = unsafe { libc::umask(0o400) };
         let _restore_umask = UmaskGuard(original_umask);
 
-        let directory = tempfile::tempdir().unwrap();
         let store_directory = directory.path().join("state");
         let paths = RefStorePaths::in_directory(&store_directory);
         let hook = Arc::new(CaptureTemporaryFileMode {
