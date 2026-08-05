@@ -1,14 +1,13 @@
 //! Single-snapshot implementation of the `oca ls` fleet inbox.
 
-use std::{cmp::Ordering, io, path::Path, time::Duration};
+use std::{cmp::Ordering, path::Path, time::Duration};
 
-use oca_core::{ErrorCode, OcaError, RefId};
+use oca_core::{ErrorCode, OcaError};
 use oca_display::{ListDocument, ListItem};
 use oca_state::{
-    EventJournal, JournalError, JournalEvent, OcaConfig, RefListFilter, RefRecord, RefStore,
-    RefStorePaths, prune_expired_journals,
+    JournalError, OcaConfig, RefListFilter, RefRecord, RefState, RefStore, RefStorePaths,
+    prune_expired_journals,
 };
-use serde_json::Value;
 
 use crate::{ListCommand, scope::Scope};
 
@@ -59,8 +58,8 @@ fn execute_list_with_scope(
         .map_err(|error| runtime_error(error.to_string()))?;
     let mut workers = records
         .into_iter()
-        .map(|record| worker_from_record(&state_directory, record))
-        .collect::<Result<Vec<_>, _>>()?;
+        .map(worker_from_record)
+        .collect::<Vec<_>>();
     if command.blocked {
         workers.retain(|worker| worker.state == ListState::Blocked);
     }
@@ -90,8 +89,10 @@ fn retention(days: u16) -> Duration {
 enum ListState {
     Blocked,
     Running,
+    Queued,
     Partial,
     Done,
+    Idle,
     Aborted,
 }
 
@@ -99,9 +100,9 @@ impl ListState {
     const fn rank(self) -> u8 {
         match self {
             Self::Blocked => 0,
-            Self::Running => 1,
+            Self::Running | Self::Queued => 1,
             Self::Partial => 2,
-            Self::Done => 3,
+            Self::Done | Self::Idle => 3,
             Self::Aborted => 4,
         }
     }
@@ -110,9 +111,25 @@ impl ListState {
         match self {
             Self::Blocked => "blocked",
             Self::Running => "running",
+            Self::Queued => "queued",
             Self::Partial => "partial",
             Self::Done => "done",
+            Self::Idle => "idle",
             Self::Aborted => "aborted",
+        }
+    }
+}
+
+impl From<Option<RefState>> for ListState {
+    fn from(state: Option<RefState>) -> Self {
+        match state.unwrap_or(RefState::Running) {
+            RefState::Blocked => Self::Blocked,
+            RefState::Running => Self::Running,
+            RefState::Queued => Self::Queued,
+            RefState::Partial => Self::Partial,
+            RefState::Done => Self::Done,
+            RefState::Idle => Self::Idle,
+            RefState::Aborted => Self::Aborted,
         }
     }
 }
@@ -132,68 +149,11 @@ impl Worker {
     }
 }
 
-fn worker_from_record(state_directory: &Path, record: RefRecord) -> Result<Worker, OcaError> {
-    let state = cached_state(state_directory, &record)?;
-    Ok(Worker {
+fn worker_from_record(record: RefRecord) -> Worker {
+    Worker {
         reference: record.id,
-        state,
-    })
-}
-
-fn cached_state(state_directory: &Path, record: &RefRecord) -> Result<ListState, OcaError> {
-    let Some(turn) = record.message_id.as_deref() else {
-        return Ok(ListState::Running);
-    };
-    let reference = RefId::new(&record.id).map_err(|error| runtime_error(error.to_string()))?;
-    let journal = match EventJournal::open(state_directory, &reference, turn) {
-        Ok(journal) => journal,
-        Err(JournalError::Io { source, .. }) if source.kind() == io::ErrorKind::NotFound => {
-            return Ok(ListState::Running);
-        }
-        Err(error) => return Err(journal_error(Some(&record.id), error)),
-    };
-    let page = journal
-        .page(0, usize::MAX)
-        .map_err(|error| journal_error(Some(&record.id), error))?;
-    Ok(page.events.iter().fold(ListState::Running, apply_event))
-}
-
-fn apply_event(state: ListState, event: &JournalEvent) -> ListState {
-    let kind = event.event.to_ascii_lowercase();
-    if kind.contains("abort") {
-        return ListState::Aborted;
+        state: record.last_state.into(),
     }
-    if kind.ends_with("busy") || payload_type(event.payload.as_ref()) == Some("busy") {
-        return ListState::Running;
-    }
-    terminal_state(event.payload.as_ref()).unwrap_or(state)
-}
-
-fn payload_type(payload: Option<&Value>) -> Option<&str> {
-    payload?.as_object()?.get("type")?.as_str()
-}
-
-fn terminal_state(value: Option<&Value>) -> Option<ListState> {
-    fn visit(value: &Value) -> Option<ListState> {
-        match value {
-            Value::Object(object) => {
-                if let Some(status) = object.get("status").and_then(Value::as_str) {
-                    match status {
-                        "blocked" => return Some(ListState::Blocked),
-                        "partial" => return Some(ListState::Partial),
-                        "done" | "completed" => return Some(ListState::Done),
-                        "aborted" => return Some(ListState::Aborted),
-                        "running" => return Some(ListState::Running),
-                        _ => {}
-                    }
-                }
-                object.values().find_map(visit)
-            }
-            Value::Array(values) => values.iter().find_map(visit),
-            _ => None,
-        }
-    }
-    value.and_then(visit)
 }
 
 fn runtime_error(detail: impl std::fmt::Display) -> OcaError {
@@ -220,9 +180,6 @@ fn journal_error(reference: Option<&str>, error: JournalError) -> OcaError {
 
 #[cfg(test)]
 mod tests {
-    use oca_core::OcaEvent;
-    use serde_json::json;
-
     use super::*;
 
     #[test]
@@ -233,15 +190,15 @@ mod tests {
             spawner_tag: "parent-a".to_owned(),
             repo: "/repo/a".to_owned(),
         };
-        for (reference, state_name) in [
-            ("w00008", "aborted"),
-            ("w00004", "done"),
-            ("w00003", "blocked"),
-            ("w00006", "partial"),
-            ("w00002", "running"),
-            ("w00001", "blocked"),
+        for (reference, worker_state) in [
+            ("w00008", RefState::Aborted),
+            ("w00004", RefState::Done),
+            ("w00003", RefState::Blocked),
+            ("w00006", RefState::Partial),
+            ("w00002", RefState::Running),
+            ("w00001", RefState::Blocked),
         ] {
-            insert_worker(&state, &scope, reference, state_name);
+            insert_worker(&state, &scope, reference, worker_state);
         }
 
         let output = execute_list_with_scope(
@@ -269,7 +226,7 @@ mod tests {
             spawner_tag: "parent-a".to_owned(),
             repo: "/repo/a".to_owned(),
         };
-        insert_worker(&state, &selected, "w00001", "blocked");
+        insert_worker(&state, &selected, "w00001", RefState::Blocked);
         insert_worker(
             &state,
             &Scope {
@@ -277,7 +234,7 @@ mod tests {
                 repo: "/repo/a".to_owned(),
             },
             "w00002",
-            "blocked",
+            RefState::Blocked,
         );
         insert_worker(
             &state,
@@ -286,7 +243,7 @@ mod tests {
                 repo: "/repo/b".to_owned(),
             },
             "w00003",
-            "blocked",
+            RefState::Blocked,
         );
 
         let count = execute_list_with_scope(
@@ -313,41 +270,21 @@ mod tests {
         assert_eq!(all.as_bytes(), b"3");
     }
 
-    fn insert_worker(state: &Path, scope: &Scope, reference: &str, state_name: &str) {
+    fn insert_worker(state: &Path, scope: &Scope, reference: &str, worker_state: RefState) {
         let store = RefStore::with_paths(RefStorePaths::in_directory(state));
-        let turn = format!("turn_{reference}");
         store
             .insert(RefRecord {
                 id: reference.to_owned(),
                 session_id: format!("ses_{reference}"),
-                message_id: Some(turn.clone()),
+                message_id: Some(format!("turn_{reference}")),
+                alias: Some("luna".to_owned()),
+                effort: Some("high".to_owned()),
+                role: Some("impl".to_owned()),
+                cwd: Some("/repo/a".to_owned()),
+                last_state: Some(worker_state),
                 repo: Some(scope.repo.clone()),
                 spawner_tag: Some(scope.spawner_tag.clone()),
                 tombstoned: false,
-            })
-            .unwrap();
-        if state_name == "running" {
-            return;
-        }
-        let reference = RefId::new(reference).unwrap();
-        let mut journal = EventJournal::create(state, &reference, &turn).unwrap();
-        let (kind, payload) = if state_name == "aborted" {
-            ("session.aborted", json!({}))
-        } else {
-            (
-                "message.updated",
-                json!({ "properties": { "info": { "structured": { "status": state_name } } } }),
-            )
-        };
-        journal
-            .append(&OcaEvent {
-                id: None,
-                cursor: None,
-                kind: kind.to_owned(),
-                session_id: Some(format!("ses_{reference}")),
-                payload: Some(payload),
-                message: None,
-                known: true,
             })
             .unwrap();
     }

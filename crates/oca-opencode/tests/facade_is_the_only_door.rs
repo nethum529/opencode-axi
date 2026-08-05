@@ -115,3 +115,33 @@ fn the_build_script_declares_no_network_capable_dependency() {
         );
     }
 }
+
+/// T19 (#19), criterion 5: `oca ls` is a single point-in-time read. Its
+/// production implementation must not grow a polling loop, wait, sleep, or
+/// OpenCode event subscription.
+#[test]
+fn list_never_loops_waits_sleeps_or_subscribes() {
+    let root = workspace_root();
+    let source = fs::read_to_string(root.join("crates/oca-cli/src/list.rs"))
+        .expect("the list implementation is readable");
+    let production = source
+        .split("#[cfg(test)]")
+        .next()
+        .expect("the production list implementation precedes its tests");
+
+    for forbidden in [
+        "loop {",
+        "while ",
+        ".wait(",
+        "wait(",
+        ".sleep(",
+        "sleep(",
+        ".subscribe(",
+        "subscribe(",
+    ] {
+        assert!(
+            !production.contains(forbidden),
+            "oca ls must remain a single snapshot; found `{forbidden}`"
+        );
+    }
+}
