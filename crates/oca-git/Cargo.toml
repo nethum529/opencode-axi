@@ -5,5 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-# No external dependency identified yet: git is invoked as a subprocess, not linked.
+fs2 = "0.4.3"
 oca-core = { path = "../oca-core" }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.189"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+] }
