@@ -6,6 +6,7 @@ use oca_core::{
 };
 use oca_state::OcaConfig;
 
+mod attach;
 mod background;
 mod control;
 mod events;
@@ -15,6 +16,7 @@ mod list;
 mod scope;
 mod worktree_dispatch;
 
+pub use attach::execute_attach;
 pub use background::execute_background;
 pub use control::{ControlCommandOutput, execute_abort, execute_message, execute_queue};
 pub use events::execute_events;

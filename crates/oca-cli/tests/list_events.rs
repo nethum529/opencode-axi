@@ -115,6 +115,8 @@ impl Fixture {
                 branch: None,
                 commit: None,
                 commit_subject: None,
+                display: None,
+                herdr_tab: None,
                 tombstoned: false,
             })
             .unwrap();

@@ -81,6 +81,14 @@ fn main() -> ExitCode {
         Ok((home, oca_cli::Command::Abort(command))) => {
             run_control(oca_cli::execute_abort(&command, home), json)
         }
+        Ok((home, oca_cli::Command::Attach(command))) => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("the current-thread runtime must initialize");
+            runtime.block_on(oca_cli::execute_attach(&command, home));
+            ExitCode::SUCCESS
+        }
         Ok(_) => ExitCode::SUCCESS,
         Err(error) => render_error(&error, json),
     }

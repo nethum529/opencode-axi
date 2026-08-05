@@ -171,6 +171,8 @@ mod tests {
             branch: None,
             commit: None,
             commit_subject: None,
+            display: None,
+            herdr_tab: None,
             tombstoned: false,
         }
     }
