@@ -111,6 +111,10 @@ fn warm_prefix_sources_reject_forbidden_operation_families() {
         .expect("policy source is readable");
     let refs = fs::read_to_string(root.join("crates/oca-state/src/refs.rs"))
         .expect("ref-store source is readable");
+    let intents = fs::read_to_string(root.join("crates/oca-state/src/intents.rs"))
+        .expect("intent-store source is readable");
+    let recovery = fs::read_to_string(root.join("crates/oca-cli/src/crash_recovery.rs"))
+        .expect("crash-recovery source is readable");
 
     let dispatch_prefix =
         source_between(&core, "pub(crate) async fn start_dispatch", "#[cfg(test)]");
@@ -129,6 +133,20 @@ fn warm_prefix_sources_reject_forbidden_operation_families() {
         &refs,
         "    pub fn acknowledge_with<E>(",
         "/// The result after the first post-ack directory-durability attempt.",
+    );
+    let intent_write = source_between(
+        &intents,
+        "    pub fn write(",
+        "    /// Reads one intent without changing it.",
+    );
+    let intent_pre_ack_write = intent_write
+        .split("            if durability == IntentDurability::PostAck {")
+        .next()
+        .expect("pre-ack intent write precedes the explicit post-ack flush");
+    let intent_persistence = source_between(
+        &recovery,
+        "pub(crate) fn persist_intent(",
+        "pub(crate) fn remove_intent(",
     );
 
     for (name, source) in [
@@ -198,6 +216,40 @@ fn warm_prefix_sources_reject_forbidden_operation_families() {
     assert!(
         acknowledgement_durability.contains("sync_directory(&self.parent)"),
         "the post-ack durability owner must retain the parent-directory sync"
+    );
+    for forbidden in [".sync_all(", ".sync_data(", "sync_directory("] {
+        assert!(
+            !intent_pre_ack_write.contains(forbidden),
+            "pre-ack intent replacement contains forbidden durability operation `{forbidden}`"
+        );
+    }
+    assert_eq!(
+        intent_write.matches(".sync_all(").count(),
+        1,
+        "intent replacement must contain exactly one explicitly post-ack file sync"
+    );
+    assert_eq!(
+        intent_write.matches(".sync_data(").count(),
+        0,
+        "intent replacement must not introduce another file-sync operation"
+    );
+    assert_eq!(
+        intent_write.matches("sync_directory(").count(),
+        1,
+        "intent replacement must contain exactly one explicitly post-ack directory sync"
+    );
+    assert_eq!(
+        intent_write
+            .matches("if durability == IntentDurability::PostAck {")
+            .count(),
+        2,
+        "file and directory syncs must remain guarded by explicit post-ack durability"
+    );
+    assert!(
+        intent_persistence.contains("intent.phase >= IntentPhase::TerminalObserved")
+            && intent_persistence.contains("IntentDurability::PostAck")
+            && intent_persistence.contains("IntentDurability::PreAck"),
+        "intent persistence must select durability explicitly at terminal_observed"
     );
 }
 

@@ -20,7 +20,10 @@ use fs2::FileExt;
 use oca_core::{RefId, RoleReply};
 use serde::{Deserialize, Serialize};
 
-use crate::RefState;
+use crate::{
+    Intent, IntentDurability, IntentOperation, IntentRequest, IntentStore, IntentStoreError,
+    RefState,
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -595,7 +598,7 @@ impl RefStore {
     /// Returns an error if the store cannot be read, locked, or persisted.
     pub fn allocate(&self, new_ref: NewRef) -> Result<PendingRefAllocation, RefStoreError> {
         let mut locked = self.lock_and_read_records()?;
-        let record = self.new_record(&locked.records, new_ref);
+        let record = self.new_record(&locked.records, new_ref)?;
         locked.records.push(record.clone());
         self.write_records_before_ack(&locked.records, &mut locked.lock)?;
 
@@ -604,6 +607,82 @@ impl RefStore {
             parent: locked.parent,
             lock: locked.lock,
             atomic_write_hook: Arc::clone(&self.atomic_write_hook),
+        })
+    }
+
+    /// Claims an intent-backed ref ID without adding an incomplete mapping to
+    /// `refs.json`. The intent is atomically renamed while `refs.lock` remains
+    /// held. Ordinary allocation and reservation scan those intent files under
+    /// the same refs lock, so the claim is visible before another ID can be
+    /// selected.
+    pub fn reserve_intent(
+        &self,
+        intents: &IntentStore,
+        operation: IntentOperation,
+        requested: IntentRequest,
+    ) -> Result<Intent, RefStoreError> {
+        let lock = self.lock_for_intent_reservation()?;
+        let reference = loop {
+            let candidate = self.id_source.next_id();
+            if RefId::new(&candidate).is_ok()
+                && !self.reference_appears_in_store(&candidate)?
+                && intents
+                    .read(&candidate)
+                    .map_err(RefStoreError::Intent)?
+                    .is_none()
+            {
+                break candidate;
+            }
+        };
+        let intent = Intent::new(reference, operation).with_requested(requested);
+        intents
+            .write(&intent, IntentDurability::PreAck)
+            .map_err(RefStoreError::Intent)?;
+        FileExt::unlock(&lock).map_err(|source| RefStoreError::Io {
+            path: self.paths.lock_file.clone(),
+            source,
+        })?;
+        Ok(intent)
+    }
+
+    /// Inserts a caller-selected, previously intent-reserved ID and retains the
+    /// refs lock so acknowledgement can precede parent-directory durability.
+    pub fn allocate_reserved(
+        &self,
+        id: &str,
+        new_ref: NewRef,
+    ) -> Result<PendingRefAllocation, RefStoreError> {
+        if RefId::new(id).is_err() {
+            return Err(RefStoreError::InvalidRefId(id.to_owned()));
+        }
+        let mut locked = self.lock_and_read_records()?;
+        if locked.records.iter().any(|record| record.id == id) {
+            return Err(RefStoreError::RefAlreadyExists(id.to_owned()));
+        }
+        let record = Self::record(id.to_owned(), new_ref);
+        locked.records.push(record.clone());
+        self.write_records_before_ack(&locked.records, &mut locked.lock)?;
+        Ok(PendingRefAllocation {
+            record,
+            parent: locked.parent,
+            lock: locked.lock,
+            atomic_write_hook: Arc::clone(&self.atomic_write_hook),
+        })
+    }
+
+    /// Inserts a caller-selected, previously intent-reserved ID outside an
+    /// acknowledgement boundary, including full directory durability.
+    pub fn insert_reserved(&self, id: &str, new_ref: NewRef) -> Result<RefRecord, RefStoreError> {
+        if RefId::new(id).is_err() {
+            return Err(RefStoreError::InvalidRefId(id.to_owned()));
+        }
+        self.with_locked_records(|records| {
+            if records.iter().any(|record| record.id == id) {
+                return Err(RefStoreError::RefAlreadyExists(id.to_owned()));
+            }
+            let record = Self::record(id.to_owned(), new_ref);
+            records.push(record.clone());
+            Ok((record, true))
         })
     }
 
@@ -619,9 +698,44 @@ impl RefStore {
     /// Returns an error if the store cannot be read, locked, or persisted.
     pub fn reserve(&self, new_ref: NewRef) -> Result<RefRecord, RefStoreError> {
         self.with_locked_records(|records| {
-            let record = self.new_record(records, new_ref);
+            let record = self.new_record(records, new_ref)?;
             records.push(record.clone());
             Ok((record, true))
+        })
+    }
+
+    /// Transfers a post-acknowledgement directory sync to the next store entrant.
+    ///
+    /// A caller still holding a `PendingRefAllocation` transfers by dropping it:
+    /// the pending marker is already set, so the lock is released with the sync
+    /// outstanding. This entry point covers a caller that owns no such handle.
+    pub fn transfer_directory_durability(&self) -> Result<(), RefStoreError> {
+        let mut locked = self.lock_and_read_records()?;
+        mark_directory_sync_pending(&mut locked.lock).map_err(|source| RefStoreError::Io {
+            path: self.paths.lock_file.clone(),
+            source,
+        })?;
+        FileExt::unlock(&locked.lock).map_err(|source| RefStoreError::Io {
+            path: self.paths.lock_file.clone(),
+            source,
+        })
+    }
+
+    /// Removes a reservation that was never acknowledged with a message id.
+    ///
+    /// This is restricted to pre-ack records so active and historical refs
+    /// cannot be deleted through the recovery cleanup path.
+    pub fn discard_unacknowledged(&self, id: &str) -> Result<(), RefStoreError> {
+        self.with_locked_records(|records| {
+            let index = records
+                .iter()
+                .position(|record| record.id == id)
+                .ok_or_else(|| RefStoreError::RefNotFound(id.to_owned()))?;
+            if records[index].message_id.is_some() {
+                return Err(RefStoreError::RefAlreadyExists(id.to_owned()));
+            }
+            records.remove(index);
+            Ok(((), true))
         })
     }
 
@@ -823,14 +937,54 @@ impl RefStore {
         Ok(value)
     }
 
-    fn new_record(&self, records: &[RefRecord], new_ref: NewRef) -> RefRecord {
-        let occupied: HashSet<_> = records.iter().map(|record| record.id.as_str()).collect();
+    fn new_record(
+        &self,
+        records: &[RefRecord],
+        new_ref: NewRef,
+    ) -> Result<RefRecord, RefStoreError> {
+        let mut occupied: HashSet<_> = records.iter().map(|record| record.id.clone()).collect();
+        occupied.extend(self.intent_reservation_ids()?);
         let id = loop {
             let candidate = self.id_source.next_id();
-            if RefId::new(&candidate).is_ok() && !occupied.contains(candidate.as_str()) {
+            if RefId::new(&candidate).is_ok() && !occupied.contains(&candidate) {
                 break candidate;
             }
         };
+        Ok(Self::record(id, new_ref))
+    }
+
+    /// Returns IDs claimed by atomically visible intent records. Callers invoke
+    /// this while holding `refs.lock`, which prevents a new reservation from
+    /// appearing between this scan and the refs.json replacement.
+    fn intent_reservation_ids(&self) -> Result<HashSet<String>, RefStoreError> {
+        let directory = self.refs_parent()?.join("intents");
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(HashSet::new()),
+            Err(source) => {
+                return Err(RefStoreError::Io {
+                    path: directory,
+                    source,
+                });
+            }
+        };
+        let mut reservations = HashSet::new();
+        for entry in entries {
+            let entry = entry.map_err(|source| RefStoreError::Io {
+                path: directory.clone(),
+                source,
+            })?;
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) == Some("json")
+                && let Some(reference) = path.file_stem().and_then(|value| value.to_str())
+            {
+                reservations.insert(reference.to_owned());
+            }
+        }
+        Ok(reservations)
+    }
+
+    fn record(id: String, new_ref: NewRef) -> RefRecord {
         RefRecord {
             id,
             session_id: new_ref.session_id,
@@ -905,6 +1059,44 @@ impl RefStore {
             lock,
             records: self.read_records()?,
         })
+    }
+
+    fn lock_for_intent_reservation(&self) -> Result<File, RefStoreError> {
+        let parent = self.refs_parent()?;
+        fs::create_dir_all(parent).map_err(|source| RefStoreError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options
+            .open(&self.paths.lock_file)
+            .map_err(|source| RefStoreError::Io {
+                path: self.paths.lock_file.clone(),
+                source,
+            })?;
+        file.lock_exclusive().map_err(|source| RefStoreError::Io {
+            path: self.paths.lock_file.clone(),
+            source,
+        })?;
+        Ok(file)
+    }
+
+    fn reference_appears_in_store(&self, reference: &str) -> Result<bool, RefStoreError> {
+        let bytes = match fs::read(&self.paths.refs_file) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(RefStoreError::Io {
+                    path: self.paths.refs_file.clone(),
+                    source,
+                });
+            }
+        };
+        let quoted = format!("\"{reference}\"");
+        Ok(memchr::memmem::find(&bytes, quoted.as_bytes()).is_some())
     }
 
     fn refs_parent(&self) -> Result<&Path, RefStoreError> {
@@ -1089,6 +1281,7 @@ pub enum RefStoreError {
         source: io::Error,
     },
     Serialize(serde_json::Error),
+    Intent(IntentStoreError),
 }
 
 impl fmt::Display for RefStoreError {
@@ -1117,6 +1310,7 @@ impl fmt::Display for RefStoreError {
                 path.display()
             ),
             Self::Serialize(source) => write!(formatter, "cannot serialize refs: {source}"),
+            Self::Intent(source) => write!(formatter, "cannot reserve ref intent: {source}"),
         }
     }
 }
@@ -1126,6 +1320,7 @@ impl std::error::Error for RefStoreError {
         match self {
             Self::Io { source, .. } | Self::Durability { source, .. } => Some(source),
             Self::Deserialize { source, .. } | Self::Serialize(source) => Some(source),
+            Self::Intent(source) => Some(source),
             Self::HomeDirectoryUnavailable
             | Self::MissingParent(_)
             | Self::InvalidRefId(_)
@@ -1158,6 +1353,7 @@ mod tests {
         AtomicWriteHook, NewRef, RefIdSource, RefListFilter, RefPatch, RefRecord, RefStore,
         RefStoreError, RefStorePaths,
     };
+    use crate::{IntentOperation, IntentPhase, IntentRequest, IntentStore, RefState};
 
     #[derive(Default)]
     struct SequenceIdSource(Mutex<VecDeque<String>>);
@@ -1196,6 +1392,155 @@ mod tests {
 
         assert_eq!(first.id, "w00000");
         assert_eq!(second.id, "w00001");
+    }
+
+    #[test]
+    fn reserve_intent_persists_the_claim_without_an_incomplete_ref() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = RefStorePaths::in_directory(directory.path());
+        let store = RefStore::with_id_source(paths, Arc::new(SequenceIdSource::new(&["w00000"])));
+        let intents = IntentStore::in_directory(directory.path());
+        let requested = IntentRequest {
+            alias: "luna".to_owned(),
+            effort: "high".to_owned(),
+            role: "impl".to_owned(),
+            cwd: "/repo".to_owned(),
+            repo: "/repo".to_owned(),
+            spawner_tag: Some("parent".to_owned()),
+            worktree: false,
+            display: Some("tmux".to_owned()),
+        };
+
+        let intent = store
+            .reserve_intent(&intents, IntentOperation::Dispatch, requested.clone())
+            .unwrap();
+
+        assert_eq!(intent.reference, "w00000");
+        assert_eq!(intent.phase, IntentPhase::Planned);
+        assert_eq!(intent.requested, Some(requested));
+        assert_eq!(intents.read("w00000").unwrap(), Some(intent));
+        assert!(store.list(&RefListFilter::default()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn allocate_reserved_materializes_the_claim_and_preserves_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = RefStorePaths::in_directory(directory.path());
+        let store = RefStore::with_id_source(paths, Arc::new(SequenceIdSource::new(&["w00000"])));
+        let intents = IntentStore::in_directory(directory.path());
+        let intent = store
+            .reserve_intent(
+                &intents,
+                IntentOperation::Dispatch,
+                IntentRequest::default(),
+            )
+            .unwrap();
+
+        let record = finish(
+            store
+                .allocate_reserved(
+                    &intent.reference,
+                    NewRef::for_session("session-one")
+                        .with_message_id("message-one")
+                        .with_display("herdr"),
+                )
+                .unwrap(),
+        );
+
+        assert_eq!(record.id, "w00000");
+        assert_eq!(record.session_id, "session-one");
+        assert_eq!(record.message_id.as_deref(), Some("message-one"));
+        assert_eq!(record.display.as_deref(), Some("herdr"));
+        assert!(matches!(
+            store.allocate_reserved("w00000", NewRef::for_session("other")),
+            Err(RefStoreError::RefAlreadyExists(id)) if id == "w00000"
+        ));
+    }
+
+    #[test]
+    fn insert_reserved_materializes_a_recovery_claim_with_full_durability() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RefStore::with_id_source(
+            RefStorePaths::in_directory(directory.path()),
+            Arc::new(SequenceIdSource::new(&["w00000"])),
+        );
+        let intents = IntentStore::in_directory(directory.path());
+        let intent = store
+            .reserve_intent(
+                &intents,
+                IntentOperation::Dispatch,
+                IntentRequest::default(),
+            )
+            .unwrap();
+
+        let record = store
+            .insert_reserved(
+                &intent.reference,
+                NewRef::for_session("session-recovered")
+                    .with_control_metadata("luna", "high", "impl", "/repo", RefState::Running)
+                    .with_display("headless"),
+            )
+            .unwrap();
+
+        assert_eq!(record.id, "w00000");
+        assert_eq!(record.last_state, Some(RefState::Running));
+        assert_eq!(record.display.as_deref(), Some("headless"));
+        assert_eq!(store.resolve("w00000").unwrap(), Some(record));
+    }
+
+    #[test]
+    fn live_intent_reservation_is_excluded_from_concurrent_allocate_and_reserve() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(RefStore::with_id_source(
+            RefStorePaths::in_directory(directory.path()),
+            Arc::new(SequenceIdSource::new(&[
+                "w00000", "w00000", "w00001", "w00000", "w00002", "w00000",
+            ])),
+        ));
+        let intents = IntentStore::in_directory(directory.path());
+        let intent = store
+            .reserve_intent(
+                &intents,
+                IntentOperation::Dispatch,
+                IntentRequest::default(),
+            )
+            .unwrap();
+        assert_eq!(intent.reference, "w00000");
+
+        let start = Arc::new(Barrier::new(3));
+        let allocate = {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                finish(store.allocate(NewRef::for_session("allocated")).unwrap())
+            })
+        };
+        let reserve = {
+            let store = Arc::clone(&store);
+            let start = Arc::clone(&start);
+            thread::spawn(move || {
+                start.wait();
+                store.reserve(NewRef::for_session("reserved")).unwrap()
+            })
+        };
+        start.wait();
+
+        let allocated = allocate.join().unwrap();
+        let reserved = reserve.join().unwrap();
+        assert_eq!(
+            HashSet::from([allocated.id.as_str(), reserved.id.as_str()]),
+            HashSet::from(["w00001", "w00002"])
+        );
+        assert!(intents.read("w00000").unwrap().is_some());
+
+        assert!(intents.remove("w00000").unwrap());
+        let reused = finish(
+            store
+                .allocate(NewRef::for_session("after-settlement"))
+                .unwrap(),
+        );
+        assert_eq!(reused.id, "w00000");
     }
 
     #[test]

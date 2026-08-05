@@ -55,7 +55,11 @@ fn main() -> ExitCode {
             }
         }
         Ok((home, oca_cli::Command::List(command))) => {
-            match oca_cli::execute_list(&command, home) {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("the current-thread runtime must initialize");
+            match runtime.block_on(oca_cli::execute_list(&command, home)) {
                 Ok(output) => {
                     print!("{output}");
                     ExitCode::SUCCESS

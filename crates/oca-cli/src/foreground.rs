@@ -18,10 +18,14 @@ use oca_opencode::{
     attributed_structured_reply, is_target_session_idle,
 };
 use oca_server::{ConnectOrStart, SystemRuntime};
-use oca_state::{NewRef, OcaConfig, PendingRefAllocation, RefState, RefStore, RefStorePaths};
+use oca_state::{
+    Intent, IntentOperation, IntentPhase, IntentRequest, IntentStore, NewRef, OcaConfig,
+    PendingRefAllocation, RefState, RefStore, RefStorePaths,
+};
 
 use crate::{
     DispatchCommand,
+    crash_recovery::{RESERVED_SESSION_ID, intent_failpoint, persist_intent, prompt_sha256},
     scope::Scope,
     transport::{CreateSessionOperation, connect_error, open_code_error, prompt_error},
     worktree_dispatch::{WorktreeDispatch, finalize_turn},
@@ -102,8 +106,16 @@ pub(crate) fn prepare_dispatch(
 
     // Server discovery happens only after every local parse/resolve failure.
     let manager = ConnectOrStart::from_home(home, &config.server);
-    let refs = RefStore::with_paths(RefStorePaths::in_directory(home.join(".oca")));
-    let backend = ProductionBackend::new(manager, refs, post_ack_durability, scope, worktree);
+    let state_directory = home.join(".oca");
+    let refs = RefStore::with_paths(RefStorePaths::in_directory(&state_directory));
+    let backend = ProductionBackend::new(
+        manager,
+        refs,
+        state_directory,
+        post_ack_durability,
+        scope,
+        worktree,
+    );
     let request = ForegroundRequest {
         model: command.model,
         prompt: command.prompt,
@@ -123,6 +135,9 @@ pub(crate) struct ProductionBackend {
     runtime: SystemRuntime,
     client: Option<OpenCodeClient>,
     refs: RefStore,
+    intents: IntentStore,
+    intent: Option<Intent>,
+    reference: Option<String>,
     message_ids: MessageIdGenerator,
     post_ack_durability: PostAckDurability,
     scope: Scope,
@@ -139,6 +154,7 @@ impl ProductionBackend {
     fn new(
         manager: ConnectOrStart,
         refs: RefStore,
+        state_directory: PathBuf,
         post_ack_durability: PostAckDurability,
         scope: Scope,
         worktree: Option<WorktreeDispatch>,
@@ -148,6 +164,9 @@ impl ProductionBackend {
             runtime: SystemRuntime::default(),
             client: None,
             refs,
+            intents: IntentStore::in_directory(state_directory),
+            intent: None,
+            reference: None,
             message_ids: MessageIdGenerator::new(),
             post_ack_durability,
             scope,
@@ -163,36 +182,18 @@ impl ProductionBackend {
         })
     }
 
-    fn persist_uncertain_ref(
-        &self,
-        session_id: &str,
-        prompt: &DispatchPrompt,
-    ) -> Result<String, OcaError> {
-        let record = NewRef::for_session(session_id)
-            .with_message_id(prompt.message_id.clone())
-            .with_control_metadata(
-                &prompt.model.alias,
-                &prompt.model.effort,
-                &prompt.role,
-                self.dispatch_cwd
-                    .as_deref()
-                    .unwrap_or_else(|| Path::new("."))
-                    .display()
-                    .to_string(),
-                RefState::Unknown,
-            )
-            .with_repo(&self.scope.repo)
-            .with_spawner_tag(&self.scope.spawner_tag);
-        let pending = self
-            .refs
-            .allocate(record)
-            .map_err(|error| state_error("could not preserve uncertain prompt ref", error))?;
-        let reference = pending.record().id.clone();
-        // There is deliberately no success acknowledgement for an uncertain
-        // prompt. Dropping transfers the pending directory sync while leaving
-        // the content-synced, atomically renamed ref visible for reconciliation.
-        drop(pending);
-        Ok(reference)
+    fn reference(&self) -> Result<&str, OcaError> {
+        self.reference.as_deref().ok_or_else(|| {
+            OcaError::new(ErrorCode::ProtocolMismatch)
+                .with_error("dispatch ref used before intent preparation")
+        })
+    }
+
+    fn intent_mut(&mut self) -> Result<&mut Intent, OcaError> {
+        self.intent.as_mut().ok_or_else(|| {
+            OcaError::new(ErrorCode::ProtocolMismatch)
+                .with_error("dispatch intent used before preparation")
+        })
     }
 
     async fn read_attributed_reply(
@@ -217,8 +218,48 @@ impl ForegroundBackend for ProductionBackend {
     type PendingRef = PendingProductionRef;
 
     fn prepare(&mut self, request: &mut ForegroundRequest) -> Result<(), OcaError> {
+        let requested = IntentRequest {
+            alias: request.model.alias.clone(),
+            effort: request.model.effort.clone(),
+            role: request.role.clone(),
+            cwd: request.cwd.display().to_string(),
+            repo: self.scope.repo.clone(),
+            spawner_tag: Some(self.scope.spawner_tag.clone()),
+            worktree: self.worktree.is_some(),
+            display: Some(request.display.as_str().to_owned()),
+        };
+        let intent = if self.worktree.is_some() {
+            let reservation = self
+                .refs
+                .reserve(
+                    NewRef::for_session(RESERVED_SESSION_ID)
+                        .with_control_metadata(
+                            &request.model.alias,
+                            &request.model.effort,
+                            &request.role,
+                            request.cwd.display().to_string(),
+                            RefState::Running,
+                        )
+                        .with_repo(&self.scope.repo)
+                        .with_spawner_tag(&self.scope.spawner_tag)
+                        .with_display(request.display.as_str()),
+                )
+                .map_err(|error| state_error("could not reserve worktree ref", error))?;
+            Intent::new(&reservation.id, IntentOperation::Dispatch).with_requested(requested)
+        } else {
+            let intent = self
+                .refs
+                .reserve_intent(&self.intents, IntentOperation::Dispatch, requested)
+                .map_err(|error| state_error("could not reserve dispatch intent", error))?;
+            intent_failpoint(&intent);
+            intent
+        };
+        self.reference = Some(intent.reference.clone());
+        self.intent = Some(intent);
         if let Some(worktree) = &mut self.worktree {
-            worktree.prepare(&self.refs, request, &self.scope)?;
+            let reference = self.reference.as_deref().expect("set above");
+            let intent = self.intent.as_mut().expect("set above");
+            worktree.prepare(&self.refs, request, reference, &self.intents, intent)?;
         }
         Ok(())
     }
@@ -242,11 +283,27 @@ impl ForegroundBackend for ProductionBackend {
             )]),
             ..CreateSessionRequest::default()
         });
-        let session = self
+        if self.worktree.is_some() {
+            let intent = self.intent.as_ref().expect("intent set during prepare");
+            persist_intent(&self.intents, intent)?;
+        }
+        let session = match self
             .manager
             .connect_or_start(&self.runtime, &mut operation)
             .await
-            .map_err(connect_error)?;
+        {
+            Ok(session) => session,
+            Err(error) => {
+                let error = connect_error(error);
+                let reference = self.reference()?.to_owned();
+                if let Some(worktree) = &self.worktree {
+                    let _ = worktree.cleanup(&reference);
+                }
+                let _ = self.intents.remove(&reference);
+                let _ = self.refs.discard_unacknowledged(&reference);
+                return Err(error.with_ref(reference));
+            }
+        };
         let record = self
             .manager
             .read_record()
@@ -262,9 +319,13 @@ impl ForegroundBackend for ProductionBackend {
                     .with_error(format!("invalid recovered OpenCode URL: {error}"))
             })?;
         self.client = Some(OpenCodeClient::new(base_url));
-        if let Some(worktree) = &self.worktree {
-            worktree.record_session(&self.refs, &session.id)?;
+        {
+            let intent = self.intent_mut()?;
+            intent.session_id = Some(session.id.clone());
+            intent.set_phase(IntentPhase::SessionCreated);
         }
+        let intent = self.intent.as_ref().expect("intent set during prepare");
+        persist_intent(&self.intents, intent)?;
         Ok(session.id)
     }
 
@@ -296,6 +357,15 @@ impl ForegroundBackend for ProductionBackend {
         session_id: &str,
         prompt: &DispatchPrompt,
     ) -> Result<(), OcaError> {
+        {
+            let intent = self.intent_mut()?;
+            intent.session_id = Some(session_id.to_owned());
+            intent.message_id = Some(prompt.message_id.clone());
+            intent.prompt_sha256 = Some(prompt_sha256(&prompt.text));
+            intent.set_phase(IntentPhase::PromptUncertain);
+        }
+        let intent = self.intent.as_ref().expect("intent set during prepare");
+        persist_intent(&self.intents, intent)?;
         let result = self
             .client()?
             .prompt_async(
@@ -314,14 +384,63 @@ impl ForegroundBackend for ProductionBackend {
             )
             .await;
         match result {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                let intent = self.intent_mut()?;
+                intent.set_phase(IntentPhase::Running);
+                let intent = self.intent.as_ref().expect("intent set during prepare");
+                persist_intent(&self.intents, intent)
+            }
             Err(error) => {
                 let error = prompt_error(error);
                 if error.code() == ErrorCode::PromptUncertain.as_str() {
-                    let reference = self.persist_uncertain_ref(session_id, prompt)?;
+                    let reference = self.reference()?.to_owned();
+                    if self.worktree.is_some() {
+                        self.refs
+                            .patch(
+                                &reference,
+                                oca_state::RefPatch::default()
+                                    .with_session_id(session_id)
+                                    .with_message_id(&prompt.message_id)
+                                    .with_last_state(RefState::Unknown),
+                            )
+                            .map_err(|state| {
+                                state_error("could not mark uncertain prompt ref", state)
+                            })?;
+                    } else {
+                        let pending = self
+                            .refs
+                            .allocate_reserved(
+                                &reference,
+                                NewRef::for_session(session_id)
+                                    .with_message_id(&prompt.message_id)
+                                    .with_control_metadata(
+                                        &prompt.model.alias,
+                                        &prompt.model.effort,
+                                        &prompt.role,
+                                        self.dispatch_cwd
+                                            .as_deref()
+                                            .unwrap_or_else(|| Path::new("."))
+                                            .display()
+                                            .to_string(),
+                                        RefState::Unknown,
+                                    )
+                                    .with_repo(&self.scope.repo)
+                                    .with_spawner_tag(&self.scope.spawner_tag)
+                                    .with_display(request_display(self.intent.as_ref())),
+                            )
+                            .map_err(|state| {
+                                state_error("could not preserve uncertain prompt ref", state)
+                            })?;
+                        drop(pending);
+                    }
                     Err(error.with_ref(reference))
                 } else {
-                    Err(error)
+                    let reference = self.reference()?.to_owned();
+                    if self.worktree.is_none() {
+                        let _ = self.intents.remove(&reference);
+                        let _ = self.refs.discard_unacknowledged(&reference);
+                    }
+                    Err(error.with_ref(reference))
                 }
             }
         }
@@ -333,29 +452,32 @@ impl ForegroundBackend for ProductionBackend {
         message_id: &str,
         request: &ForegroundRequest,
     ) -> Result<Self::PendingRef, OcaError> {
+        let reference = self.reference()?.to_owned();
         if let Some(worktree) = &self.worktree {
-            return worktree
-                .finish_ref(&self.refs, session_id, message_id)
-                .map(PendingProductionRef::Reserved);
+            worktree
+                .finish_ref(&self.refs, &reference, session_id, message_id)
+                .map(PendingProductionRef::Reserved)
+        } else {
+            self.refs
+                .allocate_reserved(
+                    &reference,
+                    NewRef::for_session(session_id)
+                        .with_message_id(message_id)
+                        .with_control_metadata(
+                            &request.model.alias,
+                            &request.model.effort,
+                            &request.role,
+                            request.cwd.display().to_string(),
+                            RefState::Running,
+                        )
+                        .with_repo(&self.scope.repo)
+                        .with_spawner_tag(&self.scope.spawner_tag)
+                        .with_display(request.display.as_str()),
+                )
+                .map(Box::new)
+                .map(PendingProductionRef::Allocated)
+                .map_err(|error| state_error("could not complete dispatch ref", error))
         }
-        self.refs
-            .allocate(
-                NewRef::for_session(session_id)
-                    .with_message_id(message_id)
-                    .with_control_metadata(
-                        &request.model.alias,
-                        &request.model.effort,
-                        &request.role,
-                        request.cwd.display().to_string(),
-                        RefState::Running,
-                    )
-                    .with_repo(&self.scope.repo)
-                    .with_spawner_tag(&self.scope.spawner_tag)
-                    .with_display(request.display.as_str()),
-            )
-            .map(Box::new)
-            .map(PendingProductionRef::Allocated)
-            .map_err(|error| state_error("could not write ref record", error))
     }
 
     fn acknowledge(
@@ -384,9 +506,6 @@ impl ForegroundBackend for ProductionBackend {
             PostAckDurability::Transfer => {
                 let reference = pending.record().id.clone();
                 print_ack(&reference, model, json).map_err(io_error)?;
-                // Dropping the retained lock leaves the durability marker for
-                // the next ref-store entrant (normally the follow process).
-                // Background dispatch performs no directory fsync after ack.
                 drop(pending);
                 Ok(reference)
             }
@@ -460,6 +579,13 @@ impl ForegroundBackend for ProductionBackend {
         }
     }
 
+    fn terminal_observed(&mut self, _reference: &str) -> Result<(), OcaError> {
+        let intent = self.intent_mut()?;
+        intent.set_phase(IntentPhase::TerminalObserved);
+        let intent = self.intent.as_ref().expect("intent set during prepare");
+        persist_intent(&self.intents, intent)
+    }
+
     fn finalize(&mut self, reference: &str, reply: &RoleReply) -> Result<(), OcaError> {
         finalize_turn(&self.refs, reference, reply)
     }
@@ -509,6 +635,13 @@ fn io_error(error: io::Error) -> OcaError {
 
 fn state_error(context: &str, error: impl std::fmt::Display) -> OcaError {
     OcaError::new(ErrorCode::ServerUnavailable).with_error(format!("{context}: {error}"))
+}
+
+fn request_display(intent: Option<&Intent>) -> &str {
+    intent
+        .and_then(|intent| intent.requested.as_ref())
+        .and_then(|requested| requested.display.as_deref())
+        .unwrap_or("headless")
 }
 
 fn server_state_error(context: &str, error: io::Error) -> OcaError {

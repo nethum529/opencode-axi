@@ -3,18 +3,17 @@
 use std::path::{Path, PathBuf};
 
 use oca_core::{ErrorCode, ForegroundRequest, OcaError, RoleReply, WorkerPolicy, WorkerState};
-use oca_git::{GitError, RefId, RelativePath, TaskSummary, WorktreeManager, commit};
-use oca_state::{NewRef, RefPatch, RefState, RefStore};
+use oca_git::{
+    GitError, RefId, RelativePath, TaskSummary, WorktreeManager, cleanup_orphaned_worktree, commit,
+};
+use oca_state::{Intent, IntentPhase, IntentStore, RefPatch, RefState, RefStore};
 
-use crate::scope::Scope;
-
-const RESERVED_SESSION_ID: &str = "oca_worktree_session_pending";
+use crate::crash_recovery::{persist_intent, remove_intent};
 
 /// State held between pre-session worktree creation and ref acknowledgement.
 pub(crate) struct WorktreeDispatch {
     repo_root: PathBuf,
     summary: TaskSummary,
-    reference: Option<String>,
 }
 
 impl WorktreeDispatch {
@@ -22,7 +21,6 @@ impl WorktreeDispatch {
         Self {
             repo_root,
             summary: TaskSummary::from_original_prompt(original_prompt),
-            reference: None,
         }
     }
 
@@ -31,34 +29,23 @@ impl WorktreeDispatch {
         &mut self,
         refs: &RefStore,
         request: &mut ForegroundRequest,
-        scope: &Scope,
+        reference: &str,
+        intents: &IntentStore,
+        intent: &mut Intent,
     ) -> Result<(), OcaError> {
-        let reservation = refs
-            .reserve(
-                NewRef::for_session(RESERVED_SESSION_ID)
-                    .with_control_metadata(
-                        &request.model.alias,
-                        &request.model.effort,
-                        &request.role,
-                        self.repo_root.display().to_string(),
-                        RefState::Running,
-                    )
-                    .with_repo(&scope.repo)
-                    .with_spawner_tag(&scope.spawner_tag)
-                    .with_display(request.display.as_str()),
-            )
-            .map_err(|error| state_error("could not reserve worktree ref", error))?;
-        let reference = RefId::new(&reservation.id).map_err(git_error)?;
-        let worktree = match WorktreeManager::new().create(&reference, &self.repo_root) {
+        let reference_id = RefId::new(reference).map_err(git_error)?;
+        let worktree = match WorktreeManager::new().create(&reference_id, &self.repo_root) {
             Ok(worktree) => worktree,
             Err(error) => {
-                let _ = refs.tombstone(&reservation.id);
+                let _ = refs.tombstone(reference);
+                let _ = remove_intent(intents, reference);
                 return Err(git_error(error));
             }
         };
         let worktree_path = worktree.path().to_path_buf();
+        intent.set_phase(IntentPhase::WorktreeReady);
         refs.patch(
-            &reservation.id,
+            reference,
             RefPatch::default()
                 .with_cwd(worktree_path.display().to_string())
                 .with_worktree_metadata(
@@ -71,26 +58,21 @@ impl WorktreeDispatch {
 
         request.cwd = worktree_path.clone();
         request.policy = WorkerPolicy::restricted([worktree_path]);
-        self.reference = Some(reservation.id);
         Ok(())
     }
 
-    pub(crate) fn record_session(&self, refs: &RefStore, session_id: &str) -> Result<(), OcaError> {
-        refs.patch(
-            self.reference()?,
-            RefPatch::default().with_session_id(session_id),
-        )
-        .map(|_| ())
-        .map_err(|error| state_error("could not store worktree session", error))
+    pub(crate) fn cleanup(&self, reference: &str) -> Result<(), OcaError> {
+        let reference = RefId::new(reference).map_err(git_error)?;
+        cleanup_orphaned_worktree(&self.repo_root, &reference).map_err(git_error)
     }
 
     pub(crate) fn finish_ref(
         &self,
         refs: &RefStore,
+        reference: &str,
         session_id: &str,
         message_id: &str,
     ) -> Result<String, OcaError> {
-        let reference = self.reference()?;
         refs.patch(
             reference,
             RefPatch::default()
@@ -100,13 +82,6 @@ impl WorktreeDispatch {
         )
         .map_err(|error| state_error("could not complete worktree ref", error))?;
         Ok(reference.to_owned())
-    }
-
-    fn reference(&self) -> Result<&str, OcaError> {
-        self.reference.as_deref().ok_or_else(|| {
-            OcaError::new(ErrorCode::ServerUnavailable)
-                .with_error("worktree dispatch was not prepared before session creation")
-        })
     }
 }
 
@@ -119,21 +94,44 @@ pub(crate) fn finalize_turn(
     reference: &str,
     reply: &RoleReply,
 ) -> Result<(), OcaError> {
+    let state_directory = refs
+        .paths()
+        .refs_file
+        .parent()
+        .ok_or_else(|| {
+            OcaError::new(ErrorCode::ServerUnavailable)
+                .with_error("refs file has no state directory")
+        })?
+        .to_path_buf();
+    let intents = IntentStore::in_directory(state_directory);
+    let mut intent = intents
+        .read(reference)
+        .map_err(|error| state_error("could not read terminal intent", error))?;
+    if let Some(intent) = intent.as_mut() {
+        if intent.phase < IntentPhase::TerminalObserved {
+            intent.set_phase(IntentPhase::TerminalObserved);
+        }
+        intent.terminal_reply = Some(reply.clone());
+    }
     let record = refs
         .resolve(reference)
         .map_err(|error| state_error("could not read terminal ref", error))?
         .ok_or_else(|| OcaError::new(ErrorCode::UnknownRef).with_ref(reference))?;
     let ref_state = ref_state(reply_state(reply));
     let Some(worktree) = record.worktree.as_deref() else {
-        return refs
-            .patch(
-                reference,
-                RefPatch::default()
-                    .with_last_state(ref_state)
-                    .with_completion(reply.clone()),
-            )
-            .map(|_| ())
-            .map_err(|error| state_error("could not update terminal ref state", error));
+        if let Some(intent) = intent.as_mut() {
+            intent.set_phase(IntentPhase::Validated);
+            persist_intent(&intents, intent)?;
+        }
+        refs.patch(
+            reference,
+            RefPatch::default()
+                .with_last_state(ref_state)
+                .with_completion(reply.clone()),
+        )
+        .map_err(|error| state_error("could not update terminal ref state", error))?;
+        remove_intent(&intents, reference)?;
+        return Ok(());
     };
 
     let stored_summary = record.commit_subject.as_deref().ok_or_else(|| {
@@ -143,11 +141,30 @@ pub(crate) fn finalize_turn(
     })?;
     let reference_id = RefId::new(reference).map_err(git_error)?;
     let manifest = [RelativePath::new(".").map_err(git_error)?];
-    WorktreeManager::new()
+    let changes = WorktreeManager::new()
         .validate(Path::new(worktree), &manifest)
         .map_err(git_error)?;
+    if let Some(intent) = intent.as_mut() {
+        intent.changed_paths = changes
+            .paths()
+            .iter()
+            .map(|path| path.as_str().to_owned())
+            .collect();
+        intent.checks = vec![
+            "manifest_scope".to_owned(),
+            "nonzero_files".to_owned(),
+            "stable_diff".to_owned(),
+        ];
+        intent.set_phase(IntentPhase::Validated);
+        persist_intent(&intents, intent)?;
+    }
     let summary = TaskSummary::from_original_prompt(stored_summary);
     let committed = commit(Path::new(worktree), &reference_id, &summary).map_err(git_error)?;
+    if let Some(intent) = intent.as_mut() {
+        intent.commit_id = Some(committed.id().to_owned());
+        intent.set_phase(IntentPhase::Committed);
+        persist_intent(&intents, intent)?;
+    }
     refs.patch(
         reference,
         RefPatch::default()
@@ -155,8 +172,8 @@ pub(crate) fn finalize_turn(
             .with_commit(committed.id())
             .with_completion(reply.clone()),
     )
-    .map(|_| ())
-    .map_err(|error| state_error("could not store committed turn", error))
+    .map_err(|error| state_error("could not store committed turn", error))?;
+    remove_intent(&intents, reference)
 }
 
 pub(crate) const fn reply_state(reply: &oca_core::RoleReply) -> WorkerState {

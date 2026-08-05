@@ -20,7 +20,7 @@ pub use error::{
 pub use follow::{
     EventJournalWriter, EventSubscription, FollowError, FollowMessage, FollowOutcome, FollowPolicy,
     FollowTarget, FollowTerminal, FollowTransport, FollowTransportError, OcaEvent,
-    follow_until_terminal, follow_until_terminal_with_policy,
+    follow_until_terminal, follow_until_terminal_from_cursor, follow_until_terminal_with_policy,
 };
 pub use foreground::{
     DispatchPrompt, ForegroundBackend, ForegroundOutcome, ForegroundRequest, TerminalReply,

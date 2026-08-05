@@ -13,12 +13,16 @@ use oca_display::Acknowledgement;
 use oca_opencode::{OpenCodeClient, PromptRequest, TextPart};
 use oca_server::ConnectOrStart;
 use oca_state::{
-    OcaConfig, RefPatch, RefRecord, RefState, RefStore, RefStorePaths, SessionTurnLock,
+    Intent, IntentOperation, IntentPhase, IntentStore, OcaConfig, RefPatch, RefRecord, RefState,
+    RefStore, RefStorePaths, SessionTurnLock,
 };
 use url::Url;
 
 use crate::{
     AbortCommand, MessageCommand,
+    crash_recovery::{
+        ReconcileCommand, persist_intent, prompt_sha256, reconcile_ref, remove_intent,
+    },
     transport::{open_code_error, prompt_error},
 };
 
@@ -42,6 +46,7 @@ pub async fn execute_message(
     let home = home.as_ref();
     let state_directory = home.join(".oca");
     let _turn_lock = acquire_turn_lock(&state_directory, &command.reference)?;
+    reconcile_ref(home, &command.reference, ReconcileCommand::Message).await?;
     let store = RefStore::with_paths(RefStorePaths::in_directory(&state_directory));
     let record = resolve_active_ref(&store, &command.reference)?;
     let state = required_state(&record, &command.reference)?;
@@ -68,13 +73,28 @@ pub async fn execute_message(
     let context = ControlContext::from_record(&record, &config, command.effort.as_deref())?;
     let client = discovered_client(home, &config, &command.reference)?;
     let message_id = mint_message_id()?;
-    client
+    let mut intent = Intent::new(&command.reference, IntentOperation::Message);
+    intent.session_id = Some(record.session_id.clone());
+    intent.message_id = Some(message_id.clone());
+    intent.prompt_sha256 = Some(prompt_sha256(&command.message));
+    intent.set_phase(IntentPhase::PromptUncertain);
+    let intents = IntentStore::in_directory(&state_directory);
+    persist_intent(&intents, &intent)?;
+    let result = client
         .prompt_async(
             &record.session_id,
             context.prompt_request(message_id.clone(), command.message.clone()),
         )
-        .await
-        .map_err(|error| prompt_error(error).with_ref(&command.reference))?;
+        .await;
+    if let Err(error) = result {
+        let error = prompt_error(error).with_ref(&command.reference);
+        if error.code() != ErrorCode::PromptUncertain.as_str() {
+            remove_intent(&intents, &command.reference)?;
+        }
+        return Err(error);
+    }
+    intent.set_phase(IntentPhase::Running);
+    persist_intent(&intents, &intent)?;
 
     let mut patch = RefPatch::default()
         .with_message_id(message_id)

@@ -8,6 +8,7 @@ use std::{
 };
 
 use oca_server::{ConnectOrStart, ServerRecord};
+use oca_state::IntentStore;
 use serde_json::{Value, json};
 
 struct CapturedRequest {
@@ -210,6 +211,66 @@ fn contract_invalid_review_turn_leaves_the_first_commit_alone() {
     );
 }
 
+#[test]
+fn killed_validated_and_committed_phases_are_committed_or_adopted_by_fresh_ls() {
+    for phase in ["validated", "committed"] {
+        let repository = TestRepository::new();
+        let home = tempfile::tempdir().expect("temporary home");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
+        let port = listener.local_addr().unwrap().port();
+        prepare_home(home.path(), port);
+        let server = thread::spawn(move || serve_completed_worktree(listener));
+
+        let killed = Command::new(env!("CARGO_BIN_EXE_oca"))
+            .args([
+                "luna:h",
+                "-w",
+                "--headless",
+                "recover",
+                "the",
+                "tool-owned",
+                "commit",
+            ])
+            .env("HOME", home.path())
+            .env("OCA_FAILPOINT", phase)
+            .current_dir(repository.path())
+            .output()
+            .unwrap();
+        server.join().expect("fake server completes");
+        assert_eq!(
+            killed.status.code(),
+            Some(86),
+            "phase {phase}: {}",
+            String::from_utf8_lossy(&killed.stderr)
+        );
+        let stranded = only_stored_ref(home.path());
+        let reference = stranded["id"].as_str().unwrap().to_owned();
+        let worktree = PathBuf::from(stranded["worktree"].as_str().unwrap());
+        assert!(stranded.get("commit").is_none());
+        assert_eq!(
+            git_output(&worktree, ["rev-list", "--count", "HEAD"]).trim(),
+            if phase == "validated" { "1" } else { "2" }
+        );
+
+        let listed = run_oca(home.path(), repository.path(), ["ls", "--all", "--json"]);
+        assert_success(&listed);
+        let recovered = stored_ref(home.path(), &reference);
+        assert_eq!(recovered["last_state"], "done");
+        assert!(recovered["commit"].as_str().is_some());
+        assert_eq!(
+            git_output(&worktree, ["rev-list", "--count", "HEAD"]).trim(),
+            "2",
+            "recovery adopts or creates exactly one commit"
+        );
+        assert!(
+            IntentStore::in_directory(home.path().join(".oca"))
+                .list()
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
 #[derive(Clone, Copy)]
 enum InvalidReply {
     Structural,
@@ -307,6 +368,51 @@ fn serve_rate_limit(listener: TcpListener) {
                 "text/plain",
                 "slow down",
             ),
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn serve_completed_worktree(listener: TcpListener) {
+    let mut message_id = None;
+    for index in 0..4 {
+        let (mut stream, _) = listener.accept().expect("fake accepts request");
+        let request = read_request(&mut stream);
+        match index {
+            0 => {
+                let worktree = session_directory(&request.path);
+                assert!(worktree.join(".git").exists());
+                std::fs::write(worktree.join("recovered.txt"), "durable worker output\n").unwrap();
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"{"id":"ses_recovery"}"#,
+                );
+            }
+            1 => write_response(&mut stream, "200 OK", "text/event-stream", ""),
+            2 => {
+                message_id = request.body["messageID"].as_str().map(ToOwned::to_owned);
+                write_response(&mut stream, "204 No Content", "text/plain", "");
+            }
+            3 => {
+                let body = json!([{
+                    "info": {
+                        "id":"msg_assistant_recovery",
+                        "sessionID":"ses_recovery",
+                        "role":"assistant",
+                        "parentID":message_id.as_deref().unwrap(),
+                        "time":{"created":1,"completed":2},
+                        "structured":{
+                            "status":"done",
+                            "files":["recovered.txt"],
+                            "note":"Implemented the durable worker change while preserving every requested worktree and validation boundary across the injected commit-state crash. Verified that fresh reconciliation creates or adopts exactly one tool-owned commit without duplicating any worker output."
+                        }
+                    },
+                    "parts":[]
+                }]);
+                write_response(&mut stream, "200 OK", "application/json", &body.to_string());
+            }
             _ => unreachable!(),
         }
     }
