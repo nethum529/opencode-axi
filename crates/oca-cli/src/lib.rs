@@ -6,11 +6,16 @@ use oca_core::{
 };
 use oca_state::OcaConfig;
 
+mod events;
 mod follow;
 mod foreground;
+mod list;
+mod scope;
 
+pub use events::execute_events;
 pub use follow::{FollowCommandOutput, execute_follow};
 pub use foreground::execute_foreground;
+pub use list::execute_list;
 
 /// The fixed command grammar accepted by `oca`.
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -20,7 +20,7 @@ use oca_opencode::{
 use oca_server::ConnectOrStart;
 use oca_state::{NewRef, OcaConfig, PendingRefAllocation, RefStore, RefStorePaths};
 
-use crate::DispatchCommand;
+use crate::{DispatchCommand, scope::Scope};
 
 /// Executes a parsed foreground dispatch using the user's local state root.
 ///
@@ -51,6 +51,7 @@ pub async fn execute_foreground(
     }
     let contract = ReplyContract::resolve(&command.role)?;
     let cwd = std::env::current_dir().map_err(io_error)?;
+    let scope = crate::scope::current(home, &cwd).map_err(io_error)?;
     let policy = WorkerPolicy::restricted([cwd.clone()]);
 
     // Server discovery happens only after every local parse/resolve failure.
@@ -70,7 +71,7 @@ pub async fn execute_foreground(
                 .with_error(format!("invalid recorded OpenCode URL: {error}"))
         })?;
     let refs = RefStore::with_paths(RefStorePaths::in_directory(home.join(".oca")));
-    let mut backend = ProductionBackend::new(OpenCodeClient::new(base_url), refs);
+    let mut backend = ProductionBackend::new(OpenCodeClient::new(base_url), refs, scope);
     let request = ForegroundRequest {
         model: command.model,
         prompt: command.prompt,
@@ -89,14 +90,16 @@ struct ProductionBackend {
     client: OpenCodeClient,
     refs: RefStore,
     message_ids: MessageIdGenerator,
+    scope: Scope,
 }
 
 impl ProductionBackend {
-    fn new(client: OpenCodeClient, refs: RefStore) -> Self {
+    fn new(client: OpenCodeClient, refs: RefStore, scope: Scope) -> Self {
         Self {
             client,
             refs,
             message_ids: MessageIdGenerator::new(),
+            scope,
         }
     }
 
@@ -130,9 +133,14 @@ impl ForegroundBackend for ProductionBackend {
         self.client
             .create_session(CreateSessionRequest {
                 directory: Some(request.cwd.display().to_string()),
+                title: Some(format!("oca:{}", self.scope.spawner_tag)),
                 agent: Some(request.role.clone()),
                 model: Some(request.model.clone()),
                 permission: Some(permission),
+                metadata: serde_json::Map::from_iter([(
+                    "oca_spawner".to_owned(),
+                    serde_json::Value::String(self.scope.spawner_tag.clone()),
+                )]),
                 ..CreateSessionRequest::default()
             })
             .await
@@ -191,7 +199,12 @@ impl ForegroundBackend for ProductionBackend {
         message_id: &str,
     ) -> Result<Self::PendingRef, OcaError> {
         self.refs
-            .allocate(NewRef::for_session(session_id).with_message_id(message_id))
+            .allocate(
+                NewRef::for_session(session_id)
+                    .with_message_id(message_id)
+                    .with_repo(&self.scope.repo)
+                    .with_spawner_tag(&self.scope.spawner_tag),
+            )
             .map_err(|error| state_error("could not write ref record", error))
     }
 
