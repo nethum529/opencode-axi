@@ -284,6 +284,10 @@ mod tests {
                 last_state: Some(worker_state),
                 repo: Some(scope.repo.clone()),
                 spawner_tag: Some(scope.spawner_tag.clone()),
+                worktree: None,
+                branch: None,
+                commit: None,
+                commit_subject: None,
                 tombstoned: false,
             })
             .unwrap();

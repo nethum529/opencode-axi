@@ -135,7 +135,11 @@ fn serve_foreground(listener: TcpListener) -> Vec<CapturedRequest> {
                         "sessionID": "ses_target",
                         "role": "assistant",
                         "parentID": message_id.as_deref().expect("prompt preceded terminal read"),
-                        "structured": {"status":"done","files":[],"note":"Done."}
+                        "structured": {
+                            "status":"done",
+                            "files":[],
+                            "note":"Implemented the requested foreground behavior while preserving the established ordering and output contracts for the dispatch. Verified the completed turn reports exactly one stable terminal result."
+                        }
                     },
                     "parts": []
                 }]);

@@ -167,6 +167,10 @@ mod tests {
             last_state: Some(oca_state::RefState::Running),
             repo: None,
             spawner_tag: None,
+            worktree: None,
+            branch: None,
+            commit: None,
+            commit_subject: None,
             tombstoned: false,
         }
     }

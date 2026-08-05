@@ -50,6 +50,14 @@ pub struct RefRecord {
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawner_tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_subject: Option<String>,
     #[serde(default)]
     pub tombstoned: bool,
 }
@@ -66,6 +74,10 @@ pub struct NewRef {
     pub last_state: Option<RefState>,
     pub repo: Option<String>,
     pub spawner_tag: Option<String>,
+    pub worktree: Option<String>,
+    pub branch: Option<String>,
+    pub commit: Option<String>,
+    pub commit_subject: Option<String>,
 }
 
 /// Store-level selection used by [`RefStore::list`].
@@ -83,9 +95,14 @@ pub struct RefPatch {
     pub session_id: Option<String>,
     pub message_id: Option<String>,
     pub effort: Option<String>,
+    pub cwd: Option<String>,
     pub last_state: Option<RefState>,
     pub repo: Option<String>,
     pub spawner_tag: Option<String>,
+    pub worktree: Option<String>,
+    pub branch: Option<String>,
+    pub commit: Option<String>,
+    pub commit_subject: Option<String>,
 }
 
 impl RefPatch {
@@ -108,6 +125,12 @@ impl RefPatch {
     }
 
     #[must_use]
+    pub fn with_cwd(mut self, cwd: impl Into<String>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    #[must_use]
     pub const fn with_last_state(mut self, last_state: RefState) -> Self {
         self.last_state = Some(last_state);
         self
@@ -122,6 +145,25 @@ impl RefPatch {
     #[must_use]
     pub fn with_spawner_tag(mut self, spawner_tag: impl Into<String>) -> Self {
         self.spawner_tag = Some(spawner_tag.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_worktree_metadata(
+        mut self,
+        worktree: impl Into<String>,
+        branch: impl Into<String>,
+        commit_subject: impl Into<String>,
+    ) -> Self {
+        self.worktree = Some(worktree.into());
+        self.branch = Some(branch.into());
+        self.commit_subject = Some(commit_subject.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_commit(mut self, commit: impl Into<String>) -> Self {
+        self.commit = Some(commit.into());
         self
     }
 }
@@ -157,6 +199,10 @@ impl NewRef {
             last_state: None,
             repo: None,
             spawner_tag: None,
+            worktree: None,
+            branch: None,
+            commit: None,
+            commit_subject: None,
         }
     }
 
@@ -192,6 +238,19 @@ impl NewRef {
     #[must_use]
     pub fn with_spawner_tag(mut self, spawner_tag: impl Into<String>) -> Self {
         self.spawner_tag = Some(spawner_tag.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_worktree_metadata(
+        mut self,
+        worktree: impl Into<String>,
+        branch: impl Into<String>,
+        commit_subject: impl Into<String>,
+    ) -> Self {
+        self.worktree = Some(worktree.into());
+        self.branch = Some(branch.into());
+        self.commit_subject = Some(commit_subject.into());
         self
     }
 }
@@ -504,30 +563,7 @@ impl RefStore {
     /// Returns an error if the store cannot be read, locked, or persisted.
     pub fn allocate(&self, new_ref: NewRef) -> Result<PendingRefAllocation, RefStoreError> {
         let mut locked = self.lock_and_read_records()?;
-        let occupied: HashSet<_> = locked
-            .records
-            .iter()
-            .map(|record| record.id.as_str())
-            .collect();
-        let id = loop {
-            let candidate = self.id_source.next_id();
-            if RefId::new(&candidate).is_ok() && !occupied.contains(candidate.as_str()) {
-                break candidate;
-            }
-        };
-        let record = RefRecord {
-            id,
-            session_id: new_ref.session_id,
-            message_id: new_ref.message_id,
-            alias: new_ref.alias,
-            effort: new_ref.effort,
-            role: new_ref.role,
-            cwd: new_ref.cwd,
-            last_state: new_ref.last_state,
-            repo: new_ref.repo,
-            spawner_tag: new_ref.spawner_tag,
-            tombstoned: false,
-        };
+        let record = self.new_record(&locked.records, new_ref);
         locked.records.push(record.clone());
         self.write_records_before_ack(&locked.records, &mut locked.lock)?;
 
@@ -536,6 +572,24 @@ impl RefStore {
             parent: locked.parent,
             lock: locked.lock,
             atomic_write_hook: Arc::clone(&self.atomic_write_hook),
+        })
+    }
+
+    /// Reserves a globally unique ref before a worktree dispatch creates its
+    /// OpenCode session.
+    ///
+    /// Unlike [`Self::allocate`], this operation completes directory durability
+    /// before returning because no user acknowledgement has happened yet. The
+    /// reserved record is later patched with the real session and message IDs.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the store cannot be read, locked, or persisted.
+    pub fn reserve(&self, new_ref: NewRef) -> Result<RefRecord, RefStoreError> {
+        self.with_locked_records(|records| {
+            let record = self.new_record(records, new_ref);
+            records.push(record.clone());
+            Ok((record, true))
         })
     }
 
@@ -622,6 +676,9 @@ impl RefStore {
             if let Some(effort) = patch.effort {
                 record.effort = Some(effort);
             }
+            if let Some(cwd) = patch.cwd {
+                record.cwd = Some(cwd);
+            }
             if let Some(last_state) = patch.last_state {
                 record.last_state = Some(last_state);
             }
@@ -630,6 +687,18 @@ impl RefStore {
             }
             if let Some(spawner_tag) = patch.spawner_tag {
                 record.spawner_tag = Some(spawner_tag);
+            }
+            if let Some(worktree) = patch.worktree {
+                record.worktree = Some(worktree);
+            }
+            if let Some(branch) = patch.branch {
+                record.branch = Some(branch);
+            }
+            if let Some(commit) = patch.commit {
+                record.commit = Some(commit);
+            }
+            if let Some(commit_subject) = patch.commit_subject {
+                record.commit_subject = Some(commit_subject);
             }
             Ok((record.clone(), true))
         })
@@ -711,6 +780,33 @@ impl RefStore {
             source,
         })?;
         Ok(value)
+    }
+
+    fn new_record(&self, records: &[RefRecord], new_ref: NewRef) -> RefRecord {
+        let occupied: HashSet<_> = records.iter().map(|record| record.id.as_str()).collect();
+        let id = loop {
+            let candidate = self.id_source.next_id();
+            if RefId::new(&candidate).is_ok() && !occupied.contains(candidate.as_str()) {
+                break candidate;
+            }
+        };
+        RefRecord {
+            id,
+            session_id: new_ref.session_id,
+            message_id: new_ref.message_id,
+            alias: new_ref.alias,
+            effort: new_ref.effort,
+            role: new_ref.role,
+            cwd: new_ref.cwd,
+            last_state: new_ref.last_state,
+            repo: new_ref.repo,
+            spawner_tag: new_ref.spawner_tag,
+            worktree: new_ref.worktree,
+            branch: new_ref.branch,
+            commit: new_ref.commit,
+            commit_subject: new_ref.commit_subject,
+            tombstoned: false,
+        }
     }
 
     fn lock_and_read_records(&self) -> Result<LockedRecords, RefStoreError> {
@@ -1127,6 +1223,10 @@ mod tests {
             last_state: None,
             repo: Some("repo-a".to_string()),
             spawner_tag: Some("parent-a".to_string()),
+            worktree: None,
+            branch: None,
+            commit: None,
+            commit_subject: None,
             tombstoned: false,
         };
 
@@ -1143,6 +1243,10 @@ mod tests {
                 last_state: None,
                 repo: Some("repo-b".to_string()),
                 spawner_tag: Some("parent-c".to_string()),
+                worktree: None,
+                branch: None,
+                commit: None,
+                commit_subject: None,
                 tombstoned: false,
             })
             .unwrap();
@@ -1182,7 +1286,7 @@ mod tests {
             1
         );
         assert!(matches!(
-            store.insert(RefRecord { id: "w0a1b2".to_string(), session_id: "new-session".to_string(), message_id: None, alias: None, effort: None, role: None, cwd: None, last_state: None, repo: None, spawner_tag: None, tombstoned: false }),
+            store.insert(RefRecord { id: "w0a1b2".to_string(), session_id: "new-session".to_string(), message_id: None, alias: None, effort: None, role: None, cwd: None, last_state: None, repo: None, spawner_tag: None, worktree: None, branch: None, commit: None, commit_subject: None, tombstoned: false }),
             Err(RefStoreError::RefAlreadyExists(id)) if id == "w0a1b2"
         ));
     }
@@ -1204,6 +1308,10 @@ mod tests {
                     last_state: None,
                     repo: None,
                     spawner_tag: None,
+                    worktree: None,
+                    branch: None,
+                    commit: None,
+                    commit_subject: None,
                     tombstoned: false,
                 })
                 .unwrap();
@@ -1234,6 +1342,10 @@ mod tests {
                 last_state: None,
                 repo: None,
                 spawner_tag: None,
+                worktree: None,
+                branch: None,
+                commit: None,
+                commit_subject: None,
                 tombstoned: false,
             });
 

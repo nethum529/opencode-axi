@@ -12,6 +12,10 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod commit;
+
+pub use commit::{CommitRecord, TaskSummary, commit};
+
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
 const DEFAULT_LOCK_ACQUISITION_TIMEOUT: Duration = Duration::from_secs(10);
 const LOCK_OWNER_RECORD: &str = "owner";
@@ -340,6 +344,7 @@ impl WorktreeManager {
             [
                 OsStr::new("worktree"),
                 OsStr::new("add"),
+                OsStr::new("--quiet"),
                 OsStr::new("-b"),
                 OsStr::new(&branch),
                 path.as_os_str(),

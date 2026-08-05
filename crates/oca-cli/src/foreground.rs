@@ -2,7 +2,7 @@
 
 use std::{
     io::{self, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -18,11 +18,13 @@ use oca_opencode::{
     attributed_structured_reply, is_target_session_idle,
 };
 use oca_server::ConnectOrStart;
-use oca_state::{
-    NewRef, OcaConfig, PendingRefAllocation, RefPatch, RefState, RefStore, RefStorePaths,
-};
+use oca_state::{NewRef, OcaConfig, PendingRefAllocation, RefState, RefStore, RefStorePaths};
 
-use crate::{DispatchCommand, scope::Scope};
+use crate::{
+    DispatchCommand,
+    scope::Scope,
+    worktree_dispatch::{WorktreeDispatch, finalize_turn, reply_state},
+};
 
 /// Executes a parsed foreground dispatch using the user's local state root.
 ///
@@ -59,12 +61,6 @@ pub(crate) fn prepare_dispatch(
     home: impl AsRef<Path>,
     post_ack_durability: PostAckDurability,
 ) -> Result<PreparedDispatch, OcaError> {
-    if command.worktree {
-        return Err(OcaError::new(ErrorCode::Usage)
-            .with_error("worktree dispatch is not available in this dispatch path yet")
-            .with_help("retry without `-w`; worktree dispatch is owned by T21/T22"));
-    }
-
     let home = home.as_ref();
     let config = OcaConfig::load_from_home(home).map_err(|error| {
         OcaError::new(ErrorCode::Usage)
@@ -80,6 +76,14 @@ pub(crate) fn prepare_dispatch(
     let cwd = std::env::current_dir().map_err(io_error)?;
     let scope = crate::scope::current(home, &cwd).map_err(io_error)?;
     let policy = WorkerPolicy::restricted([cwd.clone()]);
+    if command.worktree && !Path::new(&scope.repo).join(".git").exists() {
+        return Err(OcaError::new(ErrorCode::Usage)
+            .with_error("`-w` requires a Git repository")
+            .with_help("run the dispatch from inside a Git repository"));
+    }
+    let worktree = command
+        .worktree
+        .then(|| WorktreeDispatch::new(PathBuf::from(&scope.repo), &command.prompt));
 
     // Server discovery happens only after every local parse/resolve failure.
     let manager = ConnectOrStart::from_home(home, &config.server);
@@ -103,6 +107,7 @@ pub(crate) fn prepare_dispatch(
         refs,
         post_ack_durability,
         scope,
+        worktree,
     );
     let request = ForegroundRequest {
         model: command.model,
@@ -124,6 +129,12 @@ pub(crate) struct ProductionBackend {
     message_ids: MessageIdGenerator,
     post_ack_durability: PostAckDurability,
     scope: Scope,
+    worktree: Option<WorktreeDispatch>,
+}
+
+pub(crate) enum PendingProductionRef {
+    Allocated(Box<PendingRefAllocation>),
+    Reserved(String),
 }
 
 impl ProductionBackend {
@@ -132,6 +143,7 @@ impl ProductionBackend {
         refs: RefStore,
         post_ack_durability: PostAckDurability,
         scope: Scope,
+        worktree: Option<WorktreeDispatch>,
     ) -> Self {
         Self {
             client,
@@ -139,6 +151,7 @@ impl ProductionBackend {
             message_ids: MessageIdGenerator::new(),
             post_ack_durability,
             scope,
+            worktree,
         }
     }
 
@@ -161,7 +174,14 @@ impl ProductionBackend {
 
 impl ForegroundBackend for ProductionBackend {
     type Subscription = Subscription;
-    type PendingRef = PendingRefAllocation;
+    type PendingRef = PendingProductionRef;
+
+    fn prepare(&mut self, request: &mut ForegroundRequest) -> Result<(), OcaError> {
+        if let Some(worktree) = &mut self.worktree {
+            worktree.prepare(&self.refs, request, &self.scope)?;
+        }
+        Ok(())
+    }
 
     async fn create_session(&mut self, request: &ForegroundRequest) -> Result<String, OcaError> {
         let permission =
@@ -169,7 +189,8 @@ impl ForegroundBackend for ProductionBackend {
                 OcaError::new(ErrorCode::ProtocolMismatch)
                     .with_error(format!("permission profile could not be encoded: {error}"))
             })?;
-        self.client
+        let session_id = self
+            .client
             .create_session(CreateSessionRequest {
                 directory: Some(request.cwd.display().to_string()),
                 title: Some(format!("oca:{}", self.scope.spawner_tag)),
@@ -184,7 +205,11 @@ impl ForegroundBackend for ProductionBackend {
             })
             .await
             .map(|session| session.id)
-            .map_err(open_code_error)
+            .map_err(open_code_error)?;
+        if let Some(worktree) = &self.worktree {
+            worktree.record_session(&self.refs, &session_id)?;
+        }
+        Ok(session_id)
     }
 
     async fn subscribe(&mut self) -> Result<Self::Subscription, OcaError> {
@@ -238,6 +263,11 @@ impl ForegroundBackend for ProductionBackend {
         message_id: &str,
         request: &ForegroundRequest,
     ) -> Result<Self::PendingRef, OcaError> {
+        if let Some(worktree) = &self.worktree {
+            return worktree
+                .finish_ref(&self.refs, session_id, message_id)
+                .map(PendingProductionRef::Reserved);
+        }
         self.refs
             .allocate(
                 NewRef::for_session(session_id)
@@ -252,6 +282,8 @@ impl ForegroundBackend for ProductionBackend {
                     .with_repo(&self.scope.repo)
                     .with_spawner_tag(&self.scope.spawner_tag),
             )
+            .map(Box::new)
+            .map(PendingProductionRef::Allocated)
             .map_err(|error| state_error("could not write ref record", error))
     }
 
@@ -261,6 +293,13 @@ impl ForegroundBackend for ProductionBackend {
         model: &ResolvedModel,
         json: bool,
     ) -> Result<String, OcaError> {
+        let pending = match pending {
+            PendingProductionRef::Reserved(reference) => {
+                print_ack(&reference, model, json).map_err(io_error)?;
+                return Ok(reference);
+            }
+            PendingProductionRef::Allocated(pending) => *pending,
+        };
         match self.post_ack_durability {
             PostAckDurability::Complete => {
                 let completion = pending
@@ -351,20 +390,7 @@ impl ForegroundBackend for ProductionBackend {
     }
 
     fn finalize(&mut self, reference: &str, reply: &RoleReply) -> Result<(), OcaError> {
-        // Non-worktree dispatch has no git finalization side effect.
-        let state = match reply {
-            RoleReply::Impl(reply) => reply.status,
-            RoleReply::Review(reply) => reply.status,
-        };
-        let state = match state {
-            WorkerState::Done => RefState::Done,
-            WorkerState::Blocked => RefState::Blocked,
-            WorkerState::Partial => RefState::Partial,
-        };
-        self.refs
-            .patch(reference, RefPatch::default().with_last_state(state))
-            .map(|_| ())
-            .map_err(|error| state_error("could not update terminal ref state", error))
+        finalize_turn(&self.refs, reference, reply_state(reply))
     }
 
     fn print_final(
