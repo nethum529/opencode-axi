@@ -12,8 +12,8 @@ pub use config::{
     RoleConfig, ServerConfig,
 };
 pub use intents::{
-    INTENT_SCHEMA_VERSION, Intent, IntentOperation, IntentPhase, IntentRequest, IntentStore,
-    IntentStoreError,
+    INTENT_SCHEMA_VERSION, Intent, IntentDurability, IntentOperation, IntentPhase, IntentRequest,
+    IntentStore, IntentStoreError,
 };
 pub use journal::{
     EventJournal, JournalError, JournalEvent, JournalPage, MAX_JOURNAL_RECORD_BYTES,

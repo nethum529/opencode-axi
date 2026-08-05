@@ -10,7 +10,8 @@ use oca_core::{
 use oca_opencode::OpenCodeClient;
 use oca_server::ConnectOrStart;
 use oca_state::{
-    EventJournal, Intent, IntentPhase, IntentStore, OcaConfig, RefStore, RefStorePaths,
+    EventJournal, Intent, IntentDurability, IntentPhase, IntentStore, OcaConfig, RefStore,
+    RefStorePaths,
 };
 use serde_json::{Map, Value};
 use url::Url;
@@ -166,7 +167,7 @@ impl EventJournalWriter for RecoveryJournal {
             intent.event_cursor = Some(cursor.clone());
             intent.set_phase(IntentPhase::Running);
             self.intents
-                .write(intent)
+                .write(intent, IntentDurability::PreAck)
                 .map_err(|error| error.to_string())?;
             event_cursor_failpoint();
         }

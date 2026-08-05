@@ -7,8 +7,8 @@ use oca_git::{RefId, cleanup_orphaned_worktree};
 use oca_opencode::{MessageWithParts, OpenCodeClient};
 use oca_server::ConnectOrStart;
 use oca_state::{
-    Intent, IntentPhase, IntentStore, IntentStoreError, OcaConfig, RefPatch, RefState, RefStore,
-    RefStorePaths,
+    Intent, IntentDurability, IntentPhase, IntentStore, IntentStoreError, OcaConfig, RefPatch,
+    RefState, RefStore, RefStorePaths,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -37,7 +37,12 @@ pub(crate) fn prompt_sha256(prompt: &str) -> String {
 }
 
 pub(crate) fn persist_intent(store: &IntentStore, intent: &Intent) -> Result<(), OcaError> {
-    store.write(intent).map_err(intent_error)?;
+    let durability = if intent.phase >= IntentPhase::TerminalObserved {
+        IntentDurability::PostAck
+    } else {
+        IntentDurability::PreAck
+    };
+    store.write(intent, durability).map_err(intent_error)?;
     failpoint(intent.phase);
     Ok(())
 }

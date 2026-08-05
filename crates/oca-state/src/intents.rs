@@ -43,6 +43,16 @@ pub enum IntentPhase {
     PublishedUncertain,
 }
 
+/// Durability required for one atomic intent replacement.
+///
+/// Pre-ack writes deliberately stop after the atomic rename. Post-ack phase
+/// transitions additionally flush the file and its parent directory.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IntentDurability {
+    PreAck,
+    PostAck,
+}
+
 impl IntentPhase {
     #[must_use]
     pub const fn as_str(self) -> &'static str {
@@ -156,8 +166,12 @@ impl IntentStore {
         self.state_directory.join("intents")
     }
 
-    /// Atomically creates or replaces one content- and directory-durable intent.
-    pub fn write(&self, intent: &Intent) -> Result<(), IntentStoreError> {
+    /// Atomically creates or replaces one intent at the requested durability.
+    pub fn write(
+        &self,
+        intent: &Intent,
+        durability: IntentDurability,
+    ) -> Result<(), IntentStoreError> {
         validate_reference(&intent.reference)?;
         let directory = self.ensure_directory()?;
         let _lock = self.lock()?;
@@ -184,19 +198,27 @@ impl IntentStore {
                     source,
                 })?;
             file.write_all(&bytes)
-                .and_then(|()| file.sync_all())
                 .map_err(|source| IntentStoreError::Io {
                     path: temporary.clone(),
                     source,
                 })?;
+            if durability == IntentDurability::PostAck {
+                file.sync_all().map_err(|source| IntentStoreError::Io {
+                    path: temporary.clone(),
+                    source,
+                })?;
+            }
             fs::rename(&temporary, &path).map_err(|source| IntentStoreError::Io {
                 path: path.clone(),
                 source,
             })?;
-            sync_directory(&directory).map_err(|source| IntentStoreError::Io {
-                path: directory.clone(),
-                source,
-            })
+            if durability == IntentDurability::PostAck {
+                sync_directory(&directory).map_err(|source| IntentStoreError::Io {
+                    path: directory.clone(),
+                    source,
+                })?;
+            }
+            Ok(())
         })();
         if result.is_err() {
             let _ = fs::remove_file(temporary);
@@ -444,7 +466,12 @@ mod tests {
             IntentPhase::PublishedUncertain,
         ] {
             intent.set_phase(phase);
-            store.write(&intent).unwrap();
+            let durability = if phase >= IntentPhase::TerminalObserved {
+                IntentDurability::PostAck
+            } else {
+                IntentDurability::PreAck
+            };
+            store.write(&intent, durability).unwrap();
             assert_eq!(store.read("w4f2a1").unwrap().unwrap().phase, phase);
         }
         assert_eq!(store.list().unwrap(), [intent]);
@@ -458,7 +485,10 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let store = IntentStore::in_directory(state.path());
         store
-            .write(&Intent::new("w4f2a1", IntentOperation::Dispatch))
+            .write(
+                &Intent::new("w4f2a1", IntentOperation::Dispatch),
+                IntentDurability::PreAck,
+            )
             .unwrap();
         let directory_mode = fs::metadata(store.directory())
             .unwrap()

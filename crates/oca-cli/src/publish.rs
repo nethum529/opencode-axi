@@ -273,7 +273,8 @@ mod tests {
     use oca_core::{ErrorCode, ImplReply, RoleReply, WorkerState};
     use oca_git::GitError;
     use oca_state::{
-        Intent, IntentOperation, IntentPhase, IntentStore, RefRecord, RefStore, RefStorePaths,
+        Intent, IntentDurability, IntentOperation, IntentPhase, IntentStore, RefRecord, RefStore,
+        RefStorePaths,
     };
 
     use crate::{
@@ -568,7 +569,7 @@ mod tests {
         intent.remote_fingerprint = Some("simulated-mid-publish-crash".to_owned());
         intent.set_phase(IntentPhase::PublishedUncertain);
         IntentStore::in_directory(home.path().join(".oca"))
-            .write(&intent)
+            .write(&intent, IntentDurability::PostAck)
             .unwrap();
         let mut provider = RecordingProvider::default();
 
