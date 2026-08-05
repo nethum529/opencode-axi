@@ -1,12 +1,18 @@
 use std::fmt;
 
 pub mod error;
+pub mod follow;
 pub mod reply;
 pub mod resolver;
 
 pub use error::{
     ERROR_ENVELOPE_SCHEMA, ErrorCode, ErrorEnvelope, FollowExit, OcaError, error_envelope_schema,
     exit, parse_error_envelope, validate_error_envelope,
+};
+pub use follow::{
+    EventJournalWriter, EventSubscription, FollowError, FollowMessage, FollowOutcome, FollowPolicy,
+    FollowTarget, FollowTerminal, FollowTransport, FollowTransportError, OcaEvent,
+    follow_until_terminal, follow_until_terminal_with_policy,
 };
 pub use reply::{
     ImplReply, ReviewFinding, ReviewReply, RoleReply, WorkerState, validate_reply_floor,

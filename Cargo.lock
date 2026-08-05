@@ -743,8 +743,14 @@ name = "oca-cli"
 version = "0.1.0"
 dependencies = [
  "oca-core",
+ "oca-opencode",
+ "oca-server",
  "oca-state",
+ "oca-testkit",
+ "serde_json",
  "tempfile",
+ "tokio",
+ "url",
 ]
 
 [[package]]
@@ -753,6 +759,7 @@ version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
