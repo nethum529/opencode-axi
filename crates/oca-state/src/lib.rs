@@ -9,6 +9,6 @@ pub use config::{
     RoleConfig, ServerConfig,
 };
 pub use refs::{
-    AtomicWriteHook, NewRef, RefIdSource, RefListFilter, RefPatch, RefRecord, RefStore,
-    RefStoreError, RefStorePaths,
+    AtomicWriteHook, NewRef, PendingRefAllocation, RefAllocationCompletion, RefDurabilityWarning,
+    RefIdSource, RefListFilter, RefPatch, RefRecord, RefStore, RefStoreError, RefStorePaths,
 };
