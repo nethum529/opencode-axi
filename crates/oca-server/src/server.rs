@@ -1003,9 +1003,13 @@ mod tests {
             .expect("cold start succeeds");
         assert_eq!(probe_launches(&probe_count), 1);
 
+        // Each dispatch builds its own runtime, exactly as the CLI does. Reusing
+        // one would let the version memo absorb a warm-path probe and leave this
+        // count blind to the regression it exists to catch.
         for _ in 0..3 {
+            let warm_runtime = RecordingSystemRuntime::new(SystemRuntime::new(&executable));
             let mut warm_request = ReadyRequest;
-            block_on(manager.connect_or_start(&runtime, &mut warm_request))
+            block_on(manager.connect_or_start(&warm_runtime, &mut warm_request))
                 .expect("warm dispatch succeeds");
         }
         assert_eq!(probe_launches(&probe_count), 1);
@@ -1017,12 +1021,13 @@ mod tests {
                 runtime.start_environment_hash(),
             ))
             .expect("version-mismatched discovery hint");
+        let mismatch_runtime = RecordingSystemRuntime::new(SystemRuntime::new(&executable));
         let mut mismatch_request = ReadyRequest;
-        block_on(manager.connect_or_start(&runtime, &mut mismatch_request))
+        block_on(manager.connect_or_start(&mismatch_runtime, &mut mismatch_request))
             .expect("version mismatch does not trigger a warm probe");
 
         assert_eq!(probe_launches(&probe_count), 1);
-        assert!(runtime.warnings.borrow().is_empty());
+        assert!(mismatch_runtime.warnings.borrow().is_empty());
 
         release_tx.send(()).expect("release test server");
         server.join().expect("test server thread");
