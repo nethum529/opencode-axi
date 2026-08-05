@@ -44,11 +44,6 @@ impl WorktreeDispatch {
         };
         let worktree_path = worktree.path().to_path_buf();
         intent.set_phase(IntentPhase::WorktreeReady);
-        if let Err(error) = persist_intent(intents, intent) {
-            let _ = cleanup_orphaned_worktree(&self.repo_root, &reference_id);
-            let _ = refs.tombstone(reference);
-            return Err(error);
-        }
         refs.patch(
             reference,
             RefPatch::default()
@@ -64,17 +59,6 @@ impl WorktreeDispatch {
         request.cwd = worktree_path.clone();
         request.policy = WorkerPolicy::restricted([worktree_path]);
         Ok(())
-    }
-
-    pub(crate) fn record_session(
-        &self,
-        refs: &RefStore,
-        reference: &str,
-        session_id: &str,
-    ) -> Result<(), OcaError> {
-        refs.patch(reference, RefPatch::default().with_session_id(session_id))
-            .map(|_| ())
-            .map_err(|error| state_error("could not store worktree session", error))
     }
 
     pub(crate) fn cleanup(&self, reference: &str) -> Result<(), OcaError> {

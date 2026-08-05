@@ -20,7 +20,10 @@ use fs2::FileExt;
 use oca_core::{RefId, RoleReply};
 use serde::{Deserialize, Serialize};
 
-use crate::RefState;
+use crate::{
+    Intent, IntentDurability, IntentOperation, IntentRequest, IntentStore, IntentStoreError,
+    RefState,
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -598,6 +601,81 @@ impl RefStore {
         })
     }
 
+    /// Claims an intent-backed ref ID without adding an incomplete mapping to
+    /// `refs.json`. The refs lock serializes the collision check with ordinary
+    /// allocations, while the intent lock makes concurrent planned claims
+    /// visible before the refs lock is released.
+    pub fn reserve_intent(
+        &self,
+        intents: &IntentStore,
+        operation: IntentOperation,
+        requested: IntentRequest,
+    ) -> Result<Intent, RefStoreError> {
+        let lock = self.lock_for_intent_reservation()?;
+        let reference = loop {
+            let candidate = self.id_source.next_id();
+            if RefId::new(&candidate).is_ok()
+                && !self.reference_appears_in_store(&candidate)?
+                && intents
+                    .read(&candidate)
+                    .map_err(RefStoreError::Intent)?
+                    .is_none()
+            {
+                break candidate;
+            }
+        };
+        let intent = Intent::new(reference, operation).with_requested(requested);
+        intents
+            .write(&intent, IntentDurability::PreAck)
+            .map_err(RefStoreError::Intent)?;
+        FileExt::unlock(&lock).map_err(|source| RefStoreError::Io {
+            path: self.paths.lock_file.clone(),
+            source,
+        })?;
+        Ok(intent)
+    }
+
+    /// Inserts a caller-selected, previously intent-reserved ID and retains the
+    /// refs lock so acknowledgement can precede parent-directory durability.
+    pub fn allocate_reserved(
+        &self,
+        id: &str,
+        new_ref: NewRef,
+    ) -> Result<PendingRefAllocation, RefStoreError> {
+        if RefId::new(id).is_err() {
+            return Err(RefStoreError::InvalidRefId(id.to_owned()));
+        }
+        let mut locked = self.lock_and_read_records()?;
+        if locked.records.iter().any(|record| record.id == id) {
+            return Err(RefStoreError::RefAlreadyExists(id.to_owned()));
+        }
+        let record = Self::record(id.to_owned(), new_ref);
+        locked.records.push(record.clone());
+        self.write_records_before_ack(&locked.records, &mut locked.lock)?;
+        Ok(PendingRefAllocation {
+            record,
+            parent: locked.parent,
+            lock: locked.lock,
+            atomic_write_hook: Arc::clone(&self.atomic_write_hook),
+        })
+    }
+
+    /// Inserts a caller-selected, previously intent-reserved ID outside an
+    /// acknowledgement boundary, including full directory durability.
+    pub fn insert_reserved(&self, id: &str, new_ref: NewRef) -> Result<RefRecord, RefStoreError> {
+        if RefId::new(id).is_err() {
+            return Err(RefStoreError::InvalidRefId(id.to_owned()));
+        }
+        self.with_locked_records(|records| {
+            if records.iter().any(|record| record.id == id) {
+                return Err(RefStoreError::RefAlreadyExists(id.to_owned()));
+            }
+            let record = Self::record(id.to_owned(), new_ref);
+            records.push(record.clone());
+            Ok((record, true))
+        })
+    }
+
     /// Reserves a globally unique ref before a worktree dispatch creates its
     /// OpenCode session.
     ///
@@ -856,6 +934,10 @@ impl RefStore {
                 break candidate;
             }
         };
+        Self::record(id, new_ref)
+    }
+
+    fn record(id: String, new_ref: NewRef) -> RefRecord {
         RefRecord {
             id,
             session_id: new_ref.session_id,
@@ -930,6 +1012,44 @@ impl RefStore {
             lock,
             records: self.read_records()?,
         })
+    }
+
+    fn lock_for_intent_reservation(&self) -> Result<File, RefStoreError> {
+        let parent = self.refs_parent()?;
+        fs::create_dir_all(parent).map_err(|source| RefStoreError::Io {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options
+            .open(&self.paths.lock_file)
+            .map_err(|source| RefStoreError::Io {
+                path: self.paths.lock_file.clone(),
+                source,
+            })?;
+        file.lock_exclusive().map_err(|source| RefStoreError::Io {
+            path: self.paths.lock_file.clone(),
+            source,
+        })?;
+        Ok(file)
+    }
+
+    fn reference_appears_in_store(&self, reference: &str) -> Result<bool, RefStoreError> {
+        let bytes = match fs::read(&self.paths.refs_file) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(source) => {
+                return Err(RefStoreError::Io {
+                    path: self.paths.refs_file.clone(),
+                    source,
+                });
+            }
+        };
+        let quoted = format!("\"{reference}\"");
+        Ok(memchr::memmem::find(&bytes, quoted.as_bytes()).is_some())
     }
 
     fn refs_parent(&self) -> Result<&Path, RefStoreError> {
@@ -1114,6 +1234,7 @@ pub enum RefStoreError {
         source: io::Error,
     },
     Serialize(serde_json::Error),
+    Intent(IntentStoreError),
 }
 
 impl fmt::Display for RefStoreError {
@@ -1142,6 +1263,7 @@ impl fmt::Display for RefStoreError {
                 path.display()
             ),
             Self::Serialize(source) => write!(formatter, "cannot serialize refs: {source}"),
+            Self::Intent(source) => write!(formatter, "cannot reserve ref intent: {source}"),
         }
     }
 }
@@ -1151,6 +1273,7 @@ impl std::error::Error for RefStoreError {
         match self {
             Self::Io { source, .. } | Self::Durability { source, .. } => Some(source),
             Self::Deserialize { source, .. } | Self::Serialize(source) => Some(source),
+            Self::Intent(source) => Some(source),
             Self::HomeDirectoryUnavailable
             | Self::MissingParent(_)
             | Self::InvalidRefId(_)

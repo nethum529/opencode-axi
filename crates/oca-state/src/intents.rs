@@ -78,6 +78,8 @@ pub struct IntentRequest {
     pub role: String,
     pub cwd: String,
     pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawner_tag: Option<String>,
     pub worktree: bool,
 }
 

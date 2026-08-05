@@ -697,6 +697,7 @@ version = "0.1.0"
 dependencies = [
  "fs2",
  "libc",
+ "memchr",
  "oca-core",
  "serde",
  "serde_json",

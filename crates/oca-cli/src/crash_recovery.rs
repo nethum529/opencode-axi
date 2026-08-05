@@ -7,8 +7,8 @@ use oca_git::{RefId, cleanup_orphaned_worktree};
 use oca_opencode::{MessageWithParts, OpenCodeClient};
 use oca_server::ConnectOrStart;
 use oca_state::{
-    Intent, IntentDurability, IntentPhase, IntentStore, IntentStoreError, OcaConfig, RefPatch,
-    RefState, RefStore, RefStorePaths,
+    Intent, IntentDurability, IntentPhase, IntentStore, IntentStoreError, NewRef, OcaConfig,
+    RefPatch, RefState, RefStore, RefStorePaths,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -45,6 +45,24 @@ pub(crate) fn persist_intent(store: &IntentStore, intent: &Intent) -> Result<(),
     store.write(intent, durability).map_err(intent_error)?;
     failpoint(intent.phase);
     Ok(())
+}
+
+/// Preserves phase-table failpoint coverage for a phase normally coalesced
+/// into the next write-ahead record without adding an ordinary warm-path write.
+pub(crate) fn persist_intent_at_failpoint(
+    store: &IntentStore,
+    intent: &Intent,
+) -> Result<(), OcaError> {
+    if std::env::var("OCA_FAILPOINT").as_deref() == Ok(intent.phase.as_str()) {
+        persist_intent(store, intent)?;
+    }
+    Ok(())
+}
+
+/// Applies the phase failpoint after a caller has already persisted an intent
+/// as part of an atomic ref-ID reservation.
+pub(crate) fn intent_failpoint(intent: &Intent) {
+    failpoint(intent.phase);
 }
 
 pub(crate) fn remove_intent(store: &IntentStore, reference: &str) -> Result<(), OcaError> {
@@ -119,13 +137,7 @@ async fn reconcile_intent(
                     } else {
                         RefState::Running
                     };
-                    refs.patch(
-                        &intent.reference,
-                        RefPatch::default()
-                            .with_session_id(session_id)
-                            .with_last_state(state),
-                    )
-                    .map_err(|error| recovery_error(&intent.reference, error))?;
+                    patch_or_insert_ref(&refs, &intent, session_id, None, state)?;
                     if command == ReconcileCommand::Message {
                         remove_intent(&intents, &intent.reference)?;
                         return Ok(None);
@@ -137,26 +149,32 @@ async fn reconcile_intent(
             Ok(Some((intent.reference, ReconciledState::SessionCreated)))
         }
         IntentPhase::PromptUncertain => {
-            let landed = match prompt_landed(home, &intent).await {
-                Ok(landed) => landed,
-                Err(_) if command == ReconcileCommand::List => {
-                    return Ok(Some((intent.reference, ReconciledState::PromptUncertain)));
+            // A complete running ref is written only after prompt_async returns
+            // success. Coalesced intents can therefore accept that local proof;
+            // uncertain responses store Unknown and must use remote matching.
+            let landed = if ref_confirms_prompt_admission(&refs, &intent)? {
+                true
+            } else {
+                match prompt_landed(home, &intent).await {
+                    Ok(landed) => landed,
+                    Err(_) if command == ReconcileCommand::List => {
+                        return Ok(Some((intent.reference, ReconciledState::PromptUncertain)));
+                    }
+                    Err(error) => return Err(error),
                 }
-                Err(error) => return Err(error),
             };
             if landed {
                 let session_id =
                     required_intent(&intent, intent.session_id.as_deref(), "session id")?;
                 let message_id =
                     required_intent(&intent, intent.message_id.as_deref(), "message id")?;
-                refs.patch(
-                    &intent.reference,
-                    RefPatch::default()
-                        .with_session_id(session_id)
-                        .with_message_id(message_id)
-                        .with_last_state(RefState::Running),
-                )
-                .map_err(|error| recovery_error(&intent.reference, error))?;
+                patch_or_insert_ref(
+                    &refs,
+                    &intent,
+                    session_id,
+                    Some(message_id),
+                    RefState::Running,
+                )?;
                 intent.set_phase(IntentPhase::Running);
                 persist_intent(&intents, &intent)?;
                 return Ok(None);
@@ -165,11 +183,15 @@ async fn reconcile_intent(
             match command {
                 ReconcileCommand::Message => {
                     // This invocation is the explicit operator-authorized resend.
-                    refs.patch(
-                        &intent.reference,
-                        RefPatch::default().with_last_state(RefState::Idle),
-                    )
-                    .map_err(|error| recovery_error(&intent.reference, error))?;
+                    let session_id =
+                        required_intent(&intent, intent.session_id.as_deref(), "session id")?;
+                    patch_or_insert_ref(
+                        &refs,
+                        &intent,
+                        session_id,
+                        intent.message_id.as_deref(),
+                        RefState::Idle,
+                    )?;
                     remove_intent(&intents, &intent.reference)?;
                     Ok(None)
                 }
@@ -210,17 +232,78 @@ async fn reconcile_intent(
             if let (Some(session_id), Some(message_id)) =
                 (intent.session_id.as_deref(), intent.message_id.as_deref())
             {
-                refs.patch(
-                    &intent.reference,
-                    RefPatch::default()
-                        .with_session_id(session_id)
-                        .with_message_id(message_id)
-                        .with_last_state(RefState::Running),
-                )
-                .map_err(|error| recovery_error(&intent.reference, error))?;
+                patch_or_insert_ref(
+                    &refs,
+                    &intent,
+                    session_id,
+                    Some(message_id),
+                    RefState::Running,
+                )?;
             }
             Ok(None)
         }
+    }
+}
+
+fn ref_confirms_prompt_admission(refs: &RefStore, intent: &Intent) -> Result<bool, OcaError> {
+    let record = refs
+        .resolve(&intent.reference)
+        .map_err(|error| recovery_error(&intent.reference, error))?;
+    Ok(record.is_some_and(|record| {
+        record.last_state == Some(RefState::Running)
+            && intent.session_id.as_deref() == Some(record.session_id.as_str())
+            && intent.message_id.as_deref() == record.message_id.as_deref()
+    }))
+}
+
+fn patch_or_insert_ref(
+    refs: &RefStore,
+    intent: &Intent,
+    session_id: &str,
+    message_id: Option<&str>,
+    state: RefState,
+) -> Result<(), OcaError> {
+    if refs
+        .resolve(&intent.reference)
+        .map_err(|error| recovery_error(&intent.reference, error))?
+        .is_some()
+    {
+        let mut patch = RefPatch::default()
+            .with_session_id(session_id)
+            .with_last_state(state);
+        if let Some(message_id) = message_id {
+            patch = patch.with_message_id(message_id);
+        }
+        refs.patch(&intent.reference, patch)
+            .map(|_| ())
+            .map_err(|error| recovery_error(&intent.reference, error))
+    } else {
+        let requested = intent.requested.as_ref().ok_or_else(|| {
+            recovery_protocol(
+                &intent.reference,
+                &format!(
+                    "{} intent has no requested dispatch options",
+                    intent.phase.as_str()
+                ),
+            )
+        })?;
+        let mut new_ref = NewRef::for_session(session_id).with_control_metadata(
+            &requested.alias,
+            &requested.effort,
+            &requested.role,
+            &requested.cwd,
+            state,
+        );
+        if let Some(message_id) = message_id {
+            new_ref = new_ref.with_message_id(message_id);
+        }
+        new_ref = new_ref.with_repo(&requested.repo);
+        if let Some(spawner_tag) = &requested.spawner_tag {
+            new_ref = new_ref.with_spawner_tag(spawner_tag);
+        }
+        refs.insert_reserved(&intent.reference, new_ref)
+            .map(|_| ())
+            .map_err(|error| recovery_error(&intent.reference, error))
     }
 }
 

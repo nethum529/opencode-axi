@@ -19,13 +19,16 @@ use oca_opencode::{
 };
 use oca_server::{ConnectOrStart, SystemRuntime};
 use oca_state::{
-    Intent, IntentOperation, IntentPhase, IntentRequest, IntentStore, NewRef, OcaConfig, RefState,
-    RefStore, RefStorePaths,
+    Intent, IntentOperation, IntentPhase, IntentRequest, IntentStore, NewRef, OcaConfig,
+    PendingRefAllocation, RefState, RefStore, RefStorePaths,
 };
 
 use crate::{
     DispatchCommand,
-    crash_recovery::{RESERVED_SESSION_ID, persist_intent, prompt_sha256},
+    crash_recovery::{
+        RESERVED_SESSION_ID, intent_failpoint, persist_intent, persist_intent_at_failpoint,
+        prompt_sha256,
+    },
     scope::Scope,
     transport::{CreateSessionOperation, connect_error, open_code_error, prompt_error},
     worktree_dispatch::{WorktreeDispatch, finalize_turn},
@@ -131,6 +134,11 @@ pub(crate) struct ProductionBackend {
     dispatch_cwd: Option<PathBuf>,
 }
 
+pub(crate) enum PendingProductionRef {
+    Allocated(Box<PendingRefAllocation>),
+    Reserved(String),
+}
+
 impl ProductionBackend {
     fn new(
         manager: ConnectOrStart,
@@ -196,36 +204,44 @@ impl ProductionBackend {
 
 impl ForegroundBackend for ProductionBackend {
     type Subscription = Subscription;
-    type PendingRef = String;
+    type PendingRef = PendingProductionRef;
 
     fn prepare(&mut self, request: &mut ForegroundRequest) -> Result<(), OcaError> {
-        let reservation = self
-            .refs
-            .reserve(
-                NewRef::for_session(RESERVED_SESSION_ID)
-                    .with_control_metadata(
-                        &request.model.alias,
-                        &request.model.effort,
-                        &request.role,
-                        request.cwd.display().to_string(),
-                        RefState::Running,
-                    )
-                    .with_repo(&self.scope.repo)
-                    .with_spawner_tag(&self.scope.spawner_tag),
-            )
-            .map_err(|error| state_error("could not reserve dispatch ref", error))?;
         let requested = IntentRequest {
             alias: request.model.alias.clone(),
             effort: request.model.effort.clone(),
             role: request.role.clone(),
             cwd: request.cwd.display().to_string(),
             repo: self.scope.repo.clone(),
+            spawner_tag: Some(self.scope.spawner_tag.clone()),
             worktree: self.worktree.is_some(),
         };
-        let intent =
-            Intent::new(&reservation.id, IntentOperation::Dispatch).with_requested(requested);
-        persist_intent(&self.intents, &intent)?;
-        self.reference = Some(reservation.id);
+        let intent = if self.worktree.is_some() {
+            let reservation = self
+                .refs
+                .reserve(
+                    NewRef::for_session(RESERVED_SESSION_ID)
+                        .with_control_metadata(
+                            &request.model.alias,
+                            &request.model.effort,
+                            &request.role,
+                            request.cwd.display().to_string(),
+                            RefState::Running,
+                        )
+                        .with_repo(&self.scope.repo)
+                        .with_spawner_tag(&self.scope.spawner_tag),
+                )
+                .map_err(|error| state_error("could not reserve worktree ref", error))?;
+            Intent::new(&reservation.id, IntentOperation::Dispatch).with_requested(requested)
+        } else {
+            let intent = self
+                .refs
+                .reserve_intent(&self.intents, IntentOperation::Dispatch, requested)
+                .map_err(|error| state_error("could not reserve dispatch intent", error))?;
+            intent_failpoint(&intent);
+            intent
+        };
+        self.reference = Some(intent.reference.clone());
         self.intent = Some(intent);
         if let Some(worktree) = &mut self.worktree {
             let reference = self.reference.as_deref().expect("set above");
@@ -254,6 +270,10 @@ impl ForegroundBackend for ProductionBackend {
             )]),
             ..CreateSessionRequest::default()
         });
+        if self.worktree.is_some() {
+            let intent = self.intent.as_ref().expect("intent set during prepare");
+            persist_intent(&self.intents, intent)?;
+        }
         let session = match self
             .manager
             .connect_or_start(&self.runtime, &mut operation)
@@ -292,18 +312,7 @@ impl ForegroundBackend for ProductionBackend {
             intent.set_phase(IntentPhase::SessionCreated);
         }
         let intent = self.intent.as_ref().expect("intent set during prepare");
-        persist_intent(&self.intents, intent)?;
-        let reference = self.reference()?.to_owned();
-        if let Some(worktree) = &self.worktree {
-            worktree.record_session(&self.refs, &reference, &session.id)?;
-        } else {
-            self.refs
-                .patch(
-                    &reference,
-                    oca_state::RefPatch::default().with_session_id(&session.id),
-                )
-                .map_err(|error| state_error("could not store dispatch session", error))?;
-        }
+        persist_intent_at_failpoint(&self.intents, intent)?;
         Ok(session.id)
     }
 
@@ -366,23 +375,50 @@ impl ForegroundBackend for ProductionBackend {
                 let intent = self.intent_mut()?;
                 intent.set_phase(IntentPhase::Running);
                 let intent = self.intent.as_ref().expect("intent set during prepare");
-                persist_intent(&self.intents, intent)
+                persist_intent_at_failpoint(&self.intents, intent)
             }
             Err(error) => {
                 let error = prompt_error(error);
                 if error.code() == ErrorCode::PromptUncertain.as_str() {
                     let reference = self.reference()?.to_owned();
-                    self.refs
-                        .patch(
-                            &reference,
-                            oca_state::RefPatch::default()
-                                .with_session_id(session_id)
-                                .with_message_id(&prompt.message_id)
-                                .with_last_state(RefState::Unknown),
-                        )
-                        .map_err(|state| {
-                            state_error("could not mark uncertain prompt ref", state)
-                        })?;
+                    if self.worktree.is_some() {
+                        self.refs
+                            .patch(
+                                &reference,
+                                oca_state::RefPatch::default()
+                                    .with_session_id(session_id)
+                                    .with_message_id(&prompt.message_id)
+                                    .with_last_state(RefState::Unknown),
+                            )
+                            .map_err(|state| {
+                                state_error("could not mark uncertain prompt ref", state)
+                            })?;
+                    } else {
+                        let pending = self
+                            .refs
+                            .allocate_reserved(
+                                &reference,
+                                NewRef::for_session(session_id)
+                                    .with_message_id(&prompt.message_id)
+                                    .with_control_metadata(
+                                        &prompt.model.alias,
+                                        &prompt.model.effort,
+                                        &prompt.role,
+                                        self.dispatch_cwd
+                                            .as_deref()
+                                            .unwrap_or_else(|| Path::new("."))
+                                            .display()
+                                            .to_string(),
+                                        RefState::Unknown,
+                                    )
+                                    .with_repo(&self.scope.repo)
+                                    .with_spawner_tag(&self.scope.spawner_tag),
+                            )
+                            .map_err(|state| {
+                                state_error("could not preserve uncertain prompt ref", state)
+                            })?;
+                        drop(pending);
+                    }
                     Err(error.with_ref(reference))
                 } else {
                     let reference = self.reference()?.to_owned();
@@ -404,18 +440,27 @@ impl ForegroundBackend for ProductionBackend {
     ) -> Result<Self::PendingRef, OcaError> {
         let reference = self.reference()?.to_owned();
         if let Some(worktree) = &self.worktree {
-            worktree.finish_ref(&self.refs, &reference, session_id, message_id)
+            worktree
+                .finish_ref(&self.refs, &reference, session_id, message_id)
+                .map(PendingProductionRef::Reserved)
         } else {
             self.refs
-                .patch(
+                .allocate_reserved(
                     &reference,
-                    oca_state::RefPatch::default()
-                        .with_session_id(session_id)
+                    NewRef::for_session(session_id)
                         .with_message_id(message_id)
-                        .with_cwd(request.cwd.display().to_string())
-                        .with_last_state(RefState::Running),
+                        .with_control_metadata(
+                            &request.model.alias,
+                            &request.model.effort,
+                            &request.role,
+                            request.cwd.display().to_string(),
+                            RefState::Running,
+                        )
+                        .with_repo(&self.scope.repo)
+                        .with_spawner_tag(&self.scope.spawner_tag),
                 )
-                .map(|_| reference)
+                .map(Box::new)
+                .map(PendingProductionRef::Allocated)
                 .map_err(|error| state_error("could not complete dispatch ref", error))
         }
     }
@@ -426,13 +471,30 @@ impl ForegroundBackend for ProductionBackend {
         model: &ResolvedModel,
         json: bool,
     ) -> Result<String, OcaError> {
-        print_ack(&pending, model, json).map_err(io_error)?;
-        if self.post_ack_durability == PostAckDurability::Transfer {
-            self.refs
-                .transfer_directory_durability()
-                .map_err(|error| state_error("could not transfer ref durability", error))?;
+        let pending = match pending {
+            PendingProductionRef::Reserved(reference) => {
+                print_ack(&reference, model, json).map_err(io_error)?;
+                return Ok(reference);
+            }
+            PendingProductionRef::Allocated(pending) => *pending,
+        };
+        match self.post_ack_durability {
+            PostAckDurability::Complete => {
+                let completion = pending
+                    .acknowledge_with(|record| print_ack(&record.id, model, json))
+                    .map_err(io_error)?;
+                if let Some(warning) = completion.durability_warning() {
+                    eprintln!("warning: {warning}");
+                }
+                Ok(completion.record().id.clone())
+            }
+            PostAckDurability::Transfer => {
+                let reference = pending.record().id.clone();
+                print_ack(&reference, model, json).map_err(io_error)?;
+                drop(pending);
+                Ok(reference)
+            }
         }
-        Ok(pending)
     }
 
     fn spawn_attach(
