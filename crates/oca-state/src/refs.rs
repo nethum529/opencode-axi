@@ -82,6 +82,7 @@ pub struct NewRef {
     pub branch: Option<String>,
     pub commit: Option<String>,
     pub commit_subject: Option<String>,
+    pub display: Option<String>,
 }
 
 /// Store-level selection used by [`RefStore::list`].
@@ -217,6 +218,7 @@ impl NewRef {
             branch: None,
             commit: None,
             commit_subject: None,
+            display: None,
         }
     }
 
@@ -265,6 +267,13 @@ impl NewRef {
         self.worktree = Some(worktree.into());
         self.branch = Some(branch.into());
         self.commit_subject = Some(commit_subject.into());
+        self
+    }
+
+    /// Records the display mode selected for this dispatch.
+    #[must_use]
+    pub fn with_display(mut self, display: impl Into<String>) -> Self {
+        self.display = Some(display.into());
         self
     }
 }
@@ -825,7 +834,7 @@ impl RefStore {
             branch: new_ref.branch,
             commit: new_ref.commit,
             commit_subject: new_ref.commit_subject,
-            display: None,
+            display: new_ref.display,
             herdr_tab: None,
             tombstoned: false,
         }

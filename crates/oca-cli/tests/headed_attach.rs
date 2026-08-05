@@ -1,8 +1,10 @@
 use std::{
+    fs,
     io::{BufRead, Read, Write},
     net::{TcpListener, TcpStream},
+    os::unix::fs::PermissionsExt,
     os::unix::net::{UnixListener, UnixStream},
-    path::Path,
+    path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex, mpsc},
     thread,
@@ -20,7 +22,7 @@ fn headed_attach_records_and_closes_the_tab_after_terminal_state() {
     let calls = Arc::new(Mutex::new(Vec::new()));
     let herdr = spawn_herdr_lifecycle(&socket, Arc::clone(&calls));
     let (port, opencode) = spawn_attach_opencode();
-    prepare_attach_home(home.path(), &socket, port);
+    prepare_attach_home(home.path(), &socket, port, "herdr");
 
     let output = Command::new(env!("CARGO_BIN_EXE_oca"))
         .args(["__attach", "wabc12", "ses_target", "/worker"])
@@ -80,11 +82,10 @@ fn headed_attach_records_and_closes_the_tab_after_terminal_state() {
 }
 
 #[test]
-fn an_absent_herdr_socket_ends_the_attach_helper_quietly() {
+fn a_headless_ref_ends_the_attach_helper_quietly() {
     let home = tempfile::tempdir().unwrap();
-    // Never created, so discovery must decline rather than dial it.
     let socket = home.path().join("herdr-was-never-started.sock");
-    prepare_attach_home(home.path(), &socket, 1);
+    prepare_attach_home(home.path(), &socket, 1, "headless");
 
     let output = Command::new(env!("CARGO_BIN_EXE_oca"))
         .args(["__attach", "wabc12", "ses_target", "/worker"])
@@ -97,12 +98,112 @@ fn an_absent_herdr_socket_ends_the_attach_helper_quietly() {
     assert!(output.stdout.is_empty());
     assert!(
         output.stderr.is_empty(),
-        "an absent herdr is the normal headless case, not a warning: {}",
+        "headless display is not a warning: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let record = ref_store(home.path()).resolve("wabc12").unwrap().unwrap();
-    assert_eq!(record.display, None);
+    assert_eq!(record.display.as_deref(), Some("headless"));
     assert_eq!(record.herdr_tab, None);
+}
+
+#[test]
+fn explicit_headless_dispatch_never_calls_the_fake_herdr_socket() {
+    let home = tempfile::tempdir().unwrap();
+    let socket = home.path().join("fake-herdr.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (port, opencode) = spawn_foreground_opencode();
+    prepare_dispatch_home(home.path(), &socket, port);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["luna:h", "--headless", "skip", "display", "discovery"])
+        .env("HOME", home.path())
+        .env("TMUX", "fake-client")
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "dispatch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(matches!(
+        listener.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    let record = only_ref(home.path());
+    assert_eq!(record.display.as_deref(), Some("headless"));
+    opencode.join().unwrap();
+}
+
+#[test]
+fn no_herdr_and_no_tmux_is_a_silent_headless_http_dispatch() {
+    let home = tempfile::tempdir().unwrap();
+    let missing_socket = home.path().join("missing-herdr.sock");
+    let (port, opencode) = spawn_foreground_opencode();
+    prepare_dispatch_home(home.path(), &missing_socket, port);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["luna:h", "finish", "without", "a", "display"])
+        .env("HOME", home.path())
+        .env_remove("TMUX")
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "dispatch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("state: completed")
+    );
+    assert_eq!(only_ref(home.path()).display.as_deref(), Some("headless"));
+    opencode.join().unwrap();
+}
+
+#[test]
+fn no_herdr_inside_tmux_creates_and_cleans_up_a_ref_named_window() {
+    let home = tempfile::tempdir().unwrap();
+    let missing_socket = home.path().join("missing-herdr.sock");
+    let tmux = FakeTmux::new(home.path());
+    let (port, opencode) = spawn_tmux_foreground_opencode();
+    prepare_dispatch_home(home.path(), &missing_socket, port);
+    let path = prepend_path(home.path());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["luna:h", "finish", "inside", "tmux"])
+        .env("HOME", home.path())
+        .env("TMUX", "fake-client")
+        .env("PATH", path)
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "dispatch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record = only_ref(home.path());
+    assert_eq!(record.display.as_deref(), Some("tmux"));
+    opencode.join().unwrap();
+    let calls = tmux.wait_for_calls(2);
+    assert_eq!(
+        calls,
+        [
+            format!(
+                "new-window -d -n oca-{} -- opencode --session ses_target",
+                record.id
+            ),
+            format!("kill-window -t =oca-{}", record.id),
+        ]
+    );
 }
 
 #[test]
@@ -180,6 +281,7 @@ fn a_malformed_herdr_envelope_never_fails_the_dispatch() {
             .unwrap()
             .contains("state: completed")
     );
+    assert_eq!(only_ref(home.path()).display.as_deref(), Some("herdr"));
     opencode.join().unwrap();
     herdr.join().unwrap();
 }
@@ -303,6 +405,50 @@ fn spawn_foreground_opencode() -> (u16, thread::JoinHandle<()>) {
     (port, server)
 }
 
+fn spawn_tmux_foreground_opencode() -> (u16, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let mut message_id = None;
+        for _ in 0..6 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            if request.path.starts_with("/session?directory=") {
+                write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"{"id":"ses_target"}"#,
+                );
+            } else if request.path == "/event" {
+                write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    "text/event-stream",
+                    concat!(
+                        "id: evt_terminal\n",
+                        "event: session.idle\n",
+                        "data: {\"sessionID\":\"ses_target\"}\n\n"
+                    ),
+                );
+            } else if request.path == "/session/ses_target/prompt_async" {
+                message_id = request.body["messageID"].as_str().map(ToOwned::to_owned);
+                write_http_response(&mut stream, "204 No Content", "text/plain", "");
+            } else if request.path == "/session/ses_target/message" {
+                write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    &terminal_messages(message_id.as_deref().unwrap()),
+                );
+            } else {
+                panic!("unexpected OpenCode request path: {}", request.path);
+            }
+        }
+    });
+    (port, server)
+}
+
 fn terminal_messages(parent_id: &str) -> String {
     json!([{
         "info": {
@@ -320,7 +466,7 @@ fn terminal_messages(parent_id: &str) -> String {
     .to_string()
 }
 
-fn prepare_attach_home(home: &Path, socket: &Path, port: u16) {
+fn prepare_attach_home(home: &Path, socket: &Path, port: u16, display: &str) {
     prepare_dispatch_home(home, socket, port);
     ref_store(home)
         .insert(RefRecord {
@@ -338,7 +484,7 @@ fn prepare_attach_home(home: &Path, socket: &Path, port: u16) {
             branch: None,
             commit: None,
             commit_subject: None,
-            display: None,
+            display: Some(display.to_owned()),
             herdr_tab: None,
             tombstoned: false,
         })
@@ -363,6 +509,58 @@ fn prepare_dispatch_home(home: &Path, socket: &Path, port: u16) {
 
 fn ref_store(home: &Path) -> RefStore {
     RefStore::with_paths(RefStorePaths::in_directory(home.join(".oca")))
+}
+
+fn only_ref(home: &Path) -> RefRecord {
+    let refs = ref_store(home)
+        .list(&oca_state::RefListFilter::across_spawners_and_repos())
+        .unwrap();
+    assert_eq!(refs.len(), 1);
+    refs.into_iter().next().unwrap()
+}
+
+fn prepend_path(directory: &Path) -> std::ffi::OsString {
+    let mut paths = vec![directory.to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::env::join_paths(paths).unwrap()
+}
+
+struct FakeTmux {
+    log: PathBuf,
+}
+
+impl FakeTmux {
+    fn new(directory: &Path) -> Self {
+        let executable = directory.join("tmux");
+        let log = directory.join("tmux-calls");
+        fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&executable).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&executable, permissions).unwrap();
+        Self { log }
+    }
+
+    fn wait_for_calls(&self, expected: usize) -> Vec<String> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let calls = fs::read_to_string(&self.log)
+                .unwrap_or_default()
+                .lines()
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>();
+            if calls.len() >= expected {
+                return calls;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for fake tmux");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 struct HttpRequest {

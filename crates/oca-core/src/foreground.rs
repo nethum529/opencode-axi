@@ -5,8 +5,8 @@ use std::path::PathBuf;
 use serde_json::Value;
 
 use crate::{
-    OcaError, PermissionProfile, ReplyContract, ResolvedModel, RoleReply, WorkerPolicy,
-    decode_role_reply, validate_reply_floor,
+    DisplayMode, OcaError, PermissionProfile, ReplyContract, ResolvedModel, RoleReply,
+    WorkerPolicy, decode_role_reply, validate_reply_floor,
 };
 
 /// A fully locally-resolved foreground dispatch.
@@ -18,7 +18,7 @@ pub struct ForegroundRequest {
     pub contract: ReplyContract,
     pub policy: WorkerPolicy,
     pub cwd: PathBuf,
-    pub headless: bool,
+    pub display: DisplayMode,
     pub json: bool,
 }
 
@@ -110,7 +110,7 @@ pub trait ForegroundBackend {
         reference: &str,
         session_id: &str,
         cwd: &std::path::Path,
-        headless: bool,
+        display: DisplayMode,
     ) -> Result<(), OcaError>;
 
     /// Exactly one reconciliation pass after subscription and prompt
@@ -215,7 +215,7 @@ where
 
     // The helper cannot be spawned until the acknowledgement is emitted and
     // flushed by the backend's acknowledgement boundary.
-    backend.spawn_attach(&reference, &session_id, &request.cwd, request.headless)?;
+    backend.spawn_attach(&reference, &session_id, &request.cwd, request.display)?;
 
     Ok(StartedDispatch {
         request,
@@ -241,8 +241,9 @@ mod tests {
         DispatchPrompt, ForegroundBackend, ForegroundRequest, TerminalReply, run_foreground,
     };
     use crate::{
-        ErrorCode, MessageIdGenerator, ModelCatalog, OcaError, RANDOM_SUFFIX_WIDTH, ReplyContract,
-        ResolvedModel, RoleReply, WorkerPolicy, is_opencode_message_id, resolve_model,
+        DisplayMode, ErrorCode, MessageIdGenerator, ModelCatalog, OcaError, RANDOM_SUFFIX_WIDTH,
+        ReplyContract, ResolvedModel, RoleReply, WorkerPolicy, is_opencode_message_id,
+        resolve_model,
     };
 
     const REPLAY_PREVIOUS_ID: &str = "msg_f9a4a7900001AAAAAAAAAAAAAA";
@@ -343,7 +344,7 @@ mod tests {
             _reference: &str,
             _session_id: &str,
             _cwd: &std::path::Path,
-            _headless: bool,
+            _display: DisplayMode,
         ) -> Result<(), OcaError> {
             Ok(())
         }
@@ -497,7 +498,7 @@ mod tests {
             _reference: &str,
             _session_id: &str,
             _cwd: &std::path::Path,
-            _headless: bool,
+            _display: DisplayMode,
         ) -> Result<(), OcaError> {
             self.calls.push("spawn");
             assert_eq!(self.calls[self.calls.len() - 2], "ack");
@@ -636,7 +637,7 @@ mod tests {
             contract: ReplyContract::Impl,
             policy: WorkerPolicy::restricted([cwd.clone()]),
             cwd,
-            headless: false,
+            display: DisplayMode::Herdr,
             json: false,
         }
     }

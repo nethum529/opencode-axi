@@ -91,6 +91,7 @@ fn end_to_end_foreground_has_one_turn_one_terminal_and_one_golden_final_result()
     assert_eq!(refs[0]["role"], "impl");
     assert_eq!(refs[0]["cwd"], home.path().display().to_string());
     assert_eq!(refs[0]["last_state"], "done");
+    assert_eq!(refs[0]["display"], "headless");
 }
 
 fn serve_foreground(listener: TcpListener) -> Vec<CapturedRequest> {
