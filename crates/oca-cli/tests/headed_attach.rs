@@ -311,7 +311,9 @@ fn terminal_messages(parent_id: &str) -> String {
             "role": "assistant",
             "parentID": parent_id,
             "time": {"created":1,"completed":2},
-            "structured": {"status":"done","files":[],"note":"Done."}
+            // Long enough to clear T27a's per-role reply floor, so this fixture
+            // stays valid once the floor lands on the integration branch.
+            "structured": {"status":"done","files":[],"note":"Implemented the requested change and verified it end to end against the fake server fixture. All assertions pass, no regressions were observed, and the worker finished with no outstanding follow-up work."}
         },
         "parts": []
     }])
