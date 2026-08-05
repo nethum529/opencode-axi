@@ -589,11 +589,12 @@ fn live_oca_follow_exit_gate_records_pre_t24_blocker_and_server_loss() {
 
 #[test]
 #[ignore = "requires OCA_LIVE=1 and measures a real OpenCode server"]
-fn live_warm_headless_ack_p95_is_measured_against_ten_millisecond_gate() {
+fn live_warm_headless_ack_p95_is_under_backstop_and_recorded() {
     let _guard = live_guard();
     let server = LiveServer::start(false);
     const WARMUP: usize = 3;
     const SAMPLES: usize = 20;
+    const BACKSTOP: Duration = Duration::from_millis(250);
 
     for _ in 0..WARMUP {
         let sample = server.timed_background_ack();
@@ -619,12 +620,16 @@ fn live_warm_headless_ack_p95_is_measured_against_ten_millisecond_gate() {
             .collect::<Vec<_>>()
     );
     eprintln!(
-        "LIVE warm gate result: {} (limit <10ms; T24 investigation remains open)",
-        if p95 < Duration::from_millis(10) {
-            "PASS"
-        } else {
-            "FAIL/OPEN"
-        }
+        "LIVE warm backstop result: {} (p95={:.3}ms; limit <{}ms)",
+        if p95 < BACKSTOP { "PASS" } else { "FAIL" },
+        milliseconds(p95),
+        BACKSTOP.as_millis()
+    );
+    assert!(
+        p95 < BACKSTOP,
+        "live warm headless acknowledgement p95 {:.3}ms must remain under the {}ms backstop",
+        milliseconds(p95),
+        BACKSTOP.as_millis()
     );
 }
 

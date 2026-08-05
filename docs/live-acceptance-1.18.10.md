@@ -16,6 +16,60 @@ The fixture starts and kills an OpenCode server for each test. Each server recei
 `HOME`, XDG directories, repository, `.oca` state directory, configuration, and copied OpenCode
 credentials. The invoking user's `~/.oca` is never read or written.
 
+## Merged-head follow-up — 573b8a1
+
+This follow-up was run after both T24 (`ef1e9e6`) and T29 (`573b8a1`) were merged. The historical
+release run below is retained as the pre-T24 baseline; this section is the authoritative disposition
+of its OPEN items on the merged head. The suite included the follow-up live warm assertion, but no
+other live test shape was changed.
+
+The full serial live suite passed all 12 tests in 149.23 seconds on Linux with OpenCode 1.18.10 and
+herdr 0.7.5. The fixture again used an isolated temporary `HOME` for each server. The pinned follow
+probe reproduced the same HTTP 400 schema-history failure containing
+`Expected OutputFormatJsonSchema`; its blocker assertions remain intact.
+
+| Merged-head verification command | Result |
+|---|---|
+| `OCA_LIVE=1 cargo test -p oca-cli --test live_acceptance -- --ignored --nocapture --test-threads=1` | PASS — 12 passed, 0 failed; 149.23 s |
+| `cargo fmt --all --check` | PASS |
+| `cargo clippy --workspace --all-targets -- -D warnings` | PASS |
+| `cargo test --workspace` | PASS on the complete rerun; both named flakes passed. An earlier loaded run put the hermetic warm p95 at 10.002 ms, after which the required quiet solo rerun passed at 8.914 ms and the complete workspace rerun passed. |
+| `cargo xtask check-drift` | PASS |
+| `npm run check:plugin-runtime` | PASS |
+
+### Previous OPEN-item disposition
+
+| Previous OPEN item | Merged-head disposition | Evidence or exact remaining blocker |
+|---|---|---|
+| Detached production herdr tab cleanup | **REMAINS OPEN** | T24 is merged, but `live_queue_runs_after_turn_and_abort_reaches_terminal_for_tab_close` still creates the real tab directly and explicitly calls `close_tab` after observing the abort boundary. The run proves real herdr creation, abort, terminal observation, and explicit close; it does not launch and wait for the production `oca __attach` helper to close the real tab automatically. The fake-herdr subprocess test `headed_attach_records_and_closes_the_tab_after_terminal_state` covers that production path hermetically, not live. |
+| Live `oca k` headed-tab cleanup | **REMAINS PARTIAL/OPEN** | `oca k` was accepted and the real session reached an idle terminal event, but the same explicit fixture close leaves production-helper-driven cleanup unproved live. |
+| `oca f` done exit | **REMAINS OPEN** | T24's absence is no longer a blocker. OpenCode 1.18.10 still returns HTTP 400 while reading schema-bearing message history (`Expected OutputFormatJsonSchema`) before the pinned live probe can classify a done terminal result. |
+| `oca f` blocked exit | **REMAINS OPEN** | Same schema-history HTTP 400 blocks the terminal classification path before a blocked exit can be measured. |
+| `oca f` timeout exit | **REMAINS OPEN** | The pinned end-to-end follow-exit probe remains collectively blocked at schema-bearing history reconciliation, so this release run does not claim a live timeout exit. |
+| `oca f` server-loss exit | **CLOSED** | The merged-head live probe again exited 5 and emitted `server_unreachable`. |
+| Killed follow leaves the worker recoverable | **CLOSED** | T24's intent/cursor reconciliation implementation is merged, and the complete offline gate passed `oca_core::follow::tests::killed_follow_resumes_from_the_durable_event_cursor`. The live suite does not inject a process kill, but the previous OPEN reason—T24 being absent—is resolved by deterministic crash-recovery coverage. |
+| Live warm acknowledgement `<10 ms` | **CLOSED BY SCOPE RULING** | The 10 ms limit now governs OCA-only overhead in `warm_path_gate`. Live end-to-end acknowledgement instead has an asserted `<250 ms` p95 backstop. This run measured p50 40.137 ms and p95 84.585 ms, so the new live criterion passed. |
+| macOS release platform | **REMAINS OPEN** | This run was Linux-only; no macOS machine or runner was available. |
+| Live `oca s` steer | **REMAINS SUPERSEDED** | Issue #18 retired `oca s` after OpenCode accepted but discarded cross-pipeline steer. The merged-head retired spelling still exits 2 with `invalid_model`. |
+| Schema-bearing live behavior matches pinned recordings | **REMAINS PARTIAL/OPEN** | Variant, permission, SSE, replay, queue, abort, and server-loss behavior matched; OpenCode 1.18.10 message history still rejects `OutputFormatJsonSchema`, so follow compatibility remains incomplete. |
+
+### Merged-head live measurements
+
+The warm timer still begins before spawning `oca` and ends after reading the acknowledgement's
+first line; `--headless` disables attachment. Three warm-ups were excluded. The 20 sorted measured
+samples were:
+
+```text
+36.929, 37.255, 37.594, 37.876, 38.098, 38.447, 38.984, 39.019, 39.331, 40.132,
+40.137, 40.624, 41.427, 41.813, 42.918, 43.371, 47.093, 55.815, 84.585, 224.180
+```
+
+Result: p50 40.137 ms; p95 84.585 ms; asserted `<250 ms` live backstop PASS.
+
+The repeated DeepSeek measurement again found no reliable behavioral difference: all 16 answers
+were correct, `high` mean reasoning tokens were 140.9, `max` mean reasoning tokens were 154.0, and
+the exact permutation p-value was 0.6715.
+
 The Linux run passed all 12 executable tests in 116.15 seconds. A passing test can still record an
 explicitly OPEN release criterion; the suite is intended to preserve measured facts without
 hiding unavailable platforms, pre-T24 gaps, or server behavior that misses a target.
