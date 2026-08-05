@@ -64,6 +64,7 @@ pub struct RefListFilter {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RefPatch {
     pub session_id: Option<String>,
+    pub message_id: Option<String>,
     pub repo: Option<String>,
     pub spawner_tag: Option<String>,
 }
@@ -72,6 +73,12 @@ impl RefPatch {
     #[must_use]
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_message_id(mut self, message_id: impl Into<String>) -> Self {
+        self.message_id = Some(message_id.into());
         self
     }
 
@@ -550,6 +557,9 @@ impl RefStore {
                 .ok_or_else(|| RefStoreError::RefNotFound(id.to_owned()))?;
             if let Some(session_id) = patch.session_id {
                 record.session_id = session_id;
+            }
+            if let Some(message_id) = patch.message_id {
+                record.message_id = Some(message_id);
             }
             if let Some(repo) = patch.repo {
                 record.repo = Some(repo);

@@ -6,8 +6,10 @@ use oca_core::{
 };
 use oca_state::OcaConfig;
 
+mod follow;
 mod foreground;
 
+pub use follow::{FollowCommandOutput, execute_follow};
 pub use foreground::execute_foreground;
 
 /// The fixed command grammar accepted by `oca`.
@@ -93,6 +95,8 @@ pub enum AgentFlag {
     Count,
     /// Start event output at a cursor.
     Since,
+    /// Bound a parked follow in seconds.
+    Timeout,
 }
 
 /// One accepted option spelling and executable examples of its use.
@@ -323,13 +327,24 @@ const QUEUE_FLAGS: &[FlagGrammar] = &[FlagGrammar {
     argv_examples: &[&["oca", "q", "w4f2a1", "--json", "queue", "json"]],
 }];
 
-const FOLLOW_EXAMPLES: &[&[&str]] = &[&["oca", "f", "w4f2a1"]];
-const FOLLOW_FLAGS: &[FlagGrammar] = &[FlagGrammar {
-    kind: AgentFlag::Json,
-    spellings: &["--json"],
-    value: FlagValueForm::None,
-    argv_examples: &[&["oca", "f", "w4f2a1", "--json"]],
-}];
+const FOLLOW_EXAMPLES: &[&[&str]] = &[&["oca", "f", "w4f2a1"], &["oca", "f", "w4f2a1", "-t", "30"]];
+const FOLLOW_FLAGS: &[FlagGrammar] = &[
+    FlagGrammar {
+        kind: AgentFlag::Timeout,
+        spellings: &["-t"],
+        value: FlagValueForm::Required {
+            placeholder: "<seconds>",
+            accepted_values: &[],
+        },
+        argv_examples: &[&["oca", "f", "w4f2a1", "-t", "30"]],
+    },
+    FlagGrammar {
+        kind: AgentFlag::Json,
+        spellings: &["--json"],
+        value: FlagValueForm::None,
+        argv_examples: &[&["oca", "f", "w4f2a1", "--json"]],
+    },
+];
 
 const ABORT_EXAMPLES: &[&[&str]] = &[&["oca", "k", "w4f2a1"]];
 const ABORT_FLAGS: &[FlagGrammar] = &[FlagGrammar {
@@ -550,6 +565,7 @@ pub struct MessageCommand {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FollowCommand {
     pub reference: String,
+    pub timeout_seconds: Option<u64>,
     pub json: bool,
 }
 
@@ -830,9 +846,34 @@ fn is_effort_form(value: &str) -> bool {
 
 fn parse_follow(arguments: &[String]) -> Result<FollowCommand, OcaError> {
     let (reference, tail) = required_reference(arguments)?;
+    let mut timeout_seconds = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < tail.len() {
+        match tail[index].as_str() {
+            "--json" => json = true,
+            "-t" => {
+                index += 1;
+                let Some(value) = tail.get(index) else {
+                    return Err(usage("`-t` requires a timeout in seconds"));
+                };
+                let seconds = value
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|seconds| *seconds > 0)
+                    .ok_or_else(|| usage("`-t` must be a positive integer number of seconds"))?;
+                if timeout_seconds.replace(seconds).is_some() {
+                    return Err(usage("`-t` was provided more than once"));
+                }
+            }
+            unknown => return Err(usage(format!("unknown flag `{unknown}` for `f`"))),
+        }
+        index += 1;
+    }
     Ok(FollowCommand {
         reference: reference.to_owned(),
-        json: parse_json_only(tail)?,
+        timeout_seconds,
+        json,
     })
 }
 
@@ -989,6 +1030,7 @@ mod tests {
             parse_from(["oca", "f", "wabc12", "--json"]).unwrap(),
             Command::Follow(FollowCommand {
                 reference: "wabc12".to_owned(),
+                timeout_seconds: None,
                 json: true,
             }),
         );
@@ -1021,6 +1063,29 @@ mod tests {
                 json: false,
             }),
         );
+    }
+
+    #[test]
+    fn follow_timeout_is_typed_and_validated_locally() {
+        assert_eq!(
+            parse_from(["oca", "f", "wabc12", "-t", "30"]).unwrap(),
+            Command::Follow(FollowCommand {
+                reference: "wabc12".to_owned(),
+                timeout_seconds: Some(30),
+                json: false,
+            })
+        );
+        for arguments in [
+            vec!["oca", "f", "wabc12", "-t"],
+            vec!["oca", "f", "wabc12", "-t", "0"],
+            vec!["oca", "f", "wabc12", "-t", "seconds"],
+            vec!["oca", "f", "wabc12", "-t", "1", "-t", "2"],
+        ] {
+            assert_eq!(
+                parse_from(arguments).unwrap_err().code_kind(),
+                ErrorCode::Usage
+            );
+        }
     }
 
     #[test]

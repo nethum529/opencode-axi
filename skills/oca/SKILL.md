@@ -16,7 +16,7 @@ Construct commands only from this parser-owned surface:
     oca <alias> -e <effort> [--json] [-r|--role <role>] [-w|--worktree] [--headless] <prompt...>
     oca m <ref> [--json] [-e|--effort <effort>] <message...>
     oca q <ref> [--json] <message...>
-    oca f <ref> [--json]
+    oca f <ref> [-t <seconds>] [--json]
     oca k <ref> [--json]
     oca ls [--all] [--blocked] [--count] [--json]
     oca events <ref> [--since <non-negative-integer>] [--json]

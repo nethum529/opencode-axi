@@ -11,6 +11,7 @@ use std::{fmt, future::Future};
 
 mod dispatch;
 mod facade;
+mod follow;
 #[allow(clippy::all, dead_code, renamed_and_removed_lints)]
 mod generated;
 
@@ -20,6 +21,7 @@ pub use facade::{
     OpenCodeClient, OpenCodeError, PromptAccepted, PromptRequest, Session, SessionId, Subscription,
     TextPart,
 };
+pub use follow::{adapt_message, adapt_sse_event};
 
 /// A parsed server-sent event frame.
 #[derive(Debug, Clone, PartialEq, Eq)]

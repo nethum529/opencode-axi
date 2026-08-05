@@ -14,34 +14,50 @@ fn main() -> ExitCode {
                 .with_error("could not determine the home directory")
                 .with_help("set the HOME environment variable and retry")
         })
-        .and_then(|home| {
-            let command = oca_cli::parse_from_home(arguments, &home)?;
-            match command {
-                oca_cli::Command::Dispatch(command) => {
-                    tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .map_err(|error| {
-                            oca_core::OcaError::new(oca_core::ErrorCode::ServerUnavailable)
-                                .with_error(format!("could not start async runtime: {error}"))
-                        })?
-                        .block_on(oca_cli::execute_foreground(command, home))
-                }
-                _ => Ok(()),
-            }
-        });
+        .and_then(|home| oca_cli::parse_from_home(arguments, &home).map(|command| (home, command)));
 
     match result {
-        Ok(_) => ExitCode::SUCCESS,
-        Err(error) => {
-            if json {
-                eprintln!("{}", error.to_json());
-            } else {
-                eprint!("{}", error.render_failure());
+        Ok((home, oca_cli::Command::Dispatch(command))) => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    oca_core::OcaError::new(oca_core::ErrorCode::ServerUnavailable)
+                        .with_error(format!("could not start async runtime: {error}"))
+                });
+            match runtime {
+                Ok(runtime) => match runtime.block_on(oca_cli::execute_foreground(command, home)) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(error) => render_error(&error, json),
+                },
+                Err(error) => render_error(&error, json),
             }
-            ExitCode::from(u8::try_from(error.exit_code()).unwrap_or(1))
         }
+        Ok((home, oca_cli::Command::Follow(command))) => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("the current-thread runtime must initialize");
+            match runtime.block_on(oca_cli::execute_follow(&command, home)) {
+                Ok(output) => {
+                    print!("{}", output.stdout);
+                    ExitCode::from(u8::try_from(output.exit.code()).unwrap_or(1))
+                }
+                Err(error) => render_error(&error, json),
+            }
+        }
+        Ok(_) => ExitCode::SUCCESS,
+        Err(error) => render_error(&error, json),
     }
+}
+
+fn render_error(error: &oca_core::OcaError, json: bool) -> ExitCode {
+    if json {
+        eprintln!("{}", error.to_json());
+    } else {
+        eprint!("{}", error.render_failure());
+    }
+    ExitCode::from(u8::try_from(error.exit_code()).unwrap_or(1))
 }
 
 fn home_directory() -> Option<std::path::PathBuf> {
