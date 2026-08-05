@@ -14,9 +14,11 @@ use std::{
 
 mod commit;
 mod publish;
+mod recovery;
 
 pub use commit::{CommitRecord, TaskSummary, commit};
 pub use publish::{PublishRepository, branch_matches, is_protected_branch};
+pub use recovery::cleanup_orphaned_worktree;
 
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
 const DEFAULT_LOCK_ACQUISITION_TIMEOUT: Duration = Duration::from_secs(10);

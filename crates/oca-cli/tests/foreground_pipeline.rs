@@ -6,6 +6,7 @@ use std::{
 };
 
 use oca_core::is_opencode_message_id;
+use oca_state::IntentStore;
 use serde_json::{Value, json};
 
 struct CapturedRequest {
@@ -91,6 +92,10 @@ fn end_to_end_foreground_has_one_turn_one_terminal_and_one_golden_final_result()
     assert_eq!(refs[0]["role"], "impl");
     assert_eq!(refs[0]["cwd"], home.path().display().to_string());
     assert_eq!(refs[0]["last_state"], "done");
+    assert!(
+        IntentStore::in_directory(&state).list().unwrap().is_empty(),
+        "a clean terminal dispatch leaves no orphaned intent"
+    );
 }
 
 fn serve_foreground(listener: TcpListener) -> Vec<CapturedRequest> {

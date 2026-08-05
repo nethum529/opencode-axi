@@ -5,10 +5,15 @@ use std::{fs, path::Path};
 use oca_core::{EffortInput, ErrorCode, OcaError, resolve_model};
 use oca_display::Acknowledgement;
 use oca_git::{GitError, PublishRepository, branch_matches, is_protected_branch};
-use oca_state::{OcaConfig, RefRecord, RefStore, RefStorePaths};
+use oca_state::{
+    Intent, IntentOperation, IntentPhase, IntentStore, OcaConfig, RefRecord, RefStore,
+    RefStorePaths,
+};
+use sha2::{Digest, Sha256};
 
 use crate::{
     RefCommand,
+    crash_recovery::{persist_intent, remove_intent},
     pull_request::{GitHubProvider, ProviderError, PullRequestDraft, PullRequestProvider},
 };
 
@@ -64,6 +69,17 @@ fn execute(
         .ok_or_else(|| OcaError::new(ErrorCode::UnknownRef).with_ref(&command.reference))?;
     if record.tombstoned {
         return Err(OcaError::new(ErrorCode::SessionNotFound).with_ref(&command.reference));
+    }
+    let intents = IntentStore::in_directory(home.join(".oca"));
+    if intents
+        .read(&command.reference)
+        .map_err(|error| publish_error(&command.reference, error.to_string()))?
+        .is_some_and(|intent| intent.phase == IntentPhase::PublishedUncertain)
+    {
+        return Err(publish_error(
+            &command.reference,
+            "publication outcome is uncertain; inspect the remote or provider before clearing the intent",
+        ));
     }
 
     // Publish grant evaluation step 1: resolve and canonicalize the ref's repository root.
@@ -124,6 +140,32 @@ fn execute(
         .require_clean()
         .map_err(|error| git_error(&command.reference, error))?;
 
+    let operation = match kind {
+        PublishKind::Push => IntentOperation::Push,
+        PublishKind::PullRequest => IntentOperation::PullRequest,
+    };
+    let mut intent = Intent::new(&command.reference, operation);
+    intent.session_id = Some(record.session_id.clone());
+    intent.commit_id = record.commit.clone();
+    intent.remote_fingerprint = Some(format!(
+        "{:x}",
+        Sha256::digest(
+            format!(
+                "{}\0{}\0{}\0{}",
+                match kind {
+                    PublishKind::Push => "push",
+                    PublishKind::PullRequest => "pull_request",
+                },
+                settings.remote,
+                branch,
+                record.commit.as_deref().unwrap_or("")
+            )
+            .as_bytes()
+        )
+    ));
+    intent.set_phase(IntentPhase::PublishedUncertain);
+    persist_intent(&intents, &intent)?;
+
     match kind {
         PublishKind::Push => repository
             .push_branch(&settings.remote, branch)
@@ -140,6 +182,7 @@ fn execute(
             open_pull_request(&record, worktree, branch, &settings.base, provider)?;
         }
     }
+    remove_intent(&intents, &command.reference)?;
 
     let state = match kind {
         PublishKind::Push => "pushed",
@@ -229,7 +272,9 @@ mod tests {
 
     use oca_core::{ErrorCode, ImplReply, RoleReply, WorkerState};
     use oca_git::GitError;
-    use oca_state::{RefRecord, RefStore, RefStorePaths};
+    use oca_state::{
+        Intent, IntentOperation, IntentPhase, IntentStore, RefRecord, RefStore, RefStorePaths,
+    };
 
     use crate::{
         RefCommand,
@@ -478,6 +523,13 @@ mod tests {
             &mut provider,
         )
         .unwrap();
+        assert!(
+            IntentStore::in_directory(home.path().join(".oca"))
+                .list()
+                .unwrap()
+                .is_empty(),
+            "a settled publication leaves no intent"
+        );
         let first_remote_oid = remote_oid(&repository, "oca/w00001").unwrap();
         assert_eq!(provider.create_calls.len(), 1);
 
@@ -501,6 +553,36 @@ mod tests {
             Some(first_remote_oid.as_str()),
             "an existing remote branch is not pushed again"
         );
+    }
+
+    #[test]
+    fn published_uncertain_fences_every_follow_up_push_and_provider_request() {
+        let repository = TestRepository::new("oca/w00001");
+        let home = tempfile::tempdir().unwrap();
+        insert_ref(home.path(), &repository, "oca/w00001");
+        write_config(
+            home.path(),
+            "[publish]\npush = true\npr = true\nbranches = \"oca/*\"\nremote = \"origin\"\n",
+        );
+        let mut intent = Intent::new("w00001", IntentOperation::PullRequest);
+        intent.remote_fingerprint = Some("simulated-mid-publish-crash".to_owned());
+        intent.set_phase(IntentPhase::PublishedUncertain);
+        IntentStore::in_directory(home.path().join(".oca"))
+            .write(&intent)
+            .unwrap();
+        let mut provider = RecordingProvider::default();
+
+        let error = execute(
+            &command(),
+            home.path(),
+            PublishKind::PullRequest,
+            &mut provider,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code(), ErrorCode::PublishFailed.as_str());
+        assert!(provider.create_calls.is_empty());
+        assert!(remote_oid(&repository, "oca/w00001").is_none());
     }
 
     fn command() -> RefCommand {

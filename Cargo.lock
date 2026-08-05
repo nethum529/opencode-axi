@@ -785,6 +785,7 @@ dependencies = [
  "fs2",
  "libc",
  "oca-core",
+ "tempfile",
  "windows-sys 0.61.2",
 ]
 

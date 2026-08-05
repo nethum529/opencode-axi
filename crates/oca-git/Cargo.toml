@@ -8,6 +8,9 @@ rust-version.workspace = true
 fs2 = "0.4.3"
 oca-core = { path = "../oca-core" }
 
+[dev-dependencies]
+tempfile = "3.23"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.189"
 

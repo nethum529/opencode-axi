@@ -1,6 +1,6 @@
 //! Single-snapshot implementation of the `oca ls` fleet inbox.
 
-use std::{cmp::Ordering, path::Path, time::Duration};
+use std::{cmp::Ordering, collections::HashMap, path::Path, time::Duration};
 
 use oca_core::{ErrorCode, OcaError};
 use oca_display::{ListDocument, ListItem};
@@ -9,7 +9,11 @@ use oca_state::{
     prune_expired_journals,
 };
 
-use crate::{ListCommand, scope::Scope};
+use crate::{
+    ListCommand,
+    crash_recovery::{ReconciledState, reconcile_for_list},
+    scope::Scope,
+};
 
 const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 
@@ -20,16 +24,21 @@ const SECONDS_PER_DAY: u64 = 24 * 60 * 60;
 /// # Errors
 ///
 /// Returns a stable configuration, state, journal, or scope error.
-pub fn execute_list(command: &ListCommand, home: impl AsRef<Path>) -> Result<String, OcaError> {
+pub async fn execute_list(
+    command: &ListCommand,
+    home: impl AsRef<Path>,
+) -> Result<String, OcaError> {
     let cwd = std::env::current_dir().map_err(runtime_error)?;
     let scope = crate::scope::current(home.as_ref(), &cwd).map_err(runtime_error)?;
-    execute_list_with_scope(command, home.as_ref(), &scope)
+    let reconciled = reconcile_for_list(home.as_ref()).await?;
+    execute_list_with_scope(command, home.as_ref(), &scope, &reconciled)
 }
 
 fn execute_list_with_scope(
     command: &ListCommand,
     home: &Path,
     scope: &Scope,
+    reconciled: &[(String, ReconciledState)],
 ) -> Result<String, OcaError> {
     let state_directory = home.join(".oca");
     let config = OcaConfig::load_from_home(home).map_err(|error| {
@@ -56,9 +65,10 @@ fn execute_list_with_scope(
     let records = store
         .list(&filter)
         .map_err(|error| runtime_error(error.to_string()))?;
+    let overrides = reconciled.iter().cloned().collect::<HashMap<_, _>>();
     let mut workers = records
         .into_iter()
-        .map(worker_from_record)
+        .map(|record| worker_from_record(record, &overrides))
         .collect::<Vec<_>>();
     if command.blocked {
         workers.retain(|worker| worker.state == ListState::Blocked);
@@ -88,6 +98,10 @@ fn retention(days: u16) -> Duration {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum ListState {
     Blocked,
+    PromptUncertain,
+    PublishedUncertain,
+    SessionCreated,
+    TerminalObserved,
     Running,
     Unknown,
     Partial,
@@ -100,16 +114,21 @@ impl ListState {
     const fn rank(self) -> u8 {
         match self {
             Self::Blocked => 0,
-            Self::Running | Self::Unknown => 1,
-            Self::Partial => 2,
-            Self::Done | Self::Idle => 3,
-            Self::Aborted => 4,
+            Self::PromptUncertain | Self::PublishedUncertain => 1,
+            Self::SessionCreated | Self::Running | Self::Unknown | Self::TerminalObserved => 2,
+            Self::Partial => 3,
+            Self::Done | Self::Idle => 4,
+            Self::Aborted => 5,
         }
     }
 
     const fn as_str(self) -> &'static str {
         match self {
             Self::Blocked => "blocked",
+            Self::PromptUncertain => "prompt_uncertain",
+            Self::PublishedUncertain => "published_uncertain",
+            Self::SessionCreated => "session_created",
+            Self::TerminalObserved => "terminal_observed",
             Self::Running => "running",
             Self::Unknown => "unknown",
             Self::Partial => "partial",
@@ -149,10 +168,17 @@ impl Worker {
     }
 }
 
-fn worker_from_record(record: RefRecord) -> Worker {
+fn worker_from_record(record: RefRecord, overrides: &HashMap<String, ReconciledState>) -> Worker {
+    let state = match overrides.get(&record.id) {
+        Some(ReconciledState::PromptUncertain) => ListState::PromptUncertain,
+        Some(ReconciledState::PublishedUncertain) => ListState::PublishedUncertain,
+        Some(ReconciledState::SessionCreated) => ListState::SessionCreated,
+        Some(ReconciledState::TerminalObserved) => ListState::TerminalObserved,
+        None => record.last_state.into(),
+    };
     Worker {
         reference: record.id,
-        state: record.last_state.into(),
+        state,
     }
 }
 
@@ -210,6 +236,7 @@ mod tests {
             },
             home.path(),
             &scope,
+            &[],
         )
         .unwrap();
         assert_eq!(
@@ -253,6 +280,7 @@ mod tests {
             },
             home.path(),
             &selected,
+            &[],
         )
         .unwrap();
         assert_eq!(count.as_bytes(), b"1", "count has no newline or decoration");
@@ -265,6 +293,7 @@ mod tests {
             },
             home.path(),
             &selected,
+            &[],
         )
         .unwrap();
         assert_eq!(all.as_bytes(), b"3");

@@ -128,6 +128,12 @@ pub trait ForegroundBackend {
         message_id: &str,
     ) -> Result<TerminalReply, OcaError>;
 
+    /// Persists that an attributed terminal boundary was observed before reply
+    /// decoding or validation begins.
+    fn terminal_observed(&mut self, _reference: &str) -> Result<(), OcaError> {
+        Ok(())
+    }
+
     /// Tool-owned finalization. This is reached only after structural decode.
     fn finalize(&mut self, reference: &str, reply: &RoleReply) -> Result<(), OcaError>;
 
@@ -169,6 +175,8 @@ where
                 .await?
         }
     };
+
+    backend.terminal_observed(&started.reference)?;
 
     let reply = decode_role_reply(started.request.contract, terminal.structured)?;
     validate_reply_floor(&reply)?;

@@ -616,6 +616,40 @@ impl RefStore {
         })
     }
 
+    /// Transfers a post-acknowledgement directory sync to the next store entrant.
+    ///
+    /// Pre-reserved intent-backed dispatches use this to preserve the same
+    /// background acknowledgement contract as deferred allocations.
+    pub fn transfer_directory_durability(&self) -> Result<(), RefStoreError> {
+        let mut locked = self.lock_and_read_records()?;
+        mark_directory_sync_pending(&mut locked.lock).map_err(|source| RefStoreError::Io {
+            path: self.paths.lock_file.clone(),
+            source,
+        })?;
+        FileExt::unlock(&locked.lock).map_err(|source| RefStoreError::Io {
+            path: self.paths.lock_file.clone(),
+            source,
+        })
+    }
+
+    /// Removes a reservation that was never acknowledged with a message id.
+    ///
+    /// This is restricted to pre-ack records so active and historical refs
+    /// cannot be deleted through the recovery cleanup path.
+    pub fn discard_unacknowledged(&self, id: &str) -> Result<(), RefStoreError> {
+        self.with_locked_records(|records| {
+            let index = records
+                .iter()
+                .position(|record| record.id == id)
+                .ok_or_else(|| RefStoreError::RefNotFound(id.to_owned()))?;
+            if records[index].message_id.is_some() {
+                return Err(RefStoreError::RefAlreadyExists(id.to_owned()));
+            }
+            records.remove(index);
+            Ok(((), true))
+        })
+    }
+
     /// Lists active refs, optionally narrowed to a spawner tag and repository.
     /// `all` deliberately ignores those two scopes, which is the store-side
     /// implementation behind the CLI's future `--all` flag.

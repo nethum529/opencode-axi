@@ -255,8 +255,30 @@ where
     T: FollowTransport,
     J: EventJournalWriter,
 {
-    follow_until_terminal_with_policy(transport, target, timeout, journal, FollowPolicy::default())
-        .await
+    follow_until_terminal_from_cursor(transport, target, timeout, journal, None).await
+}
+
+/// Follows one dispatch while resuming the event stream after a durable cursor.
+pub async fn follow_until_terminal_from_cursor<T, J>(
+    transport: &T,
+    target: &FollowTarget,
+    timeout: Option<Duration>,
+    journal: Option<&mut J>,
+    initial_cursor: Option<&str>,
+) -> Result<FollowOutcome, FollowError>
+where
+    T: FollowTransport,
+    J: EventJournalWriter,
+{
+    follow_with_policy_and_cursor(
+        transport,
+        target,
+        timeout,
+        journal,
+        FollowPolicy::default(),
+        initial_cursor,
+    )
+    .await
 }
 
 /// Policy-injected form used for deterministic reconnect tests.
@@ -271,6 +293,21 @@ where
     T: FollowTransport,
     J: EventJournalWriter,
 {
+    follow_with_policy_and_cursor(transport, target, timeout, journal, policy, None).await
+}
+
+async fn follow_with_policy_and_cursor<T, J>(
+    transport: &T,
+    target: &FollowTarget,
+    timeout: Option<Duration>,
+    journal: Option<&mut J>,
+    policy: FollowPolicy,
+    initial_cursor: Option<&str>,
+) -> Result<FollowOutcome, FollowError>
+where
+    T: FollowTransport,
+    J: EventJournalWriter,
+{
     let connection_failed = Arc::new(AtomicBool::new(false));
     let follow = follow_inner(
         transport,
@@ -278,6 +315,7 @@ where
         journal,
         policy,
         Arc::clone(&connection_failed),
+        initial_cursor.map(str::to_owned),
     );
     match timeout {
         Some(timeout) => match tokio::time::timeout(timeout, follow).await {
@@ -297,12 +335,13 @@ async fn follow_inner<T, J>(
     mut journal: Option<&mut J>,
     policy: FollowPolicy,
     connection_failed: Arc<AtomicBool>,
+    initial_cursor: Option<String>,
 ) -> Result<FollowOutcome, FollowError>
 where
     T: FollowTransport,
     J: EventJournalWriter,
 {
-    let mut subscription = match transport.subscribe(None).await {
+    let mut subscription = match transport.subscribe(initial_cursor.as_deref()).await {
         Ok(subscription) => {
             connection_failed.store(false, Ordering::Relaxed);
             subscription
@@ -331,7 +370,7 @@ where
 
     let mut reconnect_started = None;
     let mut reconnect_attempts = 0_usize;
-    let mut last_event_id = None;
+    let mut last_event_id = initial_cursor;
     let mut no_cursor_reconciled = false;
     let mut last_reconnect_succeeded = false;
 
@@ -781,6 +820,39 @@ mod tests {
             [None, Some("evt-1".to_owned())]
         );
         assert!(transport.reconciliations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn killed_follow_resumes_from_the_durable_event_cursor() {
+        let transport = ScriptedTransport {
+            subscriptions: Mutex::new(VecDeque::from([subscription([
+                Ok(Some(event(
+                    "evt-after-crash",
+                    "message.updated",
+                    Some(message("msg_this_dispatch", "done", true)),
+                ))),
+                Ok(Some(event("evt-idle", "session.idle", None))),
+            ])])),
+            reconciliations: Mutex::new(VecDeque::from([Ok(Vec::new())])),
+            cursors: Mutex::new(Vec::new()),
+        };
+        let mut journal = Journal::default();
+
+        let outcome = follow_until_terminal_from_cursor(
+            &transport,
+            &target(),
+            None,
+            Some(&mut journal),
+            Some("evt-before-crash"),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(outcome.exit(), FollowExit::Success);
+        assert_eq!(
+            transport.cursors.lock().unwrap().as_slice(),
+            [Some("evt-before-crash".to_owned())]
+        );
     }
 
     #[tokio::test]

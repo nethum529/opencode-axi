@@ -73,6 +73,139 @@ fn post_transmit_pre_response_cut_never_replays_and_persists_unknown_ref() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].last_state, Some(RefState::Unknown));
     assert_eq!(records[0].id, error.reference().unwrap());
+
+    let reference = error.reference().unwrap().to_owned();
+    let recovery = FailureHttpServer::bind(
+        "127.0.0.1:0",
+        [
+            respond(200, "text/event-stream", b""),
+            respond(200, "application/json", b"[]"),
+        ],
+    )
+    .expect("recovery server binds");
+    replace_server_record(&home, recovery.local_addr().unwrap().port());
+    let recovery = thread::spawn(move || recovery.serve().expect("recovery script completes"));
+    let follow = run(&home, ["--json", "f", &reference]);
+    let recovery_requests = recovery.join().expect("recovery server thread");
+
+    let recovered_error = parsed_error(&follow);
+    assert_eq!(recovered_error.code(), ErrorCode::PromptUncertain.as_str());
+    assert!(
+        recovered_error
+            .help()
+            .contains(&format!("oca m {reference}")),
+        "the explicit resend command must be named"
+    );
+    assert_eq!(routes(&recovery_requests), ["event", "messages"]);
+    assert!(
+        !routes(&recovery_requests).contains(&"prompt_async"),
+        "fresh reconciliation must never resend the uncertain prompt"
+    );
+}
+
+#[test]
+fn fake_500_after_worktree_prepare_leaves_no_ref_intent_branch_or_worktree() {
+    let (home, server) = fixture([respond(500, "application/json", br#"{"error":"injected"}"#)]);
+    init_repository(home.path());
+
+    let output = run(
+        &home,
+        [
+            "luna:h",
+            "-w",
+            "-b",
+            "--headless",
+            "prepare",
+            "then",
+            "fail",
+        ],
+    );
+    let requests = server.join().expect("failure server thread");
+
+    assert!(!output.status.success());
+    assert_eq!(routes(&requests), ["session"]);
+    assert!(stored_refs(&home).is_empty());
+    assert!(intent_json_files(home.path()).is_empty());
+    assert!(!git_branches(home.path()).contains("oca/"));
+    assert!(
+        !home.path().join(".oca/wt").exists()
+            || std::fs::read_dir(home.path().join(".oca/wt"))
+                .unwrap()
+                .next()
+                .is_none()
+    );
+}
+
+#[test]
+fn killed_worktree_ready_phase_is_cleaned_by_a_fresh_ls() {
+    let home = tempfile::tempdir().expect("temporary home");
+    std::fs::create_dir(home.path().join(".oca")).unwrap();
+    std::fs::write(home.path().join(".oca/config.toml"), "").unwrap();
+    init_repository(home.path());
+
+    let killed = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args([
+            "luna:h",
+            "-w",
+            "-b",
+            "--headless",
+            "crash",
+            "after",
+            "worktree",
+        ])
+        .env("HOME", home.path())
+        .env("OCA_FAILPOINT", "worktree_ready")
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert_eq!(killed.status.code(), Some(86));
+    assert_eq!(intent_json_files(home.path()).len(), 1);
+    assert!(git_branches(home.path()).contains("oca/"));
+
+    let listed = run(&home, ["ls", "--all", "--json"]);
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let list: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap_or_else(|error| {
+        panic!(
+            "invalid list output ({error}): {:?}",
+            String::from_utf8_lossy(&listed.stdout)
+        )
+    });
+    assert_eq!(list["total"], 0);
+    assert!(intent_json_files(home.path()).is_empty());
+    assert!(!git_branches(home.path()).contains("oca/"));
+}
+
+#[test]
+fn killed_session_created_phase_is_queried_without_a_prompt() {
+    let (home, server) = fixture([
+        respond(
+            200,
+            "application/json",
+            br#"{"id":"ses_created_before_crash"}"#,
+        ),
+        respond(200, "application/json", b"[]"),
+    ]);
+
+    let killed = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["luna:h", "-b", "--headless", "stop", "before", "prompt"])
+        .env("HOME", home.path())
+        .env("OCA_FAILPOINT", "session_created")
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert_eq!(killed.status.code(), Some(86));
+
+    let listed = run(&home, ["ls", "--all", "--json"]);
+    let requests = server.join().expect("failure server thread");
+    assert!(listed.status.success());
+    let list: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(list["items"][0]["state"], "session_created");
+    assert_eq!(routes(&requests), ["session", "messages"]);
+    assert!(!routes(&requests).contains(&"prompt_async"));
 }
 
 #[test]
@@ -210,6 +343,83 @@ fn respond(status: u16, content_type: &str, body: &[u8]) -> FailureAction {
         [("content-type", content_type)],
         [body.to_vec()],
     ))
+}
+
+fn replace_server_record(home: &tempfile::TempDir, port: u16) {
+    ConnectOrStart::new(
+        home.path().join(".oca"),
+        port,
+        [],
+        std::time::Duration::from_secs(1),
+    )
+    .write_record(&ServerRecord::new(
+        port,
+        installed_opencode_version(),
+        environment_hash_for(home.path()),
+    ))
+    .unwrap();
+}
+
+fn init_repository(path: &std::path::Path) {
+    for arguments in [
+        vec!["init", "--quiet"],
+        vec!["config", "user.name", "oca test"],
+        vec!["config", "user.email", "oca@example.test"],
+    ] {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(arguments)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    std::fs::write(path.join("README.md"), "base\n").unwrap();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["add", "README.md"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["commit", "--quiet", "-m", "base"])
+            .status()
+            .unwrap()
+            .success()
+    );
+}
+
+fn git_branches(path: &std::path::Path) -> String {
+    String::from_utf8(
+        Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["branch", "--list"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+}
+
+fn intent_json_files(home: &std::path::Path) -> Vec<std::path::PathBuf> {
+    match std::fs::read_dir(home.join(".oca/intents")) {
+        Ok(entries) => entries
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+            .collect(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("could not list intents: {error}"),
+    }
 }
 
 fn run<const N: usize>(home: &tempfile::TempDir, arguments: [&str; N]) -> std::process::Output {

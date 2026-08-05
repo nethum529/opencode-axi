@@ -9,6 +9,7 @@ use oca_state::OcaConfig;
 mod attach;
 mod background;
 mod control;
+mod crash_recovery;
 mod events;
 mod follow;
 mod foreground;

@@ -3,17 +3,23 @@
 use std::{fmt::Write as _, path::Path, time::Duration};
 
 use oca_core::{
-    ErrorCode, FollowError, FollowExit, FollowOutcome, FollowTarget, FollowTerminal, OcaError,
-    RefId, ReplyContract, WorkerState, decode_role_reply, follow_until_terminal,
-    validate_reply_floor,
+    ErrorCode, EventJournalWriter, FollowError, FollowExit, FollowOutcome, FollowTarget,
+    FollowTerminal, OcaError, OcaEvent, RefId, ReplyContract, WorkerState, decode_role_reply,
+    follow_until_terminal_from_cursor, validate_reply_floor,
 };
 use oca_opencode::OpenCodeClient;
 use oca_server::ConnectOrStart;
-use oca_state::{EventJournal, OcaConfig, RefStore, RefStorePaths};
+use oca_state::{
+    EventJournal, Intent, IntentPhase, IntentStore, OcaConfig, RefStore, RefStorePaths,
+};
 use serde_json::{Map, Value};
 use url::Url;
 
-use crate::{FollowCommand, worktree_dispatch::finalize_turn};
+use crate::{
+    FollowCommand,
+    crash_recovery::{ReconcileCommand, event_cursor_failpoint, persist_intent, reconcile_ref},
+    worktree_dispatch::finalize_turn,
+};
 
 /// Successful command execution, including non-zero frozen follow outcomes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -35,6 +41,7 @@ pub async fn execute_follow(
 ) -> Result<FollowCommandOutput, OcaError> {
     let home = home.as_ref();
     let state_directory = home.join(".oca");
+    reconcile_ref(home, &command.reference, ReconcileCommand::Follow).await?;
     let store = RefStore::with_paths(RefStorePaths::in_directory(&state_directory));
     let record = store
         .resolve(&command.reference)
@@ -76,22 +83,44 @@ pub async fn execute_follow(
             .with_error(error.to_string())
             .with_ref(&command.reference)
     })?;
-    let mut journal = EventJournal::create(&state_directory, &reference, &message_id)
+    let journal = EventJournal::create(&state_directory, &reference, &message_id)
         .map_err(|error| journal_error(&command.reference, &error.to_string()))?;
+    let intent_store = IntentStore::in_directory(&state_directory);
+    let intent = intent_store
+        .read(&command.reference)
+        .map_err(|error| journal_error(&command.reference, &error.to_string()))?;
+    let initial_cursor = intent
+        .as_ref()
+        .and_then(|intent| intent.event_cursor.clone());
+    let mut journal = RecoveryJournal {
+        journal,
+        intents: intent_store.clone(),
+        intent,
+    };
     let target = FollowTarget {
         session_id: record.session_id.clone(),
         message_id,
     };
     let timeout = command.timeout_seconds.map(Duration::from_secs);
-    let outcome = follow_until_terminal(&client, &target, timeout, Some(&mut journal))
-        .await
-        .map_err(|error| follow_error(&command.reference, error))?;
+    let outcome = follow_until_terminal_from_cursor(
+        &client,
+        &target,
+        timeout,
+        Some(&mut journal),
+        initial_cursor.as_deref(),
+    )
+    .await
+    .map_err(|error| follow_error(&command.reference, error))?;
     journal
         .finish()
         .map_err(|error| journal_error(&command.reference, &error.to_string()))?;
 
     match outcome {
         FollowOutcome::Terminal(terminal) => {
+            if let Some(intent) = journal.intent.as_mut() {
+                intent.set_phase(IntentPhase::TerminalObserved);
+                persist_intent(&journal.intents, intent)?;
+            }
             let reply = validate_terminal_reply(&record, &terminal)?;
             finalize_turn(&store, &command.reference, &reply)?;
             Ok(FollowCommandOutput {
@@ -111,6 +140,37 @@ pub async fn execute_follow(
             &command.reference,
             "the OpenCode server could not be reached",
         )),
+    }
+}
+
+struct RecoveryJournal {
+    journal: EventJournal,
+    intents: IntentStore,
+    intent: Option<Intent>,
+}
+
+impl RecoveryJournal {
+    fn finish(&self) -> Result<(), oca_state::JournalError> {
+        self.journal.finish()
+    }
+}
+
+impl EventJournalWriter for RecoveryJournal {
+    fn append(&mut self, event: &OcaEvent) -> Result<(), String> {
+        self.journal
+            .append(event)
+            .map_err(|error| error.to_string())?;
+        if let Some(cursor) = event.cursor.as_ref()
+            && let Some(intent) = self.intent.as_mut()
+        {
+            intent.event_cursor = Some(cursor.clone());
+            intent.set_phase(IntentPhase::Running);
+            self.intents
+                .write(intent)
+                .map_err(|error| error.to_string())?;
+            event_cursor_failpoint();
+        }
+        Ok(())
     }
 }
 
