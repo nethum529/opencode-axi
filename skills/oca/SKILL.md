@@ -8,7 +8,7 @@ description: Delegate engineering work to OpenCode workers and inspect or steer 
 Dispatch every worker with an explicit alias and effort. There is no default.
 
 Aliases and canonical effort ladders: luna: low medium high xhigh max; sol: low medium high xhigh max; terra: low medium high xhigh max; flash: high max; deepseek: high max.
-Accepted effort forms: l m h x max low medium high xhigh.
+Accepted effort spellings: l m h x max low medium high xhigh. Choose a spelling of a rung from the selected alias's ladder above.
 
 Construct commands only from this parser-owned surface:
 
