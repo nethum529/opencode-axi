@@ -20,7 +20,7 @@ fn partial_dispatch_and_second_oca_m_create_two_original_prompt_commits() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
     let port = listener.local_addr().unwrap().port();
     prepare_home(home.path(), port);
-    let server = thread::spawn(move || serve_partial_then_review(listener));
+    let server = thread::spawn(move || serve_partial_then_review(listener, ReviewReply::Valid));
 
     let initial = run_oca(
         home.path(),
@@ -148,13 +148,78 @@ fn contract_invalid_schema_and_floor_preserve_the_exact_worker_diff() {
     }
 }
 
+#[test]
+fn contract_invalid_review_turn_leaves_the_first_commit_alone() {
+    let repository = TestRepository::new();
+    let home = tempfile::tempdir().expect("temporary home");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
+    let port = listener.local_addr().unwrap().port();
+    prepare_home(home.path(), port);
+    let server =
+        thread::spawn(move || serve_partial_then_review(listener, ReviewReply::FloorInvalid));
+
+    let initial = run_oca(
+        home.path(),
+        repository.path(),
+        [
+            "luna:h",
+            "-w",
+            "--headless",
+            "implement",
+            "retry",
+            "handling",
+        ],
+    );
+    assert_success(&initial);
+    let reference = String::from_utf8(initial.stdout)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    let first_record = stored_ref(home.path(), &reference);
+    let worktree = PathBuf::from(first_record["worktree"].as_str().unwrap());
+    let first_commit = first_record["commit"].as_str().unwrap().to_owned();
+
+    assert_success(&run_oca(
+        home.path(),
+        repository.path(),
+        ["m", &reference, "apply", "the", "review", "findings"],
+    ));
+    let follow = run_oca(home.path(), repository.path(), ["f", &reference]);
+    server.join().expect("fake server completes");
+
+    assert!(!follow.status.success());
+    assert!(
+        String::from_utf8_lossy(&follow.stderr).contains("code: contract_invalid"),
+        "{}",
+        String::from_utf8_lossy(&follow.stderr)
+    );
+    assert_eq!(
+        stored_ref(home.path(), &reference)["commit"].as_str(),
+        Some(first_commit.as_str()),
+        "a rejected review reply must not record a new commit"
+    );
+    assert_eq!(
+        git_output(&worktree, ["rev-list", "--count", "HEAD"]).trim(),
+        "2",
+        "the review turn must add no commit"
+    );
+}
+
 #[derive(Clone, Copy)]
 enum InvalidReply {
     Structural,
     Floor,
 }
 
-fn serve_partial_then_review(listener: TcpListener) {
+#[derive(Clone, Copy)]
+enum ReviewReply {
+    Valid,
+    FloorInvalid,
+}
+
+fn serve_partial_then_review(listener: TcpListener, review: ReviewReply) {
     let mut worktree = None;
     let mut first_message = None;
     let mut second_message = None;
@@ -203,11 +268,13 @@ fn serve_partial_then_review(listener: TcpListener) {
             }
             6 => write_response(&mut stream, "200 OK", "text/event-stream", ""),
             7 => {
-                let body = assistant_reply(
-                    second_message.as_deref().unwrap(),
-                    "done",
-                    "Applied every review finding in the existing worktree without changing the original task identity or commit message source. Verified the second checkpoint is complete and independently reviewable. WORKER-SUPPLIED",
-                );
+                let note = match review {
+                    ReviewReply::Valid => {
+                        "Applied every review finding in the existing worktree without changing the original task identity or commit message source. Verified the second checkpoint is complete and independently reviewable. WORKER-SUPPLIED"
+                    }
+                    ReviewReply::FloorInvalid => "Too short.",
+                };
+                let body = assistant_reply(second_message.as_deref().unwrap(), "done", note);
                 write_response(&mut stream, "200 OK", "application/json", &body.to_string());
             }
             _ => unreachable!(),
