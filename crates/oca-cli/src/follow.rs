@@ -92,8 +92,8 @@ pub async fn execute_follow(
 
     match outcome {
         FollowOutcome::Terminal(terminal) => {
-            validate_terminal_reply(&record, &terminal)?;
-            finalize_turn(&store, &command.reference, terminal.state)?;
+            let reply = validate_terminal_reply(&record, &terminal)?;
+            finalize_turn(&store, &command.reference, &reply)?;
             Ok(FollowCommandOutput {
                 exit: if terminal.state == WorkerState::Blocked {
                     FollowExit::Blocked
@@ -117,7 +117,7 @@ pub async fn execute_follow(
 fn validate_terminal_reply(
     record: &oca_state::RefRecord,
     terminal: &FollowTerminal,
-) -> Result<(), OcaError> {
+) -> Result<oca_core::RoleReply, OcaError> {
     let role = record.role.as_deref().ok_or_else(|| {
         OcaError::new(ErrorCode::ProtocolMismatch)
             .with_ref(&record.id)
@@ -129,7 +129,8 @@ fn validate_terminal_reply(
             .with_error("terminal worker message has no structured reply")
     })?;
     let reply = decode_role_reply(ReplyContract::resolve(role)?, structured)?;
-    validate_reply_floor(&reply)
+    validate_reply_floor(&reply)?;
+    Ok(reply)
 }
 
 fn render_terminal(reference: &str, terminal: &FollowTerminal, json: bool) -> String {

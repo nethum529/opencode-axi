@@ -17,7 +17,7 @@ use std::{
 };
 
 use fs2::FileExt;
-use oca_core::RefId;
+use oca_core::{RefId, RoleReply};
 use serde::{Deserialize, Serialize};
 
 use crate::RefState;
@@ -58,6 +58,8 @@ pub struct RefRecord {
     pub commit: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub commit_subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completion: Option<RoleReply>,
     #[serde(default)]
     pub tombstoned: bool,
 }
@@ -103,6 +105,7 @@ pub struct RefPatch {
     pub branch: Option<String>,
     pub commit: Option<String>,
     pub commit_subject: Option<String>,
+    pub completion: Option<RoleReply>,
 }
 
 impl RefPatch {
@@ -164,6 +167,12 @@ impl RefPatch {
     #[must_use]
     pub fn with_commit(mut self, commit: impl Into<String>) -> Self {
         self.commit = Some(commit.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_completion(mut self, completion: RoleReply) -> Self {
+        self.completion = Some(completion);
         self
     }
 }
@@ -700,6 +709,9 @@ impl RefStore {
             if let Some(commit_subject) = patch.commit_subject {
                 record.commit_subject = Some(commit_subject);
             }
+            if let Some(completion) = patch.completion {
+                record.completion = Some(completion);
+            }
             Ok((record.clone(), true))
         })
     }
@@ -805,6 +817,7 @@ impl RefStore {
             branch: new_ref.branch,
             commit: new_ref.commit,
             commit_subject: new_ref.commit_subject,
+            completion: None,
             tombstoned: false,
         }
     }
@@ -1227,6 +1240,7 @@ mod tests {
             branch: None,
             commit: None,
             commit_subject: None,
+            completion: None,
             tombstoned: false,
         };
 
@@ -1247,6 +1261,7 @@ mod tests {
                 branch: None,
                 commit: None,
                 commit_subject: None,
+                completion: None,
                 tombstoned: false,
             })
             .unwrap();
@@ -1286,7 +1301,7 @@ mod tests {
             1
         );
         assert!(matches!(
-            store.insert(RefRecord { id: "w0a1b2".to_string(), session_id: "new-session".to_string(), message_id: None, alias: None, effort: None, role: None, cwd: None, last_state: None, repo: None, spawner_tag: None, worktree: None, branch: None, commit: None, commit_subject: None, tombstoned: false }),
+            store.insert(RefRecord { id: "w0a1b2".to_string(), session_id: "new-session".to_string(), message_id: None, alias: None, effort: None, role: None, cwd: None, last_state: None, repo: None, spawner_tag: None, worktree: None, branch: None, commit: None, commit_subject: None, completion: None, tombstoned: false }),
             Err(RefStoreError::RefAlreadyExists(id)) if id == "w0a1b2"
         ));
     }
@@ -1312,6 +1327,7 @@ mod tests {
                     branch: None,
                     commit: None,
                     commit_subject: None,
+                    completion: None,
                     tombstoned: false,
                 })
                 .unwrap();
@@ -1346,6 +1362,7 @@ mod tests {
                 branch: None,
                 commit: None,
                 commit_subject: None,
+                completion: None,
                 tombstoned: false,
             });
 

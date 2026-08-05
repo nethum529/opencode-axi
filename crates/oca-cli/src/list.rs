@@ -285,6 +285,7 @@ mod tests {
                 branch: None,
                 commit: None,
                 commit_subject: None,
+                completion: None,
                 tombstoned: false,
             })
             .unwrap();

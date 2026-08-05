@@ -214,6 +214,7 @@ fn prepared_home(port: u16) -> tempfile::TempDir {
             branch: None,
             commit: None,
             commit_subject: None,
+            completion: None,
             tombstoned: false,
         })
         .unwrap();
