@@ -62,6 +62,12 @@ pub enum FlagValueForm {
         /// Enumerated values when the parser has a finite accepted set.
         accepted_values: &'static [&'static str],
     },
+    /// The option requires a value from the selected alias's
+    /// [`DispatchAliasGrammar::effort_ladder`].
+    DispatchEffort {
+        /// The visible placeholder for the effort value.
+        placeholder: &'static str,
+    },
 }
 
 /// One accepted option spelling and executable examples of its use.
@@ -75,6 +81,26 @@ pub struct FlagGrammar {
     pub argv_examples: &'static [&'static [&'static str]],
 }
 
+/// The delimiter that stops option parsing for a trailing text operand.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct EndOfOptionsGrammar {
+    /// The exact delimiter token accepted by the parser.
+    pub token: &'static str,
+    /// The trailing operand that receives all subsequent tokens literally.
+    pub trailing_operand: &'static str,
+    /// Complete accepted argv sequences exercising the delimiter.
+    pub argv_examples: &'static [&'static [&'static str]],
+}
+
+/// One model alias and its configured canonical effort ladder.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DispatchAliasGrammar {
+    /// The exact alias spelling accepted in model-dispatch syntax.
+    pub alias: &'static str,
+    /// Canonical effort values that consumers can safely use for this alias.
+    pub effort_ladder: &'static [&'static str],
+}
+
 /// The grammar for one public command spelling.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommandGrammar {
@@ -86,6 +112,8 @@ pub struct CommandGrammar {
     pub operands: &'static [OperandGrammar],
     /// Accepted flags and their value forms.
     pub flags: &'static [FlagGrammar],
+    /// A delimiter that makes the trailing text operand literal, when supported.
+    pub end_of_options: Option<EndOfOptionsGrammar>,
     /// Complete accepted argv sequences for the command.
     pub argv_examples: &'static [&'static [&'static str]],
 }
@@ -96,14 +124,35 @@ pub struct AgentGrammar {
     /// Every command agents may invoke, including model dispatch.
     pub commands: &'static [CommandGrammar],
     /// Every model alias accepted in model-dispatch syntax.
-    pub dispatch_aliases: &'static [&'static str],
-    /// Every spelling accepted for an effort value.
+    pub dispatch_aliases: &'static [DispatchAliasGrammar],
+    /// Every lexical spelling accepted for an effort value. Dispatch consumers
+    /// should choose a canonical value from the selected alias's ladder.
     pub effort_forms: &'static [&'static str],
 }
 
 const EFFORT_FORMS: &[&str] = &["l", "m", "h", "x", "max", "low", "medium", "high", "xhigh"];
-const DISPATCH_ALIASES: &[&str] = &["opus", "sonnet", "haiku", "flash", "deepseek"];
-static PUBLIC_COMMANDS: OnceLock<Vec<&str>> = OnceLock::new();
+const DISPATCH_ALIASES: &[DispatchAliasGrammar] = &[
+    DispatchAliasGrammar {
+        alias: "opus",
+        effort_ladder: &["low", "medium", "high", "xhigh", "max"],
+    },
+    DispatchAliasGrammar {
+        alias: "sonnet",
+        effort_ladder: &["low", "medium", "high", "xhigh"],
+    },
+    DispatchAliasGrammar {
+        alias: "haiku",
+        effort_ladder: &["low", "medium", "high"],
+    },
+    DispatchAliasGrammar {
+        alias: "flash",
+        effort_ladder: &["high", "max"],
+    },
+    DispatchAliasGrammar {
+        alias: "deepseek",
+        effort_ladder: &["high", "max"],
+    },
+];
 const DISPATCH_OPERANDS: &[OperandGrammar] = &[OperandGrammar {
     name: "prompt",
     form: OperandForm::OneOrMore,
@@ -142,9 +191,8 @@ const DISPATCH_FLAGS: &[FlagGrammar] = &[
     },
     FlagGrammar {
         spellings: &["-e", "--effort"],
-        value: FlagValueForm::Required {
+        value: FlagValueForm::DispatchEffort {
             placeholder: "<effort>",
-            accepted_values: EFFORT_FORMS,
         },
         argv_examples: &[
             &["oca", "opus", "-e", "high", "use", "short", "effort"],
@@ -199,6 +247,18 @@ const MESSAGE_FLAGS: &[FlagGrammar] = &[
         ],
     },
 ];
+
+const DISPATCH_END_OF_OPTIONS: EndOfOptionsGrammar = EndOfOptionsGrammar {
+    token: "--",
+    trailing_operand: "prompt",
+    argv_examples: &[&["oca", "opus:h", "--", "--literal", "prompt"]],
+};
+
+const MESSAGE_END_OF_OPTIONS: EndOfOptionsGrammar = EndOfOptionsGrammar {
+    token: "--",
+    trailing_operand: "message",
+    argv_examples: &[&["oca", "m", "w4f2a1", "--", "--literal", "message"]],
+};
 
 const QUEUE_EXAMPLES: &[&[&str]] = &[&["oca", "q", "w4f2a1", "queue", "this", "message"]];
 const QUEUE_FLAGS: &[FlagGrammar] = &[FlagGrammar {
@@ -282,6 +342,7 @@ const AGENT_COMMANDS: &[CommandGrammar] = &[
         display_tokens: &["<alias>:<effort>", "<alias> -e <effort>"],
         operands: DISPATCH_OPERANDS,
         flags: DISPATCH_FLAGS,
+        end_of_options: Some(DISPATCH_END_OF_OPTIONS),
         argv_examples: DISPATCH_EXAMPLES,
     },
     CommandGrammar {
@@ -289,6 +350,7 @@ const AGENT_COMMANDS: &[CommandGrammar] = &[
         display_tokens: &["m"],
         operands: REF_AND_MESSAGE_OPERANDS,
         flags: MESSAGE_FLAGS,
+        end_of_options: Some(MESSAGE_END_OF_OPTIONS),
         argv_examples: MESSAGE_EXAMPLES,
     },
     CommandGrammar {
@@ -296,6 +358,7 @@ const AGENT_COMMANDS: &[CommandGrammar] = &[
         display_tokens: &["q"],
         operands: REF_AND_MESSAGE_OPERANDS,
         flags: QUEUE_FLAGS,
+        end_of_options: None,
         argv_examples: QUEUE_EXAMPLES,
     },
     CommandGrammar {
@@ -303,6 +366,7 @@ const AGENT_COMMANDS: &[CommandGrammar] = &[
         display_tokens: &["f"],
         operands: REF_OPERAND,
         flags: FOLLOW_FLAGS,
+        end_of_options: None,
         argv_examples: FOLLOW_EXAMPLES,
     },
     CommandGrammar {
@@ -310,6 +374,7 @@ const AGENT_COMMANDS: &[CommandGrammar] = &[
         display_tokens: &["k"],
         operands: REF_OPERAND,
         flags: ABORT_FLAGS,
+        end_of_options: None,
         argv_examples: ABORT_EXAMPLES,
     },
     CommandGrammar {
@@ -317,6 +382,7 @@ const AGENT_COMMANDS: &[CommandGrammar] = &[
         display_tokens: &["ls"],
         operands: &[],
         flags: LIST_FLAGS,
+        end_of_options: None,
         argv_examples: LIST_EXAMPLES,
     },
     CommandGrammar {
@@ -324,6 +390,7 @@ const AGENT_COMMANDS: &[CommandGrammar] = &[
         display_tokens: &["events"],
         operands: REF_OPERAND,
         flags: EVENTS_FLAGS,
+        end_of_options: None,
         argv_examples: EVENTS_EXAMPLES,
     },
     CommandGrammar {
@@ -331,6 +398,7 @@ const AGENT_COMMANDS: &[CommandGrammar] = &[
         display_tokens: &["push"],
         operands: REF_OPERAND,
         flags: PUSH_FLAGS,
+        end_of_options: None,
         argv_examples: PUSH_EXAMPLES,
     },
     CommandGrammar {
@@ -338,9 +406,32 @@ const AGENT_COMMANDS: &[CommandGrammar] = &[
         display_tokens: &["pr"],
         operands: REF_OPERAND,
         flags: PULL_REQUEST_FLAGS,
+        end_of_options: None,
         argv_examples: PULL_REQUEST_EXAMPLES,
     },
 ];
+
+const PUBLIC_COMMAND_COUNT: usize = AGENT_COMMANDS.len() - 1;
+
+const fn derive_public_commands() -> [&'static str; PUBLIC_COMMAND_COUNT] {
+    let mut public_commands = [""; PUBLIC_COMMAND_COUNT];
+    let mut command_index = 0;
+    let mut public_index = 0;
+    while command_index < AGENT_COMMANDS.len() {
+        match AGENT_COMMANDS[command_index].kind {
+            AgentCommand::Dispatch => {}
+            AgentCommand::Control(verb) => {
+                public_commands[public_index] = verb;
+                public_index += 1;
+            }
+        }
+        command_index += 1;
+    }
+    assert!(public_index == PUBLIC_COMMAND_COUNT);
+    public_commands
+}
+
+const PUBLIC_COMMANDS: [&str; PUBLIC_COMMAND_COUNT] = derive_public_commands();
 
 /// The public parser-owned grammar for agent construction of `oca` argv.
 pub static AGENT_GRAMMAR: AgentGrammar = AgentGrammar {
@@ -356,19 +447,9 @@ pub const fn grammar_contract() -> &'static AgentGrammar {
 }
 
 /// The commands published to help, generated schemas, and the agent skill.
-pub fn public_commands() -> &'static [&'static str] {
-    PUBLIC_COMMANDS
-        .get_or_init(|| {
-            grammar_contract()
-                .commands
-                .iter()
-                .filter_map(|command| match command.kind {
-                    AgentCommand::Dispatch => None,
-                    AgentCommand::Control(verb) => Some(verb),
-                })
-                .collect()
-        })
-        .as_slice()
+#[must_use]
+pub const fn public_commands() -> &'static [&'static str] {
+    &PUBLIC_COMMANDS
 }
 
 /// The concise agent-facing command reference.
@@ -649,6 +730,9 @@ fn parse_message(arguments: &[String], permits_effort: bool) -> Result<MessageCo
             if value.starts_with('-') {
                 return Err(usage("`-e` requires an effort"));
             }
+            if !is_effort_form(value) {
+                return Err(usage(format!("unsupported effort `{value}`")));
+            }
             if effort.replace(value.clone()).is_some() {
                 return Err(usage("effort was provided more than once"));
             }
@@ -669,6 +753,13 @@ fn parse_message(arguments: &[String], permits_effort: bool) -> Result<MessageCo
         effort,
         json,
     })
+}
+
+fn is_effort_form(value: &str) -> bool {
+    let value = value.trim();
+    EFFORT_FORMS
+        .iter()
+        .any(|effort| value.eq_ignore_ascii_case(effort))
 }
 
 fn parse_follow(arguments: &[String]) -> Result<FollowCommand, OcaError> {

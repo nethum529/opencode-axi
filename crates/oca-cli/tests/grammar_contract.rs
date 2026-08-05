@@ -1,9 +1,14 @@
 //! The published grammar must remain executable by the parser that owns it.
 
+use std::collections::BTreeSet;
+
 use oca_cli::{
-    AgentCommand, Command, CommandGrammar, FlagGrammar, FlagValueForm, OperandForm,
-    grammar_contract, parse_from, public_commands,
+    AgentCommand, Command, CommandGrammar, DispatchAliasGrammar, EndOfOptionsGrammar, FlagGrammar,
+    FlagValueForm, OperandForm, grammar_contract, parse_from, public_commands,
 };
+use oca_core::{ErrorCode, ModelCatalog};
+
+const PUBLIC_COMMANDS: &[&str] = public_commands();
 
 #[test]
 fn agent_grammar_contract_is_visible_and_parseable() {
@@ -22,7 +27,7 @@ fn agent_grammar_contract_is_visible_and_parseable() {
         ["m", "q", "f", "k", "ls", "events", "push", "pr"],
         "the contract contains every and only public control verb"
     );
-    assert_eq!(controls, public_commands());
+    assert_eq!(controls, PUBLIC_COMMANDS);
     assert_eq!(
         contract
             .commands
@@ -54,33 +59,57 @@ fn agent_grammar_contract_is_visible_and_parseable() {
                 !flag.spellings.is_empty(),
                 "every advertised flag needs a spelling"
             );
-            if let FlagValueForm::Required {
-                placeholder,
-                accepted_values: _,
-            } = flag.value
-            {
-                assert!(
+            match flag.value {
+                FlagValueForm::None => {}
+                FlagValueForm::Required { placeholder, .. }
+                | FlagValueForm::DispatchEffort { placeholder } => assert!(
                     !placeholder.is_empty(),
                     "value-taking flags need a visible placeholder"
-                );
+                ),
             }
             assert_flag_examples_match_command(command, flag);
         }
+        if let Some(end_of_options) = command.end_of_options {
+            assert_end_of_options_matches_command(command, &end_of_options);
+        }
     }
 
+    assert_dispatch_contract_matches_resolver();
+    assert_message_efforts_are_restricted_to_published_forms();
+}
+
+fn assert_dispatch_contract_matches_resolver() {
+    let contract = grammar_contract();
     let dispatch = contract
         .commands
         .iter()
         .find(|command| command.kind == AgentCommand::Dispatch)
         .expect("the agent grammar includes model dispatch");
-    for arguments in dispatch
+    let dispatch_examples = dispatch
         .argv_examples
         .iter()
-        .chain(dispatch.flags.iter().flat_map(|flag| flag.argv_examples))
-    {
-        let (alias, effort) = dispatch_pair(arguments);
+        .copied()
+        .chain(
+            dispatch
+                .flags
+                .iter()
+                .flat_map(|flag| flag.argv_examples.iter().copied()),
+        )
+        .chain(
+            dispatch
+                .end_of_options
+                .iter()
+                .flat_map(|grammar| grammar.argv_examples.iter().copied()),
+        )
+        .collect::<Vec<_>>();
+
+    for arguments in &dispatch_examples {
+        let (alias, effort) = dispatch_pair(arguments, contract.dispatch_aliases);
         assert!(
-            contract.dispatch_aliases.contains(&alias),
+            contract
+                .dispatch_aliases
+                .iter()
+                .any(|published| published.alias == alias),
             "dispatch example `{arguments:?}` uses an unpublished alias `{alias}`"
         );
         assert!(
@@ -88,6 +117,89 @@ fn agent_grammar_contract_is_visible_and_parseable() {
             "dispatch example `{arguments:?}` uses an unpublished effort `{effort}`"
         );
     }
+
+    let catalog = ModelCatalog::default();
+    let catalog_aliases = catalog
+        .aliases()
+        .chain(std::iter::once("deepseek"))
+        .collect::<BTreeSet<_>>();
+    let published_aliases = contract
+        .dispatch_aliases
+        .iter()
+        .map(|published| published.alias)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        published_aliases.len(),
+        contract.dispatch_aliases.len(),
+        "dispatch aliases must not contain duplicates"
+    );
+    assert_eq!(
+        published_aliases, catalog_aliases,
+        "dispatch aliases must equal the default model catalog plus its deepseek synonym"
+    );
+
+    for published in contract.dispatch_aliases {
+        assert!(
+            dispatch_examples.iter().any(|arguments| {
+                dispatch_pair(arguments, contract.dispatch_aliases).0 == published.alias
+            }),
+            "dispatch alias `{}` needs an executable published example",
+            published.alias
+        );
+
+        let catalog_alias = if published.alias == "deepseek" {
+            "flash"
+        } else {
+            published.alias
+        };
+        let catalog_ladder = catalog
+            .get(catalog_alias)
+            .expect("published aliases are present in the catalog")
+            .ladder()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            published.effort_ladder,
+            catalog_ladder.as_slice(),
+            "the published ladder for `{}` must match the resolver catalog",
+            published.alias
+        );
+        assert!(
+            !published.effort_ladder.is_empty(),
+            "dispatch aliases need at least one effort"
+        );
+
+        for effort in published.effort_ladder {
+            assert!(
+                contract.effort_forms.contains(effort),
+                "the `{}` ladder uses unpublished effort `{effort}`",
+                published.alias
+            );
+            let derived = [
+                "oca",
+                published.alias,
+                "-e",
+                *effort,
+                "derived",
+                "contract",
+                "example",
+            ];
+            assert_example_matches_command(dispatch, &derived);
+        }
+    }
+}
+
+fn assert_message_efforts_are_restricted_to_published_forms() {
+    for effort in grammar_contract().effort_forms {
+        parse_from(["oca", "m", "w4f2a1", "-e", effort, "message"])
+            .unwrap_or_else(|error| panic!("published message effort `{effort}` failed: {error}"));
+    }
+    assert_eq!(
+        parse_from(["oca", "m", "w4f2a1", "-e", "bogus", "message"])
+            .unwrap_err()
+            .code(),
+        ErrorCode::Usage.as_str(),
+        "message effort parsing must reject values outside effort_forms"
+    );
 }
 
 fn assert_flag_examples_match_command(command: &CommandGrammar, flag: &FlagGrammar) {
@@ -132,11 +244,57 @@ fn assert_flag_examples_match_command(command: &CommandGrammar, flag: &FlagGramm
     }
 }
 
-fn assert_example_matches_command(command: &CommandGrammar, arguments: &[&str]) {
+fn assert_end_of_options_matches_command(
+    command: &CommandGrammar,
+    end_of_options: &EndOfOptionsGrammar,
+) {
+    assert_eq!(end_of_options.token, "--");
+    assert_eq!(
+        command
+            .operands
+            .last()
+            .expect("end-of-options needs a trailing operand")
+            .name,
+        end_of_options.trailing_operand
+    );
+    assert!(
+        !end_of_options.argv_examples.is_empty(),
+        "end-of-options needs an executable example"
+    );
+
+    for arguments in end_of_options.argv_examples {
+        let delimiter_index = arguments
+            .iter()
+            .position(|argument| *argument == end_of_options.token)
+            .expect("end-of-options examples contain the delimiter");
+        let literal = arguments
+            .get(delimiter_index + 1)
+            .expect("end-of-options examples contain a literal trailing token");
+        assert!(
+            literal.starts_with('-'),
+            "the example must prove a dash-prefixed token becomes literal"
+        );
+
+        let parsed = assert_example_matches_command(command, arguments);
+        let trailing_text = match parsed {
+            Command::Dispatch(dispatch) => dispatch.prompt,
+            Command::Message(message) => message.message,
+            other => panic!("unexpected end-of-options command: {other:?}"),
+        };
+        assert!(
+            trailing_text
+                .split_whitespace()
+                .any(|token| token == *literal),
+            "the delimiter must preserve `{literal}` in the trailing operand"
+        );
+    }
+}
+
+fn assert_example_matches_command(command: &CommandGrammar, arguments: &[&str]) -> Command {
     let parsed = parse_from(arguments.iter().copied())
         .unwrap_or_else(|error| panic!("grammar example `{arguments:?}` must parse, got {error}"));
 
-    match (command.kind, parsed) {
+    match (command.kind, &parsed) {
         (AgentCommand::Dispatch, Command::Dispatch(dispatch)) => {
             assert_eq!(command.operands.len(), 1);
             assert_eq!(command.operands[0].form, OperandForm::OneOrMore);
@@ -174,6 +332,7 @@ fn assert_example_matches_command(command: &CommandGrammar, arguments: &[&str]) 
             command.display_tokens.join(" ")
         ),
     }
+    parsed
 }
 
 fn assert_ref_operand(command: &CommandGrammar, reference: &str) {
@@ -182,19 +341,32 @@ fn assert_ref_operand(command: &CommandGrammar, reference: &str) {
     assert!(!reference.is_empty());
 }
 
-fn dispatch_pair<'a>(arguments: &'a [&'a str]) -> (&'a str, &'a str) {
-    let verb_index = arguments
+fn dispatch_pair<'a>(
+    arguments: &'a [&'a str],
+    dispatch_aliases: &[DispatchAliasGrammar],
+) -> (&'a str, &'a str) {
+    let (verb_index, alias, inline_effort) = arguments
         .iter()
-        .position(|argument| *argument != "oca" && *argument != "--json")
-        .expect("dispatch examples contain a model spelling");
-    let model = arguments[verb_index];
-    if let Some((alias, effort)) = model.split_once(':') {
+        .enumerate()
+        .find_map(|(index, argument)| {
+            dispatch_aliases.iter().find_map(|published| {
+                if *argument == published.alias {
+                    return Some((index, *argument, None));
+                }
+                let (alias, effort) = argument.split_once(':')?;
+                (alias == published.alias).then_some((index, alias, Some(effort)))
+            })
+        })
+        .expect("dispatch examples contain a published model spelling");
+    if let Some(effort) = inline_effort {
         return (alias, effort);
     }
 
-    let effort_index = arguments
+    let effort_index = arguments[verb_index + 1..]
         .iter()
         .position(|argument| *argument == "-e" || *argument == "--effort")
-        .expect("dispatch examples without inline effort provide an effort flag");
-    (model, arguments[effort_index + 1])
+        .expect("dispatch examples without inline effort provide an effort flag")
+        + verb_index
+        + 1;
+    (alias, arguments[effort_index + 1])
 }
