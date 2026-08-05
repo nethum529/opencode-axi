@@ -302,8 +302,9 @@ impl ConnectOrStart {
     }
 
     /// Reads the current discovery hint. A malformed hint is ignored so a
-    /// damaged cache cannot prevent a fresh server from starting. Discovery
-    /// emits a warning with the parse failure before recovering.
+    /// damaged cache cannot prevent a fresh server from starting. This reader
+    /// stays silent about the damage; [`Self::connect_or_start`] is what warns
+    /// with the parse failure before recovering.
     ///
     /// # Errors
     ///
@@ -894,6 +895,23 @@ mod tests {
         assert_eq!(warnings.len(), 1, "one warning line, got {warnings:?}");
         assert!(warnings[0].contains(&hint_path.display().to_string()));
         assert!(warnings[0].contains("EOF while parsing an object"));
+    }
+
+    /// The control for the corrupt case above: an absent hint takes the same
+    /// fresh-start path in silence, so the warning is what distinguishes
+    /// corruption from absence.
+    #[test]
+    fn absent_discovery_hint_starts_fresh_without_any_warning() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let manager = ConnectOrStart::new(directory.path(), 4096, [], Duration::from_millis(1));
+        let runtime = ColdRuntime::new([4096]);
+        let mut request = ReadyRequest;
+
+        block_on(manager.connect_or_start(&runtime, &mut request))
+            .expect("absent hint starts fresh");
+
+        assert_eq!(runtime.spawned.borrow().as_slice(), &[4096]);
+        assert!(runtime.warnings.borrow().is_empty());
     }
 
     #[cfg(unix)]
