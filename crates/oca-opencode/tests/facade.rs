@@ -4,7 +4,7 @@ use std::{
     thread,
 };
 
-use oca_core::ResolvedModel;
+use oca_core::{PermissionProfile, ResolvedModel};
 use oca_opencode::{CreateSessionRequest, OpenCodeClient, OpenCodeError, PromptRequest, TextPart};
 
 struct FakeServer {
@@ -57,6 +57,7 @@ fn prompt_request() -> PromptRequest {
             text: "Implement the facade".to_owned(),
         }],
         output_schema: None,
+        permission: PermissionProfile(Vec::new()),
     }
 }
 

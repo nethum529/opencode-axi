@@ -9,8 +9,14 @@ name = "oca"
 path = "src/main.rs"
 
 [dependencies]
+getrandom = "0.4"
 oca-core = { path = "../oca-core" }
+oca-display = { path = "../oca-display" }
+oca-opencode = { path = "../oca-opencode" }
+oca-server = { path = "../oca-server" }
 oca-state = { path = "../oca-state" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt"] }
 
 [dev-dependencies]
 tempfile = "3.23"

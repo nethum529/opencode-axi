@@ -15,6 +15,7 @@ pub enum WorkerState {
 
 /// A structurally decoded reply from the default implementation role.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImplReply {
     pub status: WorkerState,
     pub files: Vec<String>,
@@ -23,6 +24,7 @@ pub struct ImplReply {
 
 /// A structurally decoded reply from the default review role.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewReply {
     pub status: WorkerState,
     pub findings: Vec<ReviewFinding>,
@@ -31,6 +33,7 @@ pub struct ReviewReply {
 
 /// One review finding reported by a worker.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReviewFinding {
     pub file: String,
     pub line: u32,

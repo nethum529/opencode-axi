@@ -33,6 +33,8 @@ pub struct RefRecord {
     pub id: String,
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawner_tag: Option<String>,
@@ -44,6 +46,7 @@ pub struct RefRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NewRef {
     pub session_id: String,
+    pub message_id: Option<String>,
     pub repo: Option<String>,
     pub spawner_tag: Option<String>,
 }
@@ -108,9 +111,16 @@ impl NewRef {
     pub fn for_session(session_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
+            message_id: None,
             repo: None,
             spawner_tag: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_message_id(mut self, message_id: impl Into<String>) -> Self {
+        self.message_id = Some(message_id.into());
+        self
     }
 
     #[must_use]
@@ -448,6 +458,7 @@ impl RefStore {
         let record = RefRecord {
             id,
             session_id: new_ref.session_id,
+            message_id: new_ref.message_id,
             repo: new_ref.repo,
             spawner_tag: new_ref.spawner_tag,
             tombstoned: false,
@@ -999,6 +1010,7 @@ mod tests {
         let original = RefRecord {
             id: "w0a1b2".to_string(),
             session_id: "session-one".to_string(),
+            message_id: None,
             repo: Some("repo-a".to_string()),
             spawner_tag: Some("parent-a".to_string()),
             tombstoned: false,
@@ -1009,6 +1021,7 @@ mod tests {
             .insert(RefRecord {
                 id: "w0a1b3".to_string(),
                 session_id: "session-two".to_string(),
+                message_id: None,
                 repo: Some("repo-b".to_string()),
                 spawner_tag: Some("parent-c".to_string()),
                 tombstoned: false,
@@ -1050,7 +1063,7 @@ mod tests {
             1
         );
         assert!(matches!(
-            store.insert(RefRecord { id: "w0a1b2".to_string(), session_id: "new-session".to_string(), repo: None, spawner_tag: None, tombstoned: false }),
+            store.insert(RefRecord { id: "w0a1b2".to_string(), session_id: "new-session".to_string(), message_id: None, repo: None, spawner_tag: None, tombstoned: false }),
             Err(RefStoreError::RefAlreadyExists(id)) if id == "w0a1b2"
         ));
     }
@@ -1066,6 +1079,7 @@ mod tests {
             let result = store.insert(RefRecord {
                 id: value.to_string(),
                 session_id: "session-one".to_string(),
+                message_id: None,
                 repo: None,
                 spawner_tag: None,
                 tombstoned: false,
@@ -1424,7 +1438,7 @@ mod tests {
                 .allocate(NewRef::for_session("acknowledged-session"))
                 .unwrap();
             pending
-                .acknowledge_with(|record| ack_tx.send(record.clone()))
+                .acknowledge_with(|record| ack_tx.send(record.clone()).map_err(|_| ()))
                 .unwrap()
         });
 

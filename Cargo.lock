@@ -742,9 +742,15 @@ dependencies = [
 name = "oca-cli"
 version = "0.1.0"
 dependencies = [
+ "getrandom 0.4.3",
  "oca-core",
+ "oca-display",
+ "oca-opencode",
+ "oca-server",
  "oca-state",
+ "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
