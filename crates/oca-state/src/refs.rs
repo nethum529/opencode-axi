@@ -7,7 +7,7 @@ use std::{
     collections::HashSet,
     env, fmt,
     fs::{self, File, OpenOptions},
-    io::{self, Write},
+    io::{self, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{
         Arc,
@@ -25,6 +25,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 const REF_ID_WIDTH: usize = 5;
 const REF_ID_SPACE: u64 = 60_466_176;
+const DIRECTORY_SYNC_PENDING_MARKER: &[u8] = b"pending\n";
 
 /// A stored ref. `id` is always `w` followed by five lowercase base-36 digits.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -161,13 +162,46 @@ pub trait RefIdSource: Send + Sync {
     fn next_id(&self) -> String;
 }
 
-/// Hook called after the temporary file is durable and before it replaces
-/// `refs.json`. It is primarily a deterministic crash-test seam.
+/// Sequencing hooks around atomic ref replacement and deferred durability.
+///
+/// The hooks are primarily deterministic failure, observation, and latch seams
+/// for crash-consistency tests.
 pub trait AtomicWriteHook: Send + Sync {
+    /// # Errors
+    ///
+    /// Returns an error to simulate failure to create the temporary file.
+    fn before_temporary_file_create(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error to simulate failure to write the replacement.
+    fn before_temporary_file_write(&self) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error to simulate failure to sync the temporary file.
+    fn before_temporary_file_sync(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     /// # Errors
     ///
     /// Returns an error to simulate or report a failure before replacement.
     fn before_rename(&self) -> io::Result<()>;
+
+    /// Observes the replacement after rename and before acknowledgement.
+    fn after_rename(&self, _refs_file: &Path) {}
+
+    /// # Errors
+    ///
+    /// Returns an error to block or fail a parent-directory sync attempt.
+    fn before_directory_sync(&self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 struct NoopAtomicWriteHook;
@@ -175,6 +209,134 @@ struct NoopAtomicWriteHook;
 impl AtomicWriteHook for NoopAtomicWriteHook {
     fn before_rename(&self) -> io::Result<()> {
         Ok(())
+    }
+}
+
+/// An allocation whose replacement is visible and ready to acknowledge.
+///
+/// The handle retains the exclusive ref lock. Call [`Self::acknowledge_with`]
+/// to emit and flush the caller's acknowledgement before the owning process
+/// attempts the deferred parent-directory sync.
+#[must_use = "the caller must finish deferred ref durability after acknowledgement"]
+pub struct PendingRefAllocation {
+    record: RefRecord,
+    parent: PathBuf,
+    lock: File,
+    atomic_write_hook: Arc<dyn AtomicWriteHook>,
+}
+
+impl fmt::Debug for PendingRefAllocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PendingRefAllocation")
+            .field("record", &self.record)
+            .field("parent", &self.parent)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PendingRefAllocation {
+    /// The complete record that is visible in `refs.json` at acknowledgement.
+    #[must_use]
+    pub fn record(&self) -> &RefRecord {
+        &self.record
+    }
+
+    /// Emits and flushes acknowledgement through the caller, then attempts
+    /// deferred directory durability.
+    ///
+    /// The callback belongs to the dispatch layer, which keeps terminal output
+    /// out of state storage. If it fails, no completion is returned and dropping
+    /// this handle transfers pending directory durability to the next entrant.
+    ///
+    /// # Errors
+    ///
+    /// Returns the caller's acknowledgement or flush error without beginning
+    /// the post-ack directory-sync attempt.
+    pub fn acknowledge_with<E>(
+        self,
+        acknowledge: impl FnOnce(&RefRecord) -> Result<(), E>,
+    ) -> Result<RefAllocationCompletion, E> {
+        acknowledge(&self.record)?;
+        Ok(self.finish_after_ack())
+    }
+
+    /// Attempts the deferred parent-directory sync while retaining `refs.lock`.
+    ///
+    /// This must be called only after the acknowledgement has been emitted and
+    /// flushed. A failure is returned as a warning alongside the acknowledged
+    /// record; it cannot retroactively turn the dispatch into a failure.
+    #[must_use]
+    pub fn finish_after_ack(mut self) -> RefAllocationCompletion {
+        let sync_result = self
+            .atomic_write_hook
+            .before_directory_sync()
+            .and_then(|()| sync_directory(&self.parent))
+            .and_then(|()| clear_directory_sync_pending(&mut self.lock));
+        let durability_warning = sync_result.err().map(|source| RefDurabilityWarning {
+            path: self.parent.clone(),
+            source,
+        });
+
+        RefAllocationCompletion {
+            record: self.record,
+            durability_warning,
+        }
+    }
+}
+
+/// The result after the first post-ack directory-durability attempt.
+#[derive(Debug)]
+pub struct RefAllocationCompletion {
+    record: RefRecord,
+    durability_warning: Option<RefDurabilityWarning>,
+}
+
+impl RefAllocationCompletion {
+    #[must_use]
+    pub fn record(&self) -> &RefRecord {
+        &self.record
+    }
+
+    #[must_use]
+    pub fn durability_warning(&self) -> Option<&RefDurabilityWarning> {
+        self.durability_warning.as_ref()
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (RefRecord, Option<RefDurabilityWarning>) {
+        (self.record, self.durability_warning)
+    }
+}
+
+/// A parent-directory durability failure that happened after acknowledgement.
+#[derive(Debug)]
+pub struct RefDurabilityWarning {
+    path: PathBuf,
+    source: io::Error,
+}
+
+impl RefDurabilityWarning {
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl fmt::Display for RefDurabilityWarning {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "acknowledged refs update is not directory-durable at {}: {}",
+            self.path.display(),
+            self.source
+        )
+    }
+}
+
+impl std::error::Error for RefDurabilityWarning {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
     }
 }
 
@@ -205,6 +367,12 @@ pub struct RefStore {
     paths: RefStorePaths,
     id_source: Arc<dyn RefIdSource>,
     atomic_write_hook: Arc<dyn AtomicWriteHook>,
+}
+
+struct LockedRecords {
+    parent: PathBuf,
+    lock: File,
+    records: Vec<RefRecord>,
 }
 
 impl fmt::Debug for RefStore {
@@ -255,29 +423,43 @@ impl RefStore {
     }
 
     /// Allocates an unused ref ID while retaining the advisory lock through the
-    /// collision check and atomic persistence.
+    /// collision check, pre-ack content sync, and atomic replacement.
+    ///
+    /// The returned handle owns `refs.lock` and exposes the complete renamed
+    /// record at the acknowledgement boundary. The caller must acknowledge and
+    /// finish deferred directory durability through that handle.
     ///
     /// # Errors
     ///
     /// Returns an error if the store cannot be read, locked, or persisted.
-    pub fn allocate(&self, new_ref: NewRef) -> Result<RefRecord, RefStoreError> {
-        self.with_locked_records(|records| {
-            let occupied: HashSet<_> = records.iter().map(|record| record.id.as_str()).collect();
-            let id = loop {
-                let candidate = self.id_source.next_id();
-                if RefId::new(&candidate).is_ok() && !occupied.contains(candidate.as_str()) {
-                    break candidate;
-                }
-            };
-            let record = RefRecord {
-                id,
-                session_id: new_ref.session_id,
-                repo: new_ref.repo,
-                spawner_tag: new_ref.spawner_tag,
-                tombstoned: false,
-            };
-            records.push(record.clone());
-            Ok((record, true))
+    pub fn allocate(&self, new_ref: NewRef) -> Result<PendingRefAllocation, RefStoreError> {
+        let mut locked = self.lock_and_read_records()?;
+        let occupied: HashSet<_> = locked
+            .records
+            .iter()
+            .map(|record| record.id.as_str())
+            .collect();
+        let id = loop {
+            let candidate = self.id_source.next_id();
+            if RefId::new(&candidate).is_ok() && !occupied.contains(candidate.as_str()) {
+                break candidate;
+            }
+        };
+        let record = RefRecord {
+            id,
+            session_id: new_ref.session_id,
+            repo: new_ref.repo,
+            spawner_tag: new_ref.spawner_tag,
+            tombstoned: false,
+        };
+        locked.records.push(record.clone());
+        self.write_records_before_ack(&locked.records, &mut locked.lock)?;
+
+        Ok(PendingRefAllocation {
+            record,
+            parent: locked.parent,
+            lock: locked.lock,
+            atomic_write_hook: Arc::clone(&self.atomic_write_hook),
         })
     }
 
@@ -388,6 +570,30 @@ impl RefStore {
         &self,
         operation: impl FnOnce(&mut Vec<RefRecord>) -> Result<(T, bool), RefStoreError>,
     ) -> Result<T, RefStoreError> {
+        let mut locked = self.lock_and_read_records()?;
+        let (value, changed) = operation(&mut locked.records)?;
+        if changed {
+            self.write_records_before_ack(&locked.records, &mut locked.lock)?;
+            self.atomic_write_hook
+                .before_directory_sync()
+                .and_then(|()| sync_directory(&locked.parent))
+                .map_err(|source| RefStoreError::Io {
+                    path: locked.parent.clone(),
+                    source,
+                })?;
+            clear_directory_sync_pending(&mut locked.lock).map_err(|source| RefStoreError::Io {
+                path: self.paths.lock_file.clone(),
+                source,
+            })?;
+        }
+        FileExt::unlock(&locked.lock).map_err(|source| RefStoreError::Io {
+            path: self.paths.lock_file.clone(),
+            source,
+        })?;
+        Ok(value)
+    }
+
+    fn lock_and_read_records(&self) -> Result<LockedRecords, RefStoreError> {
         let parent = self.refs_parent()?;
         fs::create_dir_all(parent).map_err(|source| RefStoreError::Io {
             path: parent.to_path_buf(),
@@ -402,7 +608,7 @@ impl RefStore {
             .truncate(false);
         #[cfg(unix)]
         lock_options.mode(0o600);
-        let lock =
+        let mut lock =
             lock_options
                 .open(&self.paths.lock_file)
                 .map_err(|source| RefStoreError::Io {
@@ -415,16 +621,30 @@ impl RefStore {
             source,
         })?;
 
-        let mut records = self.read_records()?;
-        let (value, changed) = operation(&mut records)?;
-        if changed {
-            self.write_records_atomically(&records)?;
-        }
-        lock.unlock().map_err(|source| RefStoreError::Io {
+        if directory_sync_pending(&lock).map_err(|source| RefStoreError::Io {
             path: self.paths.lock_file.clone(),
             source,
-        })?;
-        Ok(value)
+        })? {
+            self.atomic_write_hook
+                .before_directory_sync()
+                .and_then(|()| sync_directory(parent))
+                .map_err(|source| RefStoreError::Durability {
+                    path: parent.to_path_buf(),
+                    source,
+                })?;
+            clear_directory_sync_pending(&mut lock).map_err(|source| {
+                RefStoreError::Durability {
+                    path: self.paths.lock_file.clone(),
+                    source,
+                }
+            })?;
+        }
+
+        Ok(LockedRecords {
+            parent: parent.to_path_buf(),
+            lock,
+            records: self.read_records()?,
+        })
     }
 
     fn refs_parent(&self) -> Result<&Path, RefStoreError> {
@@ -451,7 +671,11 @@ impl RefStore {
         }
     }
 
-    fn write_records_atomically(&self, records: &[RefRecord]) -> Result<(), RefStoreError> {
+    fn write_records_before_ack(
+        &self,
+        records: &[RefRecord],
+        lock: &mut File,
+    ) -> Result<(), RefStoreError> {
         let bytes = serde_json::to_vec_pretty(records).map_err(RefStoreError::Serialize)?;
         let parent = self.refs_parent()?;
         let temporary = parent.join(format!(
@@ -462,7 +686,17 @@ impl RefStore {
                 .unwrap_or_default()
                 .as_nanos()
         ));
+        mark_directory_sync_pending(lock).map_err(|source| RefStoreError::Io {
+            path: self.paths.lock_file.clone(),
+            source,
+        })?;
         let write_result = (|| -> Result<(), RefStoreError> {
+            self.atomic_write_hook
+                .before_temporary_file_create()
+                .map_err(|source| RefStoreError::Io {
+                    path: temporary.clone(),
+                    source,
+                })?;
             let mut temporary_options = OpenOptions::new();
             temporary_options.write(true).create_new(true);
             #[cfg(unix)]
@@ -480,10 +714,22 @@ impl RefStore {
                     path: temporary.clone(),
                     source,
                 })?;
+            self.atomic_write_hook
+                .before_temporary_file_write()
+                .map_err(|source| RefStoreError::Io {
+                    path: temporary.clone(),
+                    source,
+                })?;
             file.write_all(&bytes).map_err(|source| RefStoreError::Io {
                 path: temporary.clone(),
                 source,
             })?;
+            self.atomic_write_hook
+                .before_temporary_file_sync()
+                .map_err(|source| RefStoreError::Io {
+                    path: temporary.clone(),
+                    source,
+                })?;
             file.sync_all().map_err(|source| RefStoreError::Io {
                 path: temporary.clone(),
                 source,
@@ -498,14 +744,33 @@ impl RefStore {
                 path: self.paths.refs_file.clone(),
                 source,
             })?;
-            sync_directory(parent)?;
+            self.atomic_write_hook.after_rename(&self.paths.refs_file);
             Ok(())
         })();
         if write_result.is_err() {
             let _ = fs::remove_file(&temporary);
+            let _ = clear_directory_sync_pending(lock);
         }
         write_result
     }
+}
+
+fn directory_sync_pending(lock: &File) -> io::Result<bool> {
+    Ok(lock.metadata()?.len() != 0)
+}
+
+// The marker is written before replacement while the advisory lock is held.
+// It transfers an interrupted or failed directory-sync attempt to the next
+// entrant without imposing an unconditional directory sync on every warm path.
+fn mark_directory_sync_pending(lock: &mut File) -> io::Result<()> {
+    lock.set_len(0)?;
+    lock.seek(SeekFrom::Start(0))?;
+    lock.write_all(DIRECTORY_SYNC_PENDING_MARKER)
+}
+
+fn clear_directory_sync_pending(lock: &mut File) -> io::Result<()> {
+    lock.set_len(0)?;
+    lock.seek(SeekFrom::Start(0)).map(|_| ())
 }
 
 fn secure_path(path: &Path, mode: u32) -> Result<(), RefStoreError> {
@@ -534,17 +799,12 @@ fn encode_base36(mut value: u64) -> String {
 }
 
 #[cfg(unix)]
-fn sync_directory(directory: &Path) -> Result<(), RefStoreError> {
-    File::open(directory)
-        .and_then(|directory| directory.sync_all())
-        .map_err(|source| RefStoreError::Io {
-            path: directory.to_path_buf(),
-            source,
-        })
+fn sync_directory(directory: &Path) -> io::Result<()> {
+    File::open(directory).and_then(|directory| directory.sync_all())
 }
 
 #[cfg(not(unix))]
-fn sync_directory(_directory: &Path) -> Result<(), RefStoreError> {
+fn sync_directory(_directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
@@ -563,6 +823,10 @@ pub enum RefStoreError {
     Deserialize {
         path: PathBuf,
         source: serde_json::Error,
+    },
+    Durability {
+        path: PathBuf,
+        source: io::Error,
     },
     Serialize(serde_json::Error),
 }
@@ -587,6 +851,11 @@ impl fmt::Display for RefStoreError {
                     path.display()
                 )
             }
+            Self::Durability { path, source } => write!(
+                formatter,
+                "pending refs directory durability at {}: {source}",
+                path.display()
+            ),
             Self::Serialize(source) => write!(formatter, "cannot serialize refs: {source}"),
         }
     }
@@ -595,7 +864,7 @@ impl fmt::Display for RefStoreError {
 impl std::error::Error for RefStoreError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Io { source, .. } => Some(source),
+            Self::Io { source, .. } | Self::Durability { source, .. } => Some(source),
             Self::Deserialize { source, .. } | Self::Serialize(source) => Some(source),
             Self::HomeDirectoryUnavailable
             | Self::MissingParent(_)
@@ -611,8 +880,13 @@ mod tests {
     use std::{
         collections::{HashSet, VecDeque},
         fs, io,
-        sync::{Arc, Barrier, Mutex},
+        sync::{
+            Arc, Barrier, Condvar, Mutex,
+            atomic::{AtomicUsize, Ordering},
+            mpsc,
+        },
         thread,
+        time::Duration,
     };
 
     #[cfg(unix)]
@@ -640,6 +914,14 @@ mod tests {
         }
     }
 
+    fn finish(allocation: super::PendingRefAllocation) -> RefRecord {
+        let completion = allocation
+            .acknowledge_with(|_| Ok::<(), std::convert::Infallible>(()))
+            .unwrap();
+        assert!(completion.durability_warning().is_none());
+        completion.into_parts().0
+    }
+
     #[test]
     fn allocate_retries_a_colliding_id_while_holding_the_store_lock() {
         let directory = tempfile::tempdir().unwrap();
@@ -649,8 +931,8 @@ mod tests {
             Arc::new(SequenceIdSource::new(&["w00000", "w00000", "w00001"])),
         );
 
-        let first = store.allocate(NewRef::for_session("session-one")).unwrap();
-        let second = store.allocate(NewRef::for_session("session-two")).unwrap();
+        let first = finish(store.allocate(NewRef::for_session("session-one")).unwrap());
+        let second = finish(store.allocate(NewRef::for_session("session-two")).unwrap());
 
         assert_eq!(first.id, "w00000");
         assert_eq!(second.id, "w00001");
@@ -667,7 +949,7 @@ mod tests {
             ])),
         );
 
-        let allocated = store.allocate(NewRef::for_session("session-one")).unwrap();
+        let allocated = finish(store.allocate(NewRef::for_session("session-one")).unwrap());
 
         assert_eq!(allocated.id, "w4f2a1");
     }
@@ -691,9 +973,11 @@ mod tests {
                 let start = Arc::clone(&start);
                 thread::spawn(move || {
                     start.wait();
-                    store
-                        .allocate(NewRef::for_session(format!("session-{number}")))
-                        .unwrap()
+                    finish(
+                        store
+                            .allocate(NewRef::for_session(format!("session-{number}")))
+                            .unwrap(),
+                    )
                 })
             })
             .collect();
@@ -909,7 +1193,7 @@ mod tests {
             hook.clone(),
         );
 
-        store.allocate(NewRef::for_session("session-one")).unwrap();
+        finish(store.allocate(NewRef::for_session("session-one")).unwrap());
 
         assert_eq!(mode(&store_directory), 0o700);
         assert_eq!(mode(&paths.refs_file), 0o600);
@@ -965,7 +1249,7 @@ mod tests {
             hook.clone(),
         );
 
-        store.allocate(NewRef::for_session("session-one")).unwrap();
+        finish(store.allocate(NewRef::for_session("session-one")).unwrap());
 
         assert_eq!(mode(&store_directory), 0o700);
         assert_eq!(mode(&paths.refs_file), 0o600);
@@ -1000,37 +1284,345 @@ mod tests {
         assert_eq!(mode(directory.path()), 0o700);
     }
 
-    struct FailBeforeRename;
+    #[derive(Clone, Copy, Debug)]
+    enum PreAckFailure {
+        TemporaryCreate,
+        TemporaryWrite,
+        TemporarySync,
+        Rename,
+    }
 
-    impl AtomicWriteHook for FailBeforeRename {
+    struct FailPreAckOperation(PreAckFailure);
+
+    impl FailPreAckOperation {
+        fn fail(&self, operation: PreAckFailure) -> io::Result<()> {
+            (std::mem::discriminant(&self.0) != std::mem::discriminant(&operation))
+                .then_some(())
+                .ok_or_else(|| io::Error::other(format!("simulated {operation:?} failure")))
+        }
+    }
+
+    impl AtomicWriteHook for FailPreAckOperation {
+        fn before_temporary_file_create(&self) -> io::Result<()> {
+            self.fail(PreAckFailure::TemporaryCreate)
+        }
+
+        fn before_temporary_file_write(&self) -> io::Result<()> {
+            self.fail(PreAckFailure::TemporaryWrite)
+        }
+
+        fn before_temporary_file_sync(&self) -> io::Result<()> {
+            self.fail(PreAckFailure::TemporarySync)
+        }
+
         fn before_rename(&self) -> io::Result<()> {
-            Err(io::Error::other("simulated crash before rename"))
+            self.fail(PreAckFailure::Rename)
         }
     }
 
     #[test]
-    fn a_failure_before_rename_leaves_the_prior_refs_file_intact() {
+    fn every_fallible_pre_ack_replacement_operation_suppresses_acknowledgement() {
+        for failure in [
+            PreAckFailure::TemporaryCreate,
+            PreAckFailure::TemporaryWrite,
+            PreAckFailure::TemporarySync,
+            PreAckFailure::Rename,
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let paths = RefStorePaths::in_directory(directory.path());
+            let initial = RefStore::with_id_source(
+                paths.clone(),
+                Arc::new(SequenceIdSource::new(&["w00000"])),
+            );
+            finish(
+                initial
+                    .allocate(NewRef::for_session("durable-session"))
+                    .unwrap(),
+            );
+            let prior_contents = fs::read(&paths.refs_file).unwrap();
+            let failing = RefStore::with_id_source_and_write_hook(
+                paths.clone(),
+                Arc::new(SequenceIdSource::new(&["w00001"])),
+                Arc::new(FailPreAckOperation(failure)),
+            );
+
+            let result = failing.allocate(NewRef::for_session("unacknowledged-session"));
+
+            assert!(result.is_err(), "{failure:?} unexpectedly reached ack");
+            assert_eq!(fs::read(&paths.refs_file).unwrap(), prior_contents);
+            assert_eq!(initial.list(&RefListFilter::default()).unwrap().len(), 1);
+            assert_eq!(
+                fs::read_dir(directory.path())
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+                    .count(),
+                0
+            );
+            #[cfg(unix)]
+            {
+                assert_eq!(mode(directory.path()), 0o700, "{failure:?}");
+                assert_eq!(mode(&paths.refs_file), 0o600, "{failure:?}");
+                assert_eq!(mode(&paths.lock_file), 0o600, "{failure:?}");
+            }
+        }
+    }
+
+    struct SequencingHook {
+        observed_records: Mutex<Option<Vec<RefRecord>>>,
+        sync_started: Mutex<Option<mpsc::Sender<()>>>,
+        released: (Mutex<bool>, Condvar),
+    }
+
+    impl SequencingHook {
+        fn release(&self) {
+            *self.released.0.lock().unwrap() = true;
+            self.released.1.notify_all();
+        }
+    }
+
+    impl AtomicWriteHook for SequencingHook {
+        fn before_rename(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn after_rename(&self, refs_file: &std::path::Path) {
+            let records = serde_json::from_slice(&fs::read(refs_file).unwrap()).unwrap();
+            *self.observed_records.lock().unwrap() = Some(records);
+        }
+
+        fn before_directory_sync(&self) -> io::Result<()> {
+            if let Some(sender) = self.sync_started.lock().unwrap().take() {
+                sender.send(()).unwrap();
+            }
+            let mut released = self.released.0.lock().unwrap();
+            while !*released {
+                released = self.released.1.wait(released).unwrap();
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn acknowledgement_observes_renamed_refs_before_deferred_sync_and_lock_release() {
         let directory = tempfile::tempdir().unwrap();
         let paths = RefStorePaths::in_directory(directory.path());
-        let initial =
-            RefStore::with_id_source(paths.clone(), Arc::new(SequenceIdSource::new(&["w00000"])));
-        initial
-            .allocate(NewRef::for_session("durable-session"))
-            .unwrap();
-        let prior_contents = fs::read(&paths.refs_file).unwrap();
-        let failing = RefStore::with_id_source_and_write_hook(
+        let (sync_started_tx, sync_started_rx) = mpsc::channel();
+        let hook = Arc::new(SequencingHook {
+            observed_records: Mutex::new(None),
+            sync_started: Mutex::new(Some(sync_started_tx)),
+            released: (Mutex::new(false), Condvar::new()),
+        });
+        let first = RefStore::with_id_source_and_write_hook(
             paths.clone(),
-            Arc::new(SequenceIdSource::new(&["w00001"])),
-            Arc::new(FailBeforeRename),
+            Arc::new(SequenceIdSource::new(&["w00000"])),
+            hook.clone(),
+        );
+        let (ack_tx, ack_rx) = mpsc::channel();
+        let first_worker = thread::spawn(move || {
+            let pending = first
+                .allocate(NewRef::for_session("acknowledged-session"))
+                .unwrap();
+            pending
+                .acknowledge_with(|record| ack_tx.send(record.clone()))
+                .unwrap()
+        });
+
+        let acknowledged = ack_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(acknowledged.id, "w00000");
+        assert_eq!(
+            hook.observed_records.lock().unwrap().as_ref(),
+            Some(&vec![acknowledged.clone()])
+        );
+        sync_started_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+
+        let second = RefStore::with_id_source(paths, Arc::new(SequenceIdSource::new(&["w00001"])));
+        let (second_started_tx, second_started_rx) = mpsc::channel();
+        let (second_entered_tx, second_entered_rx) = mpsc::channel();
+        let second_worker = thread::spawn(move || {
+            second_started_tx.send(()).unwrap();
+            let pending = second
+                .allocate(NewRef::for_session("concurrent-session"))
+                .unwrap();
+            second_entered_tx.send(()).unwrap();
+            pending
+        });
+        second_started_rx.recv().unwrap();
+        assert_eq!(
+            second_entered_rx.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "the concurrent allocation entered while deferred durability held refs.lock"
         );
 
+        hook.release();
+        let first_completion = first_worker.join().unwrap();
+        assert!(first_completion.durability_warning().is_none());
+        second_entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap();
+        let second_pending = second_worker.join().unwrap();
         assert!(
-            failing
-                .allocate(NewRef::for_session("lost-session"))
-                .is_err()
+            second_pending
+                .acknowledge_with(|_| Ok::<(), std::convert::Infallible>(()))
+                .unwrap()
+                .durability_warning()
+                .is_none()
+        );
+    }
+
+    struct FailDirectorySync {
+        remaining_failures: AtomicUsize,
+        calls: AtomicUsize,
+    }
+
+    impl FailDirectorySync {
+        fn new(failures: usize) -> Self {
+            Self {
+                remaining_failures: AtomicUsize::new(failures),
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl AtomicWriteHook for FailDirectorySync {
+        fn before_rename(&self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn before_directory_sync(&self) -> io::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self
+                .remaining_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                Err(io::Error::other("simulated directory sync failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn post_ack_sync_failure_returns_a_warning_and_the_next_entrant_retries() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = RefStorePaths::in_directory(directory.path());
+        let hook = Arc::new(FailDirectorySync::new(1));
+        let store = RefStore::with_id_source_and_write_hook(
+            paths.clone(),
+            Arc::new(SequenceIdSource::new(&["w00000"])),
+            hook.clone(),
         );
 
-        assert_eq!(fs::read(&paths.refs_file).unwrap(), prior_contents);
-        assert_eq!(initial.list(&RefListFilter::default()).unwrap().len(), 1);
+        let pending = store
+            .allocate(NewRef::for_session("acknowledged-session"))
+            .unwrap();
+        let acknowledged = pending.record().clone();
+        let completion = pending.finish_after_ack();
+
+        assert_eq!(completion.record(), &acknowledged);
+        let warning = completion.durability_warning().unwrap();
+        assert_eq!(warning.path(), directory.path());
+        assert!(warning.to_string().contains("not directory-durable"));
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 1);
+
+        assert_eq!(
+            store.list(&RefListFilter::default()).unwrap(),
+            vec![acknowledged]
+        );
+        assert_eq!(hook.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn retry_failure_prevents_reliance_and_remains_retryable_by_a_later_entrant() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = RefStorePaths::in_directory(directory.path());
+        let first_hook = Arc::new(FailDirectorySync::new(1));
+        let first = RefStore::with_id_source_and_write_hook(
+            paths.clone(),
+            Arc::new(SequenceIdSource::new(&["w00000"])),
+            first_hook,
+        );
+        let completion = first
+            .allocate(NewRef::for_session("acknowledged-session"))
+            .unwrap()
+            .finish_after_ack();
+        assert!(completion.durability_warning().is_some());
+
+        let retry_hook = Arc::new(FailDirectorySync::new(1));
+        let retrying = RefStore::with_id_source_and_write_hook(
+            paths.clone(),
+            Arc::new(SequenceIdSource::new(&[])),
+            retry_hook.clone(),
+        );
+        assert!(matches!(
+            retrying.list(&RefListFilter::default()),
+            Err(RefStoreError::Durability { path, .. }) if path == directory.path()
+        ));
+        assert_eq!(retry_hook.calls.load(Ordering::SeqCst), 1);
+
+        let later = RefStore::with_paths(paths);
+        assert_eq!(later.list(&RefListFilter::default()).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn an_unfinished_post_ack_attempt_is_transferred_to_the_next_entrant() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = RefStorePaths::in_directory(directory.path());
+        let first_hook = Arc::new(FailDirectorySync::new(0));
+        let first = RefStore::with_id_source_and_write_hook(
+            paths.clone(),
+            Arc::new(SequenceIdSource::new(&["w00000"])),
+            first_hook.clone(),
+        );
+        let pending = first
+            .allocate(NewRef::for_session("acknowledged-session"))
+            .unwrap();
+
+        drop(pending);
+        assert_eq!(first_hook.calls.load(Ordering::SeqCst), 0);
+
+        let retry_hook = Arc::new(FailDirectorySync::new(0));
+        let next = RefStore::with_id_source_and_write_hook(
+            paths,
+            Arc::new(SequenceIdSource::new(&[])),
+            retry_hook.clone(),
+        );
+        assert_eq!(next.list(&RefListFilter::default()).unwrap().len(), 1);
+        assert_eq!(retry_hook.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn acknowledgement_flush_failure_suppresses_completion_and_defers_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let paths = RefStorePaths::in_directory(directory.path());
+        let first_hook = Arc::new(FailDirectorySync::new(0));
+        let first = RefStore::with_id_source_and_write_hook(
+            paths.clone(),
+            Arc::new(SequenceIdSource::new(&["w00000"])),
+            first_hook.clone(),
+        );
+        let pending = first
+            .allocate(NewRef::for_session("unacknowledged-session"))
+            .unwrap();
+
+        let result = pending.acknowledge_with(|_| {
+            Err::<(), _>(io::Error::other("simulated acknowledgement flush failure"))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(first_hook.calls.load(Ordering::SeqCst), 0);
+        let retry_hook = Arc::new(FailDirectorySync::new(0));
+        let next = RefStore::with_id_source_and_write_hook(
+            paths,
+            Arc::new(SequenceIdSource::new(&[])),
+            retry_hook.clone(),
+        );
+        assert_eq!(next.list(&RefListFilter::default()).unwrap().len(), 1);
+        assert_eq!(retry_hook.calls.load(Ordering::SeqCst), 1);
     }
 }
