@@ -158,7 +158,11 @@ fn warm_prefix_sources_reject_forbidden_operation_families() {
         for forbidden in [
             "ProcessCommand::",
             "std::process::Command",
-            "HerdrClient",
+            ".workspace(",
+            ".tab(",
+            ".agent_start(",
+            ".close_tab(",
+            "UnixStream::connect",
             ".messages(",
             ".status(",
             "health_check",

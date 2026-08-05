@@ -198,6 +198,13 @@ fn killed_session_created_phase_is_queried_without_a_prompt() {
         .output()
         .unwrap();
     assert_eq!(killed.status.code(), Some(86));
+    let intent_files = intent_json_files(home.path());
+    assert_eq!(intent_files.len(), 1);
+    let durable_intent: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&intent_files[0]).unwrap()).unwrap();
+    assert_eq!(durable_intent["phase"], "session_created");
+    assert_eq!(durable_intent["session_id"], "ses_created_before_crash");
+    assert!(stored_refs(&home).is_empty());
 
     let listed = run(&home, ["ls", "--all", "--json"]);
     let requests = server.join().expect("failure server thread");
@@ -206,6 +213,51 @@ fn killed_session_created_phase_is_queried_without_a_prompt() {
     assert_eq!(list["items"][0]["state"], "session_created");
     assert_eq!(routes(&requests), ["session", "messages"]);
     assert!(!routes(&requests).contains(&"prompt_async"));
+}
+
+#[test]
+fn killed_running_phase_persists_production_intent_before_ref_materialization() {
+    let (home, server) = fixture([
+        respond(
+            200,
+            "application/json",
+            br#"{"id":"ses_running_before_crash"}"#,
+        ),
+        respond(200, "text/event-stream", b""),
+        respond(204, "text/plain", b""),
+    ]);
+
+    let killed = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["luna:h", "-b", "--headless", "stop", "after", "prompt"])
+        .env("HOME", home.path())
+        .env("OCA_FAILPOINT", "running")
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    let requests = server.join().expect("failure server thread");
+    assert_eq!(killed.status.code(), Some(86));
+    assert_eq!(routes(&requests), ["session", "event", "prompt_async"]);
+
+    let intent_files = intent_json_files(home.path());
+    assert_eq!(intent_files.len(), 1);
+    let durable_intent: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&intent_files[0]).unwrap()).unwrap();
+    assert_eq!(durable_intent["phase"], "running");
+    assert_eq!(durable_intent["session_id"], "ses_running_before_crash");
+    assert!(durable_intent["message_id"].as_str().is_some());
+    assert!(durable_intent["prompt_sha256"].as_str().is_some());
+    assert!(stored_refs(&home).is_empty());
+
+    let listed = run(&home, ["ls", "--all", "--json"]);
+    assert!(
+        listed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let records = stored_refs(&home);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].session_id, "ses_running_before_crash");
+    assert_eq!(records[0].last_state, Some(RefState::Running));
 }
 
 #[test]

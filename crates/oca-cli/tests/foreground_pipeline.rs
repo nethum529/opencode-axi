@@ -96,6 +96,7 @@ fn end_to_end_foreground_has_one_turn_one_terminal_and_one_golden_final_result()
         IntentStore::in_directory(&state).list().unwrap().is_empty(),
         "a clean terminal dispatch leaves no orphaned intent"
     );
+    assert_eq!(refs[0]["display"], "headless");
 }
 
 fn serve_foreground(listener: TcpListener) -> Vec<CapturedRequest> {

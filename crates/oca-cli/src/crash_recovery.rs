@@ -47,18 +47,6 @@ pub(crate) fn persist_intent(store: &IntentStore, intent: &Intent) -> Result<(),
     Ok(())
 }
 
-/// Preserves phase-table failpoint coverage for a phase normally coalesced
-/// into the next write-ahead record without adding an ordinary warm-path write.
-pub(crate) fn persist_intent_at_failpoint(
-    store: &IntentStore,
-    intent: &Intent,
-) -> Result<(), OcaError> {
-    if std::env::var("OCA_FAILPOINT").as_deref() == Ok(intent.phase.as_str()) {
-        persist_intent(store, intent)?;
-    }
-    Ok(())
-}
-
 /// Applies the phase failpoint after a caller has already persisted an intent
 /// as part of an atomic ref-ID reservation.
 pub(crate) fn intent_failpoint(intent: &Intent) {
@@ -300,6 +288,9 @@ fn patch_or_insert_ref(
         new_ref = new_ref.with_repo(&requested.repo);
         if let Some(spawner_tag) = &requested.spawner_tag {
             new_ref = new_ref.with_spawner_tag(spawner_tag);
+        }
+        if let Some(display) = &requested.display {
+            new_ref = new_ref.with_display(display);
         }
         refs.insert_reserved(&intent.reference, new_ref)
             .map(|_| ())

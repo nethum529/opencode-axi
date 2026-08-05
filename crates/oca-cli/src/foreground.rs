@@ -4,15 +4,15 @@ use std::{
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use oca_core::{
-    DispatchPrompt, ErrorCode, ForegroundBackend, ForegroundRequest, MessageIdGenerator, OcaError,
-    RANDOM_SUFFIX_WIDTH, ReplyContract, ResolvedModel, RoleReply, TerminalReply, WorkerPolicy,
-    WorkerState, run_foreground,
+    DispatchPrompt, DisplayMode, ErrorCode, ForegroundBackend, ForegroundRequest,
+    MessageIdGenerator, OcaError, RANDOM_SUFFIX_WIDTH, ReplyContract, ResolvedModel, RoleReply,
+    TerminalReply, WorkerPolicy, WorkerState, run_foreground,
 };
-use oca_display::{Acknowledgement, CompletionRecord};
+use oca_display::{Acknowledgement, CompletionRecord, HerdrClient};
 use oca_opencode::{
     CreateSessionRequest, OpenCodeClient, PromptRequest, Subscription, TextPart,
     attributed_structured_reply, is_target_session_idle,
@@ -25,10 +25,7 @@ use oca_state::{
 
 use crate::{
     DispatchCommand,
-    crash_recovery::{
-        RESERVED_SESSION_ID, intent_failpoint, persist_intent, persist_intent_at_failpoint,
-        prompt_sha256,
-    },
+    crash_recovery::{RESERVED_SESSION_ID, intent_failpoint, persist_intent, prompt_sha256},
     scope::Scope,
     transport::{CreateSessionOperation, connect_error, open_code_error, prompt_error},
     worktree_dispatch::{WorktreeDispatch, finalize_turn},
@@ -92,6 +89,20 @@ pub(crate) fn prepare_dispatch(
     let worktree = command
         .worktree
         .then(|| WorktreeDispatch::new(PathBuf::from(&scope.repo), &command.prompt));
+    let configured_socket =
+        (!config.herdr.socket.is_empty()).then(|| Path::new(config.herdr.socket.as_str()));
+    let display = DisplayMode::select(
+        command.headless,
+        || {
+            HerdrClient::discover_from(
+                home,
+                configured_socket,
+                Duration::from_millis(config.herdr.timeout_ms),
+            )
+            .is_some()
+        },
+        std::env::var_os("TMUX").is_some(),
+    );
 
     // Server discovery happens only after every local parse/resolve failure.
     let manager = ConnectOrStart::from_home(home, &config.server);
@@ -112,7 +123,7 @@ pub(crate) fn prepare_dispatch(
         contract,
         policy,
         cwd,
-        headless: command.headless,
+        display,
         json: command.json,
     };
 
@@ -215,6 +226,7 @@ impl ForegroundBackend for ProductionBackend {
             repo: self.scope.repo.clone(),
             spawner_tag: Some(self.scope.spawner_tag.clone()),
             worktree: self.worktree.is_some(),
+            display: Some(request.display.as_str().to_owned()),
         };
         let intent = if self.worktree.is_some() {
             let reservation = self
@@ -229,7 +241,8 @@ impl ForegroundBackend for ProductionBackend {
                             RefState::Running,
                         )
                         .with_repo(&self.scope.repo)
-                        .with_spawner_tag(&self.scope.spawner_tag),
+                        .with_spawner_tag(&self.scope.spawner_tag)
+                        .with_display(request.display.as_str()),
                 )
                 .map_err(|error| state_error("could not reserve worktree ref", error))?;
             Intent::new(&reservation.id, IntentOperation::Dispatch).with_requested(requested)
@@ -312,7 +325,7 @@ impl ForegroundBackend for ProductionBackend {
             intent.set_phase(IntentPhase::SessionCreated);
         }
         let intent = self.intent.as_ref().expect("intent set during prepare");
-        persist_intent_at_failpoint(&self.intents, intent)?;
+        persist_intent(&self.intents, intent)?;
         Ok(session.id)
     }
 
@@ -375,7 +388,7 @@ impl ForegroundBackend for ProductionBackend {
                 let intent = self.intent_mut()?;
                 intent.set_phase(IntentPhase::Running);
                 let intent = self.intent.as_ref().expect("intent set during prepare");
-                persist_intent_at_failpoint(&self.intents, intent)
+                persist_intent(&self.intents, intent)
             }
             Err(error) => {
                 let error = prompt_error(error);
@@ -412,7 +425,8 @@ impl ForegroundBackend for ProductionBackend {
                                         RefState::Unknown,
                                     )
                                     .with_repo(&self.scope.repo)
-                                    .with_spawner_tag(&self.scope.spawner_tag),
+                                    .with_spawner_tag(&self.scope.spawner_tag)
+                                    .with_display(request_display(self.intent.as_ref())),
                             )
                             .map_err(|state| {
                                 state_error("could not preserve uncertain prompt ref", state)
@@ -457,7 +471,8 @@ impl ForegroundBackend for ProductionBackend {
                             RefState::Running,
                         )
                         .with_repo(&self.scope.repo)
-                        .with_spawner_tag(&self.scope.spawner_tag),
+                        .with_spawner_tag(&self.scope.spawner_tag)
+                        .with_display(request.display.as_str()),
                 )
                 .map(Box::new)
                 .map(PendingProductionRef::Allocated)
@@ -502,9 +517,9 @@ impl ForegroundBackend for ProductionBackend {
         reference: &str,
         session_id: &str,
         cwd: &Path,
-        headless: bool,
+        display: DisplayMode,
     ) -> Result<(), OcaError> {
-        if headless {
+        if display == DisplayMode::Headless {
             return Ok(());
         }
         let executable = std::env::current_exe().map_err(io_error)?;
@@ -620,6 +635,13 @@ fn io_error(error: io::Error) -> OcaError {
 
 fn state_error(context: &str, error: impl std::fmt::Display) -> OcaError {
     OcaError::new(ErrorCode::ServerUnavailable).with_error(format!("{context}: {error}"))
+}
+
+fn request_display(intent: Option<&Intent>) -> &str {
+    intent
+        .and_then(|intent| intent.requested.as_ref())
+        .and_then(|requested| requested.display.as_deref())
+        .unwrap_or("headless")
 }
 
 fn server_state_error(context: &str, error: io::Error) -> OcaError {

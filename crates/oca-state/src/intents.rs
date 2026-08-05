@@ -81,6 +81,8 @@ pub struct IntentRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawner_tag: Option<String>,
     pub worktree: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
 }
 
 /// One write-ahead crash-recovery record.
