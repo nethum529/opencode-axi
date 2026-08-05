@@ -696,8 +696,9 @@ impl RefStore {
 
     /// Transfers a post-acknowledgement directory sync to the next store entrant.
     ///
-    /// Pre-reserved intent-backed dispatches use this to preserve the same
-    /// background acknowledgement contract as deferred allocations.
+    /// A caller still holding a `PendingRefAllocation` transfers by dropping it:
+    /// the pending marker is already set, so the lock is released with the sync
+    /// outstanding. This entry point covers a caller that owns no such handle.
     pub fn transfer_directory_durability(&self) -> Result<(), RefStoreError> {
         let mut locked = self.lock_and_read_records()?;
         mark_directory_sync_pending(&mut locked.lock).map_err(|source| RefStoreError::Io {
