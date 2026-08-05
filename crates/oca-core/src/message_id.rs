@@ -74,17 +74,24 @@ mod tests {
     #[test]
     fn contract_is_clock_derived_counter_ordered_and_uses_opencode_widths() {
         let mut generator = MessageIdGenerator::new();
+        // Identical randomness on every mint, so ordering can only come from
+        // the clock/counter field and never from the base-62 suffix.
         let first = generator.mint(1_785_000_000_000, [0; RANDOM_SUFFIX_WIDTH]);
-        let second = generator.mint(1_785_000_000_000, [61; RANDOM_SUFFIX_WIDTH]);
+        let second = generator.mint(1_785_000_000_000, [0; RANDOM_SUFFIX_WIDTH]);
         let third = generator.mint(1_785_000_000_001, [0; RANDOM_SUFFIX_WIDTH]);
 
         assert!(is_opencode_message_id(&first));
         assert!(is_opencode_message_id(&second));
         assert!(is_opencode_message_id(&third));
-        assert_eq!(first.len(), "msg_".len() + TIME_PREFIX_WIDTH + 14);
+        assert_eq!(
+            first.len(),
+            "msg_".len() + TIME_PREFIX_WIDTH + RANDOM_SUFFIX_WIDTH
+        );
         assert!(first < second, "same-tick counter must sort ascending");
         assert!(second < third, "the next clock tick must sort ascending");
         assert_eq!(&first[4..16], "f9a4a7a00001");
+        assert_eq!(&second[4..16], "f9a4a7a00002");
+        assert_eq!(&third[4..16], "f9a4a7a01001");
     }
 
     #[test]
