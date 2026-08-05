@@ -334,6 +334,31 @@ mod tests {
     }
 
     #[test]
+    fn a_disabled_grant_refuses_before_the_glob_protected_and_remote_steps() {
+        let repository = TestRepository::new("main");
+        run_git(repository.worktree.path(), ["remote", "remove", "origin"]);
+        let home = tempfile::tempdir().unwrap();
+        insert_ref(home.path(), &repository, "main");
+        write_config(
+            home.path(),
+            "[publish]\npush = false\nbranches = \"nothing/*\"\nremote = \"missing\"\n",
+        );
+
+        let error = execute(
+            &command(),
+            home.path(),
+            PublishKind::Push,
+            &mut RecordingProvider::default(),
+        )
+        .unwrap_err();
+
+        // Every later step would also refuse this ref, so only the spec's
+        // step-3-first ordering can produce `publish_disabled` here.
+        assert_eq!(error.code(), ErrorCode::PublishDisabled.as_str());
+        assert_eq!(error.help(), "[publish] push = true");
+    }
+
+    #[test]
     fn canonical_repository_override_wins_over_disabled_default() {
         let repository = TestRepository::new("oca/w00001");
         let home = tempfile::tempdir().unwrap();
