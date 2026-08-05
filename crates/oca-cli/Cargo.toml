@@ -12,6 +12,7 @@ path = "src/main.rs"
 getrandom = "0.4"
 oca-core = { path = "../oca-core" }
 oca-display = { path = "../oca-display" }
+oca-git = { path = "../oca-git" }
 oca-opencode = { path = "../oca-opencode" }
 oca-server = { path = "../oca-server" }
 oca-state = { path = "../oca-state" }

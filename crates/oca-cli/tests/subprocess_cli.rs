@@ -210,6 +210,10 @@ fn prepared_home(port: u16) -> tempfile::TempDir {
             last_state: Some(oca_state::RefState::Running),
             repo: None,
             spawner_tag: None,
+            worktree: None,
+            branch: None,
+            commit: None,
+            commit_subject: None,
             tombstoned: false,
         })
         .unwrap();
@@ -234,7 +238,7 @@ fn terminal_sse(status: &str) -> String {
                 "structured": {
                     "status": status,
                     "files": [],
-                    "note": "The worker returned one attributed terminal report for process-level acceptance."
+                    "note": "Returned one attributed terminal report for the process-level acceptance path without duplicating any session event. Verified the follow command preserves the expected stable output and exit behavior."
                 }
             }
         }

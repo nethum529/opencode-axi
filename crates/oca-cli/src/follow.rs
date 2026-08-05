@@ -4,15 +4,16 @@ use std::{fmt::Write as _, path::Path, time::Duration};
 
 use oca_core::{
     ErrorCode, FollowError, FollowExit, FollowOutcome, FollowTarget, FollowTerminal, OcaError,
-    RefId, WorkerState, follow_until_terminal,
+    RefId, ReplyContract, WorkerState, decode_role_reply, follow_until_terminal,
+    validate_reply_floor,
 };
 use oca_opencode::OpenCodeClient;
 use oca_server::ConnectOrStart;
-use oca_state::{EventJournal, OcaConfig, RefPatch, RefState, RefStore, RefStorePaths};
+use oca_state::{EventJournal, OcaConfig, RefStore, RefStorePaths};
 use serde_json::{Map, Value};
 use url::Url;
 
-use crate::FollowCommand;
+use crate::{FollowCommand, worktree_dispatch::finalize_turn};
 
 /// Successful command execution, including non-zero frozen follow outcomes.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -46,7 +47,7 @@ pub async fn execute_follow(
     if record.tombstoned {
         return Err(OcaError::new(ErrorCode::SessionNotFound).with_ref(&command.reference));
     }
-    let message_id = record.message_id.ok_or_else(|| {
+    let message_id = record.message_id.clone().ok_or_else(|| {
         OcaError::new(ErrorCode::PromptUncertain)
             .with_ref(&command.reference)
             .with_error("The ref has no dispatch message id to attribute")
@@ -78,7 +79,7 @@ pub async fn execute_follow(
     let mut journal = EventJournal::create(&state_directory, &reference, &message_id)
         .map_err(|error| journal_error(&command.reference, &error.to_string()))?;
     let target = FollowTarget {
-        session_id: record.session_id,
+        session_id: record.session_id.clone(),
         message_id,
     };
     let timeout = command.timeout_seconds.map(Duration::from_secs);
@@ -91,12 +92,8 @@ pub async fn execute_follow(
 
     match outcome {
         FollowOutcome::Terminal(terminal) => {
-            store
-                .patch(
-                    &command.reference,
-                    RefPatch::default().with_last_state(ref_state(terminal.state)),
-                )
-                .map_err(|error| state_error(&command.reference, &error.to_string()))?;
+            validate_terminal_reply(&record, &terminal)?;
+            finalize_turn(&store, &command.reference, terminal.state)?;
             Ok(FollowCommandOutput {
                 exit: if terminal.state == WorkerState::Blocked {
                     FollowExit::Blocked
@@ -117,12 +114,22 @@ pub async fn execute_follow(
     }
 }
 
-const fn ref_state(state: WorkerState) -> RefState {
-    match state {
-        WorkerState::Done => RefState::Done,
-        WorkerState::Blocked => RefState::Blocked,
-        WorkerState::Partial => RefState::Partial,
-    }
+fn validate_terminal_reply(
+    record: &oca_state::RefRecord,
+    terminal: &FollowTerminal,
+) -> Result<(), OcaError> {
+    let role = record.role.as_deref().ok_or_else(|| {
+        OcaError::new(ErrorCode::ProtocolMismatch)
+            .with_ref(&record.id)
+            .with_error("the ref has no stored role for reply validation")
+    })?;
+    let structured = terminal.message.reply().cloned().ok_or_else(|| {
+        OcaError::new(ErrorCode::ContractInvalid)
+            .with_ref(&record.id)
+            .with_error("terminal worker message has no structured reply")
+    })?;
+    let reply = decode_role_reply(ReplyContract::resolve(role)?, structured)?;
+    validate_reply_floor(&reply)
 }
 
 fn render_terminal(reference: &str, terminal: &FollowTerminal, json: bool) -> String {

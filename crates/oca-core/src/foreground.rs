@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::{
     OcaError, PermissionProfile, ReplyContract, ResolvedModel, RoleReply, WorkerPolicy,
-    decode_role_reply,
+    decode_role_reply, validate_reply_floor,
 };
 
 /// A fully locally-resolved foreground dispatch.
@@ -69,6 +69,15 @@ pub(crate) struct StartedDispatch<S> {
 pub trait ForegroundBackend {
     type Subscription;
     type PendingRef;
+
+    /// Performs dispatch-local preparation before session creation.
+    ///
+    /// The production worktree backend uses this boundary to reserve the ref,
+    /// create the worktree, and replace the request cwd/write scope. The
+    /// default keeps non-worktree backends entirely free of git work.
+    fn prepare(&mut self, _request: &mut ForegroundRequest) -> Result<(), OcaError> {
+        Ok(())
+    }
 
     async fn create_session(&mut self, request: &ForegroundRequest) -> Result<String, OcaError>;
 
@@ -161,9 +170,8 @@ where
         }
     };
 
-    // Deliberately structural only. T27a owns validate_reply_floor and the
-    // foreground path must not call it in this ticket.
     let reply = decode_role_reply(started.request.contract, terminal.structured)?;
+    validate_reply_floor(&reply)?;
     backend.finalize(&started.reference, &reply)?;
     backend.print_final(&started.reference, &reply, started.request.json)?;
 
@@ -179,11 +187,12 @@ where
 /// and background ownership.
 pub(crate) async fn start_dispatch<B>(
     backend: &mut B,
-    request: ForegroundRequest,
+    mut request: ForegroundRequest,
 ) -> Result<StartedDispatch<B::Subscription>, OcaError>
 where
     B: ForegroundBackend,
 {
+    backend.prepare(&mut request)?;
     let session_id = backend.create_session(&request).await?;
 
     // This ordering is binding: the stream must be established before the
@@ -634,7 +643,11 @@ mod tests {
 
     fn valid_terminal() -> TerminalReply {
         TerminalReply {
-            structured: json!({"status":"done","files":[],"note":"Done."}),
+            structured: json!({
+                "status":"done",
+                "files":[],
+                "note":"Implemented the requested dispatch behavior with deterministic validation and complete coverage for each required boundary. Verified the resulting flow remains stable across normal completion paths."
+            }),
         }
     }
 

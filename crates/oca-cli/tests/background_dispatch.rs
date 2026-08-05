@@ -149,7 +149,7 @@ fn serve_background_then_follow(listener: TcpListener) -> Vec<CapturedRequest> {
                         "structured": {
                             "status": "done",
                             "files": [],
-                            "note": "The already-finished background turn was reconciled."
+                            "note": "Reconciled the already-finished background turn through the one-shot message lookup without replaying its original prompt. Verified the separate follow process reports the single attributed terminal result."
                         }
                     },
                     "parts": []
