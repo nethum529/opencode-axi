@@ -47,6 +47,18 @@ fn default_model_definition_drives_catalog_and_configuration() {
     }
 }
 
+/// The source between two markers. A missing marker panics rather than
+/// widening the slice, so renaming either boundary fails loudly here.
+fn constructor_body<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+    let (_, after_start) = source
+        .split_once(start)
+        .unwrap_or_else(|| panic!("`{start}` opens a default constructor"));
+    let (body, _) = after_start
+        .split_once(end)
+        .unwrap_or_else(|| panic!("`{end}` closes a default constructor"));
+    body
+}
+
 #[test]
 fn default_constructors_cannot_use_duplicated_model_tables() {
     let state_source = include_str!("../src/config.rs");
@@ -55,16 +67,13 @@ fn default_constructors_cannot_use_duplicated_model_tables() {
     )
     .expect("oca-core resolver source is readable");
 
-    let catalog_constructor = core_source
-        .split("impl Default for ModelCatalog")
-        .nth(1)
-        .and_then(|source| source.split("/// The two CLI effort sources").next())
-        .expect("the catalog default constructor is identifiable");
-    let config_constructor = state_source
-        .split("fn default_models()")
-        .nth(1)
-        .and_then(|source| source.split("fn default_roles()").next())
-        .expect("the config default constructor is identifiable");
+    let catalog_constructor = constructor_body(
+        &core_source,
+        "impl Default for ModelCatalog",
+        "/// The two CLI effort sources",
+    );
+    let config_constructor =
+        constructor_body(state_source, "fn default_models()", "fn default_roles()");
 
     for constructor in [catalog_constructor, config_constructor] {
         assert!(
