@@ -1,3 +1,6 @@
+use oca_cli::{
+    AgentFlag, AgentGrammar, FlagGrammar, FlagValueForm, OperandForm, grammar_contract, parse_from,
+};
 use std::{fs, path::Path};
 
 #[cfg(test)]
@@ -86,55 +89,211 @@ export default async function OcaNotify() {
 "#
 }
 
-fn render_hook() -> &'static str {
-    r#"#!/bin/sh
-count=$(oca ls --blocked --count)
-prev=$(cat "$state_file" 2>/dev/null || echo 0)
-[ "$count" = "$prev" ] && exit 0
-printf 'oca inbox blocked=%s delta=%+d refs=%s\n' "$count" "$((count-prev))" "$(oca ls --blocked --count --refs)"
-echo "$count" > "$state_file"
-"#
+#[derive(Debug)]
+struct GeneratedInvocation {
+    display: String,
+    argv: Vec<String>,
 }
 
-const COMMANDS: &[&str] = &[
-    "oca luna:h \"<task>\"",
-    "oca flash:h -r impl -w -b \"<task>\"",
-    "oca m <ref> \"<message>\"",
-    "oca s <ref> \"<message>\"",
-    "oca q <ref> \"<message>\"",
-    "oca f <ref>",
-    "oca k <ref>",
-    "oca ls",
-    "oca events <ref>",
-    "oca push <ref>",
-    "oca pr <ref>",
-];
-
-fn render_skill() -> String {
-    format!(
-        "---\nname: oca\ndescription: Delegate engineering work to OpenCode workers and inspect or steer their state.\n---\n\n# oca\n\nDispatch every worker with an explicit alias and effort. There is no default.\n\n    {}\n    {}\n\nAliases: luna, sol, terra (gpt-5.6), flash (deepseek-v4-flash-free).\nEfforts: l m h x max. flash accepts h and x only.\n\nUse -b for work that can run while you continue, then immediately park:\n\n    {}\n\nThe follow exits 0 done, 3 blocked, 4 timeout, 5 server unreachable.\n\n    {}\n    {}\n    {}\n    {}\n    {}\n    {}\n\nUse -w when edits must stay isolated. Workers never run git; oca validates the\ndiff and commits locally after each worktree turn.\n\nThe impl reply is status, files, and a note of at most five sentences. A blocked\nworker ends its turn with a question — answer it with `oca m <ref> \"<answer>\"`.\n\n`oca push` and `oca pr` work only where the repository publish grant allows it.\nMerges and grants stay with the human.\n",
-        COMMANDS[0],
-        COMMANDS[1],
-        COMMANDS[5],
-        COMMANDS[2],
-        COMMANDS[3],
-        COMMANDS[4],
-        COMMANDS[6],
-        COMMANDS[7],
-        COMMANDS[8],
-    )
+#[derive(Debug)]
+struct AdvertisedFlag {
+    spelling: &'static str,
+    argv: Vec<String>,
 }
 
-fn artifacts() -> [(&'static str, String); 3] {
-    [
-        ("skills/oca/SKILL.md", render_skill()),
-        ("templates/opencode-plugin.js", render_plugin().to_owned()),
-        ("templates/hook.sh", render_hook().to_owned()),
-    ]
+#[derive(Debug)]
+struct RenderedGuidance {
+    artifacts: Vec<(&'static str, String)>,
+    invocations: Vec<GeneratedInvocation>,
+    advertised_flags: Vec<AdvertisedFlag>,
+}
+
+fn render_guidance(contract: &AgentGrammar) -> Result<RenderedGuidance, String> {
+    let (skill, mut invocations, advertised_flags) = render_skill(contract)?;
+    let (hook, hook_invocation) = render_hook(contract)?;
+    invocations.push(hook_invocation);
+
+    Ok(RenderedGuidance {
+        artifacts: vec![
+            ("skills/oca/SKILL.md", skill),
+            ("templates/opencode-plugin.js", render_plugin().to_owned()),
+            ("templates/hook.sh", hook),
+        ],
+        invocations,
+        advertised_flags,
+    })
+}
+
+fn render_hook(contract: &AgentGrammar) -> Result<(String, GeneratedInvocation), String> {
+    let command = contract
+        .commands
+        .iter()
+        .find(|command| {
+            command
+                .flags
+                .iter()
+                .any(|flag| flag.kind == AgentFlag::Blocked)
+                && command
+                    .flags
+                    .iter()
+                    .any(|flag| flag.kind == AgentFlag::Count)
+        })
+        .ok_or_else(|| "grammar contract has no blocked-count command".to_owned())?;
+    let display_token = command
+        .display_tokens
+        .first()
+        .ok_or_else(|| "blocked-count command has no display token".to_owned())?;
+    let blocked = flag_spelling(command.flags, AgentFlag::Blocked)?;
+    let count = flag_spelling(command.flags, AgentFlag::Count)?;
+    let invocation = format!("oca {display_token} {blocked} {count}");
+    let contents = format!(
+        "#!/bin/sh\ncount=$({invocation})\nprev=$(cat \"$state_file\" 2>/dev/null || echo 0)\n[ \"$count\" = \"$prev\" ] && exit 0\nprintf 'oca inbox blocked=%s delta=%+d\\n' \"$count\" \"$((count-prev))\"\necho \"$count\" > \"$state_file\"\n"
+    );
+
+    Ok((
+        contents,
+        GeneratedInvocation {
+            display: invocation,
+            argv: vec![
+                "oca".to_owned(),
+                (*display_token).to_owned(),
+                blocked.to_owned(),
+                count.to_owned(),
+            ],
+        },
+    ))
+}
+
+fn flag_spelling(flags: &[FlagGrammar], kind: AgentFlag) -> Result<&'static str, String> {
+    flags
+        .iter()
+        .find(|flag| flag.kind == kind)
+        .and_then(|flag| flag.spellings.first().copied())
+        .ok_or_else(|| format!("grammar contract has no spelling for {kind:?}"))
+}
+
+fn render_skill(
+    contract: &AgentGrammar,
+) -> Result<(String, Vec<GeneratedInvocation>, Vec<AdvertisedFlag>), String> {
+    let mut command_lines = Vec::new();
+    let mut invocations = Vec::new();
+    let mut advertised_flags = Vec::new();
+
+    for command in contract.commands {
+        let validation_argv = command.argv_examples.first().ok_or_else(|| {
+            format!(
+                "grammar command `{}` has no concrete argv example",
+                command.display_tokens.join(" ")
+            )
+        })?;
+        for (index, display_token) in command.display_tokens.iter().enumerate() {
+            let line = render_command_line(display_token, command.operands, command.flags);
+            command_lines.push(format!("    {line}"));
+            let example = command.argv_examples.get(index).unwrap_or(validation_argv);
+            invocations.push(GeneratedInvocation {
+                display: line,
+                argv: example.iter().map(|token| (*token).to_owned()).collect(),
+            });
+        }
+
+        for flag in command.flags {
+            for spelling in flag.spellings {
+                let example = flag
+                    .argv_examples
+                    .iter()
+                    .find(|example| example.contains(spelling))
+                    .ok_or_else(|| {
+                        format!(
+                            "advertised flag `{spelling}` for `{}` has no concrete argv example",
+                            command.display_tokens.join(" ")
+                        )
+                    })?;
+                advertised_flags.push(AdvertisedFlag {
+                    spelling,
+                    argv: example.iter().map(|token| (*token).to_owned()).collect(),
+                });
+            }
+        }
+    }
+
+    let aliases = contract
+        .dispatch_aliases
+        .iter()
+        .map(|alias| format!("{}: {}", alias.alias, alias.effort_ladder.join(" ")))
+        .collect::<Vec<_>>()
+        .join("; ");
+    let skill = format!(
+        "---\nname: oca\ndescription: Delegate engineering work to OpenCode workers and inspect or steer their state.\n---\n\n# oca\n\nDispatch every worker with an explicit alias and effort. There is no default.\n\nAliases and canonical effort ladders: {aliases}.\nAccepted effort forms: {}.\n\nConstruct commands only from this parser-owned surface:\n\n{}\n\nUse the follow command when waiting for a worker. It exits 0 done, 3 blocked, 4 timeout, and 5 server unreachable.\n\nUse the worktree option when edits must stay isolated. Workers never run git; oca validates the diff and commits locally after each worktree turn.\n\nA blocked worker ends its turn with a question; answer it with the message command. Publication commands work only where the repository publish grant allows them. Merges and grants stay with the human.\n",
+        contract.effort_forms.join(" "),
+        command_lines.join("\n")
+    );
+
+    Ok((skill, invocations, advertised_flags))
+}
+
+fn render_command_line(
+    display_token: &str,
+    operands: &[oca_cli::OperandGrammar],
+    flags: &[FlagGrammar],
+) -> String {
+    let mut tokens = vec!["oca".to_owned(), display_token.to_owned()];
+    tokens.extend(
+        operands
+            .iter()
+            .filter(|operand| operand.form == OperandForm::Required)
+            .map(|operand| format!("<{}>", operand.name)),
+    );
+    tokens.extend(
+        flags
+            .iter()
+            .filter(|flag| {
+                !matches!(flag.value, FlagValueForm::DispatchEffort { .. })
+                    || !display_token.contains("<effort>")
+            })
+            .map(render_flag),
+    );
+    tokens.extend(
+        operands
+            .iter()
+            .filter(|operand| operand.form == OperandForm::OneOrMore)
+            .map(|operand| format!("<{}...>", operand.name)),
+    );
+    tokens.join(" ")
+}
+
+fn render_flag(flag: &FlagGrammar) -> String {
+    let value = match flag.value {
+        FlagValueForm::None => String::new(),
+        FlagValueForm::Required { placeholder, .. }
+        | FlagValueForm::DispatchEffort { placeholder } => format!(" {placeholder}"),
+    };
+    format!("[{}{value}]", flag.spellings.join("|"))
+}
+
+fn validate_rendered_guidance(guidance: &RenderedGuidance) -> Result<(), String> {
+    for invocation in &guidance.invocations {
+        parse_from(invocation.argv.iter().cloned()).map_err(|error| {
+            format!(
+                "generated invocation `{}` was rejected by oca_cli::parse_from: {error}",
+                invocation.display
+            )
+        })?;
+    }
+    for flag in &guidance.advertised_flags {
+        parse_from(flag.argv.iter().cloned()).map_err(|error| {
+            format!(
+                "advertised flag `{}` was rejected by oca_cli::parse_from: {error}",
+                flag.spelling
+            )
+        })?;
+    }
+    Ok(())
 }
 
 pub(crate) fn write_artifacts(workspace_root: &Path) -> Result<(), String> {
-    for (relative_path, contents) in artifacts() {
+    let guidance = render_guidance(grammar_contract())?;
+    validate_rendered_guidance(&guidance)?;
+    for (relative_path, contents) in guidance.artifacts {
         let path = workspace_root.join(relative_path);
         let parent = path
             .parent()
@@ -148,8 +307,15 @@ pub(crate) fn write_artifacts(workspace_root: &Path) -> Result<(), String> {
 }
 
 pub(crate) fn check_drift(workspace_root: &Path) -> Result<(), String> {
+    check_drift_with_contract(workspace_root, grammar_contract())
+}
+
+fn check_drift_with_contract(workspace_root: &Path, contract: &AgentGrammar) -> Result<(), String> {
+    let guidance = render_guidance(contract)?;
+    validate_rendered_guidance(&guidance)?;
+
     let mut drifted = Vec::new();
-    for (relative_path, contents) in artifacts() {
+    for (relative_path, contents) in guidance.artifacts {
         let path = workspace_root.join(relative_path);
         match fs::read_to_string(&path) {
             Ok(committed) if committed == contents => {}
@@ -170,7 +336,117 @@ pub(crate) fn check_drift(workspace_root: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMMANDS, Notification, classify_notification, render_hook, render_plugin, render_skill,
+        Notification, check_drift_with_contract, classify_notification, render_hook, render_plugin,
+        render_skill,
+    };
+    use oca_cli::{
+        AgentCommand, AgentFlag, AgentGrammar, CommandGrammar, DispatchAliasGrammar, FlagGrammar,
+        FlagValueForm, OperandForm, OperandGrammar, grammar_contract,
+    };
+    use std::{env, fs, process, time::SystemTime};
+
+    const FIXTURE_DISPATCH_FLAGS: &[FlagGrammar] = &[FlagGrammar {
+        kind: AgentFlag::Role,
+        spellings: &["--persona"],
+        value: FlagValueForm::Required {
+            placeholder: "<persona>",
+            accepted_values: &[],
+        },
+        argv_examples: &[&["oca", "unit:h", "--persona", "impl", "work"]],
+    }];
+    const FIXTURE_LIST_FLAGS: &[FlagGrammar] = &[
+        FlagGrammar {
+            kind: AgentFlag::Blocked,
+            spellings: &["--stalled"],
+            value: FlagValueForm::None,
+            argv_examples: &[&["oca", "inbox-token", "--stalled"]],
+        },
+        FlagGrammar {
+            kind: AgentFlag::Count,
+            spellings: &["--total"],
+            value: FlagValueForm::None,
+            argv_examples: &[&["oca", "inbox-token", "--total"]],
+        },
+    ];
+    const FIXTURE_COMMANDS: &[CommandGrammar] = &[
+        CommandGrammar {
+            kind: AgentCommand::Dispatch,
+            display_tokens: &["<engine>@<depth>"],
+            operands: &[OperandGrammar {
+                name: "job",
+                form: OperandForm::OneOrMore,
+            }],
+            flags: FIXTURE_DISPATCH_FLAGS,
+            end_of_options: None,
+            argv_examples: &[&["oca", "unit:h", "work"]],
+        },
+        CommandGrammar {
+            kind: AgentCommand::Control("inbox"),
+            display_tokens: &["inbox-token"],
+            operands: &[],
+            flags: FIXTURE_LIST_FLAGS,
+            end_of_options: None,
+            argv_examples: &[&["oca", "inbox-token"]],
+        },
+    ];
+    const FIXTURE_ALIASES: &[DispatchAliasGrammar] = &[DispatchAliasGrammar {
+        alias: "unit",
+        effort_ladder: &["h"],
+    }];
+    const RENDER_FIXTURE: AgentGrammar = AgentGrammar {
+        commands: FIXTURE_COMMANDS,
+        dispatch_aliases: FIXTURE_ALIASES,
+        effort_forms: &["h"],
+    };
+
+    const REJECTED_DISPATCH_FLAGS: &[FlagGrammar] = &[FlagGrammar {
+        kind: AgentFlag::Worktree,
+        spellings: &["-b"],
+        value: FlagValueForm::None,
+        argv_examples: &[&["oca", "luna:l", "-b", "work"]],
+    }];
+    const REJECTED_LIST_FLAGS: &[FlagGrammar] = &[
+        FlagGrammar {
+            kind: AgentFlag::Blocked,
+            spellings: &["--blocked"],
+            value: FlagValueForm::None,
+            argv_examples: &[&["oca", "ls", "--blocked"]],
+        },
+        FlagGrammar {
+            kind: AgentFlag::Count,
+            spellings: &["--count"],
+            value: FlagValueForm::None,
+            argv_examples: &[&["oca", "ls", "--count"]],
+        },
+    ];
+    const REJECTED_COMMANDS: &[CommandGrammar] = &[
+        CommandGrammar {
+            kind: AgentCommand::Dispatch,
+            display_tokens: &["<alias>:<effort>"],
+            operands: &[OperandGrammar {
+                name: "prompt",
+                form: OperandForm::OneOrMore,
+            }],
+            flags: REJECTED_DISPATCH_FLAGS,
+            end_of_options: None,
+            argv_examples: &[&["oca", "luna:l", "-b", "work"]],
+        },
+        CommandGrammar {
+            kind: AgentCommand::Control("ls"),
+            display_tokens: &["ls"],
+            operands: &[],
+            flags: REJECTED_LIST_FLAGS,
+            end_of_options: None,
+            argv_examples: &[&["oca", "ls"]],
+        },
+    ];
+    const REJECTED_CONTRACT: AgentGrammar = AgentGrammar {
+        commands: REJECTED_COMMANDS,
+        dispatch_aliases: &[DispatchAliasGrammar {
+            alias: "luna",
+            effort_ladder: &["l"],
+        }],
+        effort_forms: &["l"],
     };
 
     // Seam under test: classify_notification. The generated plugin must only
@@ -254,49 +530,82 @@ mod tests {
 
     #[test]
     fn hook_renderer_emits_a_delta_only_blocked_inbox() {
-        let hook = render_hook();
+        let (hook, _) = render_hook(grammar_contract()).expect("default hook grammar is complete");
 
         assert!(hook.starts_with("#!/bin/sh\n"));
         assert!(hook.contains("count=$(oca ls --blocked --count)"));
         assert!(hook.contains("prev=$(cat \"$state_file\" 2>/dev/null || echo 0)"));
         assert!(hook.contains("[ \"$count\" = \"$prev\" ] && exit 0"));
-        assert!(hook.contains(
-            "printf 'oca inbox blocked=%s delta=%+d refs=%s\\n' \"$count\" \"$((count-prev))\" \"$(oca ls --blocked --count --refs)\""
-        ));
+        assert!(
+            hook.contains(
+                "printf 'oca inbox blocked=%s delta=%+d\\n' \"$count\" \"$((count-prev))\""
+            )
+        );
+        assert!(!hook.contains("refs"));
         assert!(hook.ends_with("echo \"$count\" > \"$state_file\"\n"));
     }
 
     #[test]
-    fn skill_and_command_array_publish_only_the_agent_surface() {
-        assert_eq!(
-            COMMANDS,
-            [
-                "oca luna:h \"<task>\"",
-                "oca flash:h -r impl -w -b \"<task>\"",
-                "oca m <ref> \"<message>\"",
-                "oca s <ref> \"<message>\"",
-                "oca q <ref> \"<message>\"",
-                "oca f <ref>",
-                "oca k <ref>",
-                "oca ls",
-                "oca events <ref>",
-                "oca push <ref>",
-                "oca pr <ref>",
-            ]
-        );
+    fn injected_contract_drives_skill_and_hook_tokens_and_flag_spellings() {
+        let (skill, _, _) = render_skill(&RENDER_FIXTURE).expect("fixture renders a skill");
+        let (hook, _) = render_hook(&RENDER_FIXTURE).expect("fixture renders a hook");
 
-        let skill = render_skill();
+        assert!(skill.contains("oca <engine>@<depth> [--persona <persona>] <job...>"));
+        assert!(skill.contains("oca inbox-token [--stalled] [--total]"));
+        assert!(hook.contains("count=$(oca inbox-token --stalled --total)"));
+    }
+
+    #[test]
+    fn skill_publishes_only_contract_commands_and_flags() {
+        let (skill, _, _) =
+            render_skill(grammar_contract()).expect("default grammar renders a skill");
         assert!(skill.starts_with("---\nname: oca\ndescription: Delegate engineering work"));
-        assert!(
-            skill.contains("Aliases: luna, sol, terra (gpt-5.6), flash (deepseek-v4-flash-free).")
-        );
-        assert!(
-            skill.contains("The follow exits 0 done, 3 blocked, 4 timeout, 5 server unreachable.")
-        );
+        assert!(skill.contains("luna: low medium high xhigh max"));
+        assert!(skill.contains("It exits 0 done, 3 blocked, 4 timeout"));
         assert!(skill.contains("Merges and grants stay with the human."));
-        for forbidden in ["oca __attach", "oca clean", "oca ping"] {
-            assert!(!skill.contains(forbidden), "skill must exclude {forbidden}");
-            assert!(COMMANDS.iter().all(|command| !command.contains(forbidden)));
+        for command in grammar_contract().commands {
+            for display_token in command.display_tokens {
+                assert!(skill.contains(&format!("oca {display_token}")));
+            }
+            for flag in command.flags {
+                for spelling in flag.spellings {
+                    assert!(skill.contains(spelling));
+                }
+            }
         }
+        for forbidden in [
+            "oca luna:h",
+            " -b",
+            "oca s ",
+            "oca __attach",
+            "oca clean",
+            "oca ping",
+        ] {
+            assert!(!skill.contains(forbidden), "skill must exclude {forbidden}");
+        }
+    }
+
+    #[test]
+    fn drift_check_validates_parser_evidence_before_comparing_artifacts() {
+        let workspace_root = env::temp_dir().join(format!(
+            "oca-guidance-parser-first-test-{}-{}",
+            process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("system time is after the Unix epoch")
+                .as_nanos()
+        ));
+        fs::create_dir_all(workspace_root.join("skills/oca"))
+            .expect("drifting artifact root can be created");
+        fs::write(workspace_root.join("skills/oca/SKILL.md"), "drifted\n")
+            .expect("drifting artifact can be written");
+
+        let error = check_drift_with_contract(&workspace_root, &REJECTED_CONTRACT)
+            .expect_err("the rejected -b fixture must fail parser validation");
+
+        assert!(error.contains("oca_cli::parse_from"), "{error}");
+        assert!(error.contains("unknown flag `-b`"), "{error}");
+        assert!(!error.contains("out of sync"), "{error}");
+        fs::remove_dir_all(workspace_root).expect("test output can be removed");
     }
 }

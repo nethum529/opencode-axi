@@ -68,9 +68,34 @@ pub enum FlagValueForm {
     },
 }
 
+/// The parser behavior controlled by an agent-visible flag.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum AgentFlag {
+    /// Select machine-readable output.
+    Json,
+    /// Select model effort.
+    Effort,
+    /// Select the worker role.
+    Role,
+    /// Isolate worker edits in a worktree.
+    Worktree,
+    /// Run without an interactive terminal.
+    Headless,
+    /// Include completed workers in list output.
+    All,
+    /// Restrict list output to blocked workers.
+    Blocked,
+    /// Emit only the list result count.
+    Count,
+    /// Start event output at a cursor.
+    Since,
+}
+
 /// One accepted option spelling and executable examples of its use.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlagGrammar {
+    /// The parser behavior controlled by this flag.
+    pub kind: AgentFlag,
     /// Equivalent spellings accepted by the parser.
     pub spellings: &'static [&'static str],
     /// Whether the option takes a value and, if known, its accepted forms.
@@ -201,6 +226,7 @@ const DISPATCH_EXAMPLES: &[&[&str]] = &[
 ];
 const DISPATCH_FLAGS: &[FlagGrammar] = &[
     FlagGrammar {
+        kind: AgentFlag::Json,
         spellings: &["--json"],
         value: FlagValueForm::None,
         argv_examples: &[
@@ -209,6 +235,7 @@ const DISPATCH_FLAGS: &[FlagGrammar] = &[
         ],
     },
     FlagGrammar {
+        kind: AgentFlag::Effort,
         spellings: &["-e", "--effort"],
         value: FlagValueForm::DispatchEffort {
             placeholder: "<effort>",
@@ -219,6 +246,7 @@ const DISPATCH_FLAGS: &[FlagGrammar] = &[
         ],
     },
     FlagGrammar {
+        kind: AgentFlag::Role,
         spellings: &["-r", "--role"],
         value: FlagValueForm::Required {
             placeholder: "<role>",
@@ -230,6 +258,7 @@ const DISPATCH_FLAGS: &[FlagGrammar] = &[
         ],
     },
     FlagGrammar {
+        kind: AgentFlag::Worktree,
         spellings: &["-w", "--worktree"],
         value: FlagValueForm::None,
         argv_examples: &[
@@ -238,6 +267,7 @@ const DISPATCH_FLAGS: &[FlagGrammar] = &[
         ],
     },
     FlagGrammar {
+        kind: AgentFlag::Headless,
         spellings: &["--headless"],
         value: FlagValueForm::None,
         argv_examples: &[&["oca", "flash:h", "--headless", "run", "without", "a", "tui"]],
@@ -250,11 +280,13 @@ const MESSAGE_EXAMPLES: &[&[&str]] = &[
 ];
 const MESSAGE_FLAGS: &[FlagGrammar] = &[
     FlagGrammar {
+        kind: AgentFlag::Json,
         spellings: &["--json"],
         value: FlagValueForm::None,
         argv_examples: &[&["oca", "m", "w4f2a1", "--json", "report", "json"]],
     },
     FlagGrammar {
+        kind: AgentFlag::Effort,
         spellings: &["-e", "--effort"],
         value: FlagValueForm::Required {
             placeholder: "<effort>",
@@ -281,6 +313,7 @@ const MESSAGE_END_OF_OPTIONS: EndOfOptionsGrammar = EndOfOptionsGrammar {
 
 const QUEUE_EXAMPLES: &[&[&str]] = &[&["oca", "q", "w4f2a1", "queue", "this", "message"]];
 const QUEUE_FLAGS: &[FlagGrammar] = &[FlagGrammar {
+    kind: AgentFlag::Json,
     spellings: &["--json"],
     value: FlagValueForm::None,
     argv_examples: &[&["oca", "q", "w4f2a1", "--json", "queue", "json"]],
@@ -288,6 +321,7 @@ const QUEUE_FLAGS: &[FlagGrammar] = &[FlagGrammar {
 
 const FOLLOW_EXAMPLES: &[&[&str]] = &[&["oca", "f", "w4f2a1"]];
 const FOLLOW_FLAGS: &[FlagGrammar] = &[FlagGrammar {
+    kind: AgentFlag::Json,
     spellings: &["--json"],
     value: FlagValueForm::None,
     argv_examples: &[&["oca", "f", "w4f2a1", "--json"]],
@@ -295,6 +329,7 @@ const FOLLOW_FLAGS: &[FlagGrammar] = &[FlagGrammar {
 
 const ABORT_EXAMPLES: &[&[&str]] = &[&["oca", "k", "w4f2a1"]];
 const ABORT_FLAGS: &[FlagGrammar] = &[FlagGrammar {
+    kind: AgentFlag::Json,
     spellings: &["--json"],
     value: FlagValueForm::None,
     argv_examples: &[&["oca", "k", "w4f2a1", "--json"]],
@@ -303,21 +338,25 @@ const ABORT_FLAGS: &[FlagGrammar] = &[FlagGrammar {
 const LIST_EXAMPLES: &[&[&str]] = &[&["oca", "ls"]];
 const LIST_FLAGS: &[FlagGrammar] = &[
     FlagGrammar {
+        kind: AgentFlag::All,
         spellings: &["--all"],
         value: FlagValueForm::None,
         argv_examples: &[&["oca", "ls", "--all"]],
     },
     FlagGrammar {
+        kind: AgentFlag::Blocked,
         spellings: &["--blocked"],
         value: FlagValueForm::None,
         argv_examples: &[&["oca", "ls", "--blocked"]],
     },
     FlagGrammar {
+        kind: AgentFlag::Count,
         spellings: &["--count"],
         value: FlagValueForm::None,
         argv_examples: &[&["oca", "ls", "--count"]],
     },
     FlagGrammar {
+        kind: AgentFlag::Json,
         spellings: &["--json"],
         value: FlagValueForm::None,
         argv_examples: &[&["oca", "ls", "--json"]],
@@ -327,6 +366,7 @@ const LIST_FLAGS: &[FlagGrammar] = &[
 const EVENTS_EXAMPLES: &[&[&str]] = &[&["oca", "events", "w4f2a1"]];
 const EVENTS_FLAGS: &[FlagGrammar] = &[
     FlagGrammar {
+        kind: AgentFlag::Since,
         spellings: &["--since"],
         value: FlagValueForm::Required {
             placeholder: "<non-negative-integer>",
@@ -335,6 +375,7 @@ const EVENTS_FLAGS: &[FlagGrammar] = &[
         argv_examples: &[&["oca", "events", "w4f2a1", "--since", "7"]],
     },
     FlagGrammar {
+        kind: AgentFlag::Json,
         spellings: &["--json"],
         value: FlagValueForm::None,
         argv_examples: &[&["oca", "events", "w4f2a1", "--json"]],
@@ -343,6 +384,7 @@ const EVENTS_FLAGS: &[FlagGrammar] = &[
 
 const PUSH_EXAMPLES: &[&[&str]] = &[&["oca", "push", "w4f2a1"]];
 const PUSH_FLAGS: &[FlagGrammar] = &[FlagGrammar {
+    kind: AgentFlag::Json,
     spellings: &["--json"],
     value: FlagValueForm::None,
     argv_examples: &[&["oca", "push", "w4f2a1", "--json"]],
@@ -350,6 +392,7 @@ const PUSH_FLAGS: &[FlagGrammar] = &[FlagGrammar {
 
 const PULL_REQUEST_EXAMPLES: &[&[&str]] = &[&["oca", "pr", "w4f2a1"]];
 const PULL_REQUEST_FLAGS: &[FlagGrammar] = &[FlagGrammar {
+    kind: AgentFlag::Json,
     spellings: &["--json"],
     value: FlagValueForm::None,
     argv_examples: &[&["oca", "pr", "w4f2a1", "--json"]],

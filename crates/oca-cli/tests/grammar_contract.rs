@@ -54,7 +54,14 @@ fn agent_grammar_contract_is_visible_and_parseable() {
         for arguments in command.argv_examples {
             assert_example_matches_command(command, arguments);
         }
+        let mut flag_kinds = BTreeSet::new();
         for flag in command.flags {
+            assert!(
+                flag_kinds.insert(flag.kind),
+                "command `{}` publishes {:?} more than once",
+                command.display_tokens.join(" "),
+                flag.kind
+            );
             assert!(
                 !flag.spellings.is_empty(),
                 "every advertised flag needs a spelling"
