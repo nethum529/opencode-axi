@@ -474,6 +474,12 @@ impl RefStore {
                         path: temporary.clone(),
                         source,
                     })?;
+            #[cfg(unix)]
+            file.set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|source| RefStoreError::Io {
+                    path: temporary.clone(),
+                    source,
+                })?;
             file.write_all(&bytes).map_err(|source| RefStoreError::Io {
                 path: temporary.clone(),
                 source,
@@ -812,6 +818,7 @@ mod tests {
         }
         assert_eq!(fs::read(&paths.refs_file).unwrap(), payload);
         assert!(!directory.path().join("corrupt").exists());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
     }
 
     #[test]
@@ -838,6 +845,7 @@ mod tests {
         }
         assert_eq!(fs::read(&paths.refs_file).unwrap(), payload);
         assert!(!directory.path().join("corrupt").exists());
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
     }
 
     #[cfg(unix)]
@@ -907,6 +915,66 @@ mod tests {
         assert_eq!(mode(&paths.refs_file), 0o600);
         assert_eq!(mode(&paths.lock_file), 0o600);
         assert_eq!(*hook.temporary_mode.lock().unwrap(), Some(0o600));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_mutation_is_private_under_an_owner_read_blocking_umask() {
+        const CHILD_ENV: &str = "OCA_STATE_REFS_UMASK_CHILD";
+        const TEST_NAME: &str =
+            "refs::tests::first_mutation_is_private_under_an_owner_read_blocking_umask";
+
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST_NAME])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "umask child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        // SAFETY: this test executes in a dedicated child process, so changing
+        // the process-global umask cannot affect concurrently running tests.
+        let original_umask = unsafe { libc::umask(0o400) };
+        let _restore_umask = UmaskGuard(original_umask);
+
+        let directory = tempfile::tempdir().unwrap();
+        let store_directory = directory.path().join("state");
+        let paths = RefStorePaths::in_directory(&store_directory);
+        let hook = Arc::new(CaptureTemporaryFileMode {
+            directory: store_directory.clone(),
+            temporary_mode: Mutex::new(None),
+        });
+        let store = RefStore::with_id_source_and_write_hook(
+            paths.clone(),
+            Arc::new(SequenceIdSource::new(&["w00000"])),
+            hook.clone(),
+        );
+
+        store.allocate(NewRef::for_session("session-one")).unwrap();
+
+        assert_eq!(mode(&store_directory), 0o700);
+        assert_eq!(mode(&paths.refs_file), 0o600);
+        assert_eq!(mode(&paths.lock_file), 0o600);
+        assert_eq!(*hook.temporary_mode.lock().unwrap(), Some(0o600));
+    }
+
+    #[cfg(unix)]
+    struct UmaskGuard(libc::mode_t);
+
+    #[cfg(unix)]
+    impl Drop for UmaskGuard {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` is the umask returned by `libc::umask` above.
+            unsafe {
+                libc::umask(self.0);
+            }
+        }
     }
 
     #[cfg(unix)]

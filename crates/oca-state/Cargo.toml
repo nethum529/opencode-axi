@@ -14,3 +14,6 @@ toml = "0.9"
 
 [dev-dependencies]
 tempfile = "3.23"
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
