@@ -49,6 +49,18 @@ pub struct ForegroundOutcome {
     pub reply: RoleReply,
 }
 
+/// The common dispatch prefix retained by the process that owns completion.
+///
+/// Background dispatch deliberately drops `subscription` after acknowledgement;
+/// foreground dispatch carries it into terminal waiting.
+pub(crate) struct StartedDispatch<S> {
+    pub(crate) request: ForegroundRequest,
+    pub(crate) subscription: S,
+    pub(crate) reference: String,
+    pub(crate) session_id: String,
+    pub(crate) message_id: String,
+}
+
 /// Injected transport, state, output, launcher, and finalization seams.
 ///
 /// Keeping each phase separate makes the two load-bearing request-order and
@@ -130,18 +142,59 @@ pub async fn run_foreground<B>(
 where
     B: ForegroundBackend,
 {
+    let mut started = start_dispatch(backend, request).await?;
+
+    let terminal = match backend
+        .reconcile_once(&started.session_id, &started.message_id)
+        .await?
+    {
+        Some(terminal) => terminal,
+        None => {
+            backend
+                .wait_terminal(
+                    &mut started.subscription,
+                    &started.session_id,
+                    &started.message_id,
+                )
+                .await?
+        }
+    };
+
+    // Deliberately structural only. T27a owns validate_reply_floor and the
+    // foreground path must not call it in this ticket.
+    let reply = decode_role_reply(started.request.contract, terminal.structured)?;
+    backend.finalize(&started.reference, &reply)?;
+    backend.print_final(&started.reference, &reply, started.request.json)?;
+
+    Ok(ForegroundOutcome {
+        reference: started.reference,
+        session_id: started.session_id,
+        message_id: started.message_id,
+        reply,
+    })
+}
+
+/// Runs the single subscribe-before-prompt dispatch prefix shared by foreground
+/// and background ownership.
+pub(crate) async fn start_dispatch<B>(
+    backend: &mut B,
+    request: ForegroundRequest,
+) -> Result<StartedDispatch<B::Subscription>, OcaError>
+where
+    B: ForegroundBackend,
+{
     let session_id = backend.create_session(&request).await?;
 
     // This ordering is binding: the stream must be established before the
     // server is allowed to admit the prompt.
-    let mut subscription = backend.subscribe().await?;
+    let subscription = backend.subscribe().await?;
     let message_id = backend.mint_message_id()?;
     let prompt = DispatchPrompt {
         message_id: message_id.clone(),
         model: request.model.clone(),
         variant: request.model.variant.clone(),
         role: request.role.clone(),
-        text: request.prompt,
+        text: request.prompt.clone(),
         output_schema: request.contract.schema(),
         permission: request.policy.permission_profile(),
     };
@@ -154,26 +207,12 @@ where
     // flushed by the backend's acknowledgement boundary.
     backend.spawn_attach(&reference, &session_id, &request.cwd, request.headless)?;
 
-    let terminal = match backend.reconcile_once(&session_id, &message_id).await? {
-        Some(terminal) => terminal,
-        None => {
-            backend
-                .wait_terminal(&mut subscription, &session_id, &message_id)
-                .await?
-        }
-    };
-
-    // Deliberately structural only. T27a owns validate_reply_floor and the
-    // foreground path must not call it in this ticket.
-    let reply = decode_role_reply(request.contract, terminal.structured)?;
-    backend.finalize(&reference, &reply)?;
-    backend.print_final(&reference, &reply, request.json)?;
-
-    Ok(ForegroundOutcome {
+    Ok(StartedDispatch {
+        request,
+        subscription,
         reference,
         session_id,
         message_id,
-        reply,
     })
 }
 

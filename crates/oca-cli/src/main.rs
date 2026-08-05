@@ -18,6 +18,7 @@ fn main() -> ExitCode {
 
     match result {
         Ok((home, oca_cli::Command::Dispatch(command))) => {
+            let background = command.background;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -26,10 +27,17 @@ fn main() -> ExitCode {
                         .with_error(format!("could not start async runtime: {error}"))
                 });
             match runtime {
-                Ok(runtime) => match runtime.block_on(oca_cli::execute_foreground(command, home)) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(error) => render_error(&error, json),
-                },
+                Ok(runtime) => {
+                    let execution = if background {
+                        runtime.block_on(oca_cli::execute_background(command, home))
+                    } else {
+                        runtime.block_on(oca_cli::execute_foreground(command, home))
+                    };
+                    match execution {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(error) => render_error(&error, json),
+                    }
+                }
                 Err(error) => render_error(&error, json),
             }
         }

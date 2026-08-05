@@ -32,9 +32,34 @@ pub async fn execute_foreground(
     command: DispatchCommand,
     home: impl AsRef<Path>,
 ) -> Result<(), OcaError> {
+    let mut prepared = prepare_dispatch(command, home, PostAckDurability::Complete)?;
+    run_foreground(&mut prepared.backend, prepared.request)
+        .await
+        .map(|_| ())
+}
+
+/// Who owns the potentially blocking parent-directory durability attempt after
+/// acknowledgement has been flushed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PostAckDurability {
+    Complete,
+    Transfer,
+}
+
+pub(crate) struct PreparedDispatch {
+    pub(crate) backend: ProductionBackend,
+    pub(crate) request: ForegroundRequest,
+}
+
+/// Resolves production state shared by foreground and background dispatch.
+pub(crate) fn prepare_dispatch(
+    command: DispatchCommand,
+    home: impl AsRef<Path>,
+    post_ack_durability: PostAckDurability,
+) -> Result<PreparedDispatch, OcaError> {
     if command.worktree {
         return Err(OcaError::new(ErrorCode::Usage)
-            .with_error("worktree dispatch is not available in the foreground path yet")
+            .with_error("worktree dispatch is not available in this dispatch path yet")
             .with_help("retry without `-w`; worktree dispatch is owned by T21/T22"));
     }
 
@@ -70,7 +95,7 @@ pub async fn execute_foreground(
                 .with_error(format!("invalid recorded OpenCode URL: {error}"))
         })?;
     let refs = RefStore::with_paths(RefStorePaths::in_directory(home.join(".oca")));
-    let mut backend = ProductionBackend::new(OpenCodeClient::new(base_url), refs);
+    let backend = ProductionBackend::new(OpenCodeClient::new(base_url), refs, post_ack_durability);
     let request = ForegroundRequest {
         model: command.model,
         prompt: command.prompt,
@@ -82,21 +107,23 @@ pub async fn execute_foreground(
         json: command.json,
     };
 
-    run_foreground(&mut backend, request).await.map(|_| ())
+    Ok(PreparedDispatch { backend, request })
 }
 
-struct ProductionBackend {
+pub(crate) struct ProductionBackend {
     client: OpenCodeClient,
     refs: RefStore,
     message_ids: MessageIdGenerator,
+    post_ack_durability: PostAckDurability,
 }
 
 impl ProductionBackend {
-    fn new(client: OpenCodeClient, refs: RefStore) -> Self {
+    fn new(client: OpenCodeClient, refs: RefStore, post_ack_durability: PostAckDurability) -> Self {
         Self {
             client,
             refs,
             message_ids: MessageIdGenerator::new(),
+            post_ack_durability,
         }
     }
 
@@ -201,23 +228,26 @@ impl ForegroundBackend for ProductionBackend {
         model: &ResolvedModel,
         json: bool,
     ) -> Result<String, OcaError> {
-        let completion = pending
-            .acknowledge_with(|record| {
-                let document = Acknowledgement::from_resolved(&record.id, "running", model);
-                let rendered = if json {
-                    document.render_json()
-                } else {
-                    document.render_toon()
-                };
-                let mut stdout = io::stdout().lock();
-                stdout.write_all(rendered.as_bytes())?;
-                stdout.flush()
-            })
-            .map_err(io_error)?;
-        if let Some(warning) = completion.durability_warning() {
-            eprintln!("warning: {warning}");
+        match self.post_ack_durability {
+            PostAckDurability::Complete => {
+                let completion = pending
+                    .acknowledge_with(|record| print_ack(&record.id, model, json))
+                    .map_err(io_error)?;
+                if let Some(warning) = completion.durability_warning() {
+                    eprintln!("warning: {warning}");
+                }
+                Ok(completion.record().id.clone())
+            }
+            PostAckDurability::Transfer => {
+                let reference = pending.record().id.clone();
+                print_ack(&reference, model, json).map_err(io_error)?;
+                // Dropping the retained lock leaves the durability marker for
+                // the next ref-store entrant (normally the follow process).
+                // Background dispatch performs no directory fsync after ack.
+                drop(pending);
+                Ok(reference)
+            }
         }
-        Ok(completion.record().id.clone())
     }
 
     fn spawn_attach(
@@ -317,6 +347,18 @@ impl ForegroundBackend for ProductionBackend {
         stdout.write_all(rendered.as_bytes()).map_err(io_error)?;
         stdout.flush().map_err(io_error)
     }
+}
+
+fn print_ack(reference: &str, model: &ResolvedModel, json: bool) -> io::Result<()> {
+    let document = Acknowledgement::from_resolved(reference, "running", model);
+    let rendered = if json {
+        document.render_json()
+    } else {
+        document.render_toon()
+    };
+    let mut stdout = io::stdout().lock();
+    stdout.write_all(rendered.as_bytes())?;
+    stdout.flush()
 }
 
 fn open_code_error(error: OpenCodeError) -> OcaError {
