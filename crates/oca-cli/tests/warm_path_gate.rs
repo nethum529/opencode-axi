@@ -423,7 +423,6 @@ struct ServerState {
 }
 
 struct CurrentDispatch {
-    session_id: String,
     awaiting_ack: bool,
     pre_ack_requests: Vec<String>,
 }
@@ -534,7 +533,6 @@ fn serve(listener: TcpListener, shared: &Arc<(Mutex<ServerState>, Condvar)>) {
                 state.next_session += 1;
                 let session_id = format!("ses_warm_{}", state.next_session);
                 state.current = Some(CurrentDispatch {
-                    session_id: session_id.clone(),
                     awaiting_ack: true,
                     pre_ack_requests: vec![path.clone()],
                 });
@@ -545,19 +543,18 @@ fn serve(listener: TcpListener, shared: &Arc<(Mutex<ServerState>, Condvar)>) {
                     false,
                 )
             } else {
-                let current = state.current.as_mut();
-                if let Some(current) = current.as_ref().filter(|current| current.awaiting_ack) {
-                    let belongs_to_current = path == "/event"
-                        || path.contains(&current.session_id)
-                        || !path.starts_with("/session/");
-                    if belongs_to_current {
-                        state
-                            .current
-                            .as_mut()
-                            .expect("current dispatch exists")
-                            .pre_ack_requests
-                            .push(path.clone());
-                    }
+                // Every pre-ack request is recorded, including one naming a
+                // session this dispatch never created: a poll against any
+                // session is exactly what the warm-path budget forbids. Each
+                // dispatch waits for its child to exit and barriers the server
+                // before the next one starts, so no earlier process can still
+                // be in flight here.
+                if let Some(current) = state
+                    .current
+                    .as_mut()
+                    .filter(|current| current.awaiting_ack)
+                {
+                    current.pre_ack_requests.push(path.clone());
                 }
 
                 if path == "/event" {
