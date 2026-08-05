@@ -401,9 +401,9 @@ mod tests {
 
     const REJECTED_DISPATCH_FLAGS: &[FlagGrammar] = &[FlagGrammar {
         kind: AgentFlag::Worktree,
-        spellings: &["-b"],
+        spellings: &["--isolated"],
         value: FlagValueForm::None,
-        argv_examples: &[&["oca", "luna:l", "-b", "work"]],
+        argv_examples: &[&["oca", "luna:l", "--isolated", "work"]],
     }];
     const REJECTED_LIST_FLAGS: &[FlagGrammar] = &[
         FlagGrammar {
@@ -429,7 +429,7 @@ mod tests {
             }],
             flags: REJECTED_DISPATCH_FLAGS,
             end_of_options: None,
-            argv_examples: &[&["oca", "luna:l", "-b", "work"]],
+            argv_examples: &[&["oca", "luna:l", "--isolated", "work"]],
         },
         CommandGrammar {
             kind: AgentCommand::Control("ls"),
@@ -601,10 +601,10 @@ mod tests {
             .expect("drifting artifact can be written");
 
         let error = check_drift_with_contract(&workspace_root, &REJECTED_CONTRACT)
-            .expect_err("the rejected -b fixture must fail parser validation");
+            .expect_err("the rejected --isolated fixture must fail parser validation");
 
         assert!(error.contains("oca_cli::parse_from"), "{error}");
-        assert!(error.contains("unknown flag `-b`"), "{error}");
+        assert!(error.contains("unknown flag `--isolated`"), "{error}");
         assert!(!error.contains("out of sync"), "{error}");
         fs::remove_dir_all(workspace_root).expect("test output can be removed");
     }

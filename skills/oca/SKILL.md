@@ -12,8 +12,8 @@ Accepted effort spellings: l m h x max low medium high xhigh. Choose a spelling 
 
 Construct commands only from this parser-owned surface:
 
-    oca <alias>:<effort> [--json] [-r|--role <role>] [-w|--worktree] [--headless] <prompt...>
-    oca <alias> -e <effort> [--json] [-r|--role <role>] [-w|--worktree] [--headless] <prompt...>
+    oca <alias>:<effort> [--json] [-r|--role <role>] [-w|--worktree] [-b] [--headless] <prompt...>
+    oca <alias> -e <effort> [--json] [-r|--role <role>] [-w|--worktree] [-b] [--headless] <prompt...>
     oca m <ref> [--json] [-e|--effort <effort>] <message...>
     oca q <ref> [--json] <message...>
     oca f <ref> [-t <seconds>] [--json]

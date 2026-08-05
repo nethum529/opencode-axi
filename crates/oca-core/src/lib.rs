@@ -1,5 +1,6 @@
 use std::fmt;
 
+pub mod background;
 pub mod error;
 pub mod follow;
 pub mod foreground;
@@ -9,6 +10,7 @@ pub mod reply;
 pub mod reply_decode;
 pub mod resolver;
 
+pub use background::{BackgroundOutcome, BackgroundRequest, run_background};
 pub use error::{
     ERROR_ENVELOPE_SCHEMA, ErrorCode, ErrorEnvelope, FollowExit, OcaError, error_envelope_schema,
     exit, parse_error_envelope, validate_error_envelope,

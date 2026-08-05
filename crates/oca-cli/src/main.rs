@@ -1,4 +1,4 @@
-use std::process::ExitCode;
+use std::{future::Future, process::ExitCode};
 
 fn main() -> ExitCode {
     let arguments = std::env::args().collect::<Vec<_>>();
@@ -18,6 +18,7 @@ fn main() -> ExitCode {
 
     match result {
         Ok((home, oca_cli::Command::Dispatch(command))) => {
+            let background = command.background;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -26,10 +27,17 @@ fn main() -> ExitCode {
                         .with_error(format!("could not start async runtime: {error}"))
                 });
             match runtime {
-                Ok(runtime) => match runtime.block_on(oca_cli::execute_foreground(command, home)) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(error) => render_error(&error, json),
-                },
+                Ok(runtime) => {
+                    let execution = if background {
+                        runtime.block_on(oca_cli::execute_background(command, home))
+                    } else {
+                        runtime.block_on(oca_cli::execute_foreground(command, home))
+                    };
+                    match execution {
+                        Ok(()) => ExitCode::SUCCESS,
+                        Err(error) => render_error(&error, json),
+                    }
+                }
                 Err(error) => render_error(&error, json),
             }
         }
@@ -64,7 +72,33 @@ fn main() -> ExitCode {
                 Err(error) => render_error(&error, json),
             }
         }
+        Ok((home, oca_cli::Command::Message(command))) => {
+            run_control(oca_cli::execute_message(&command, home), json)
+        }
+        Ok((home, oca_cli::Command::Queue(command))) => {
+            run_control(oca_cli::execute_queue(&command, home), json)
+        }
+        Ok((home, oca_cli::Command::Abort(command))) => {
+            run_control(oca_cli::execute_abort(&command, home), json)
+        }
         Ok(_) => ExitCode::SUCCESS,
+        Err(error) => render_error(&error, json),
+    }
+}
+
+fn run_control(
+    operation: impl Future<Output = Result<oca_cli::ControlCommandOutput, oca_core::OcaError>>,
+    json: bool,
+) -> ExitCode {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("the current-thread runtime must initialize");
+    match runtime.block_on(operation) {
+        Ok(output) => {
+            print!("{}", output.stdout);
+            ExitCode::SUCCESS
+        }
         Err(error) => render_error(&error, json),
     }
 }

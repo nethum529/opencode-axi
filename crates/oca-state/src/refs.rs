@@ -20,6 +20,8 @@ use fs2::FileExt;
 use oca_core::RefId;
 use serde::{Deserialize, Serialize};
 
+use crate::RefState;
+
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
@@ -35,6 +37,16 @@ pub struct RefRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_state: Option<RefState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawner_tag: Option<String>,
@@ -47,6 +59,11 @@ pub struct RefRecord {
 pub struct NewRef {
     pub session_id: String,
     pub message_id: Option<String>,
+    pub alias: Option<String>,
+    pub effort: Option<String>,
+    pub role: Option<String>,
+    pub cwd: Option<String>,
+    pub last_state: Option<RefState>,
     pub repo: Option<String>,
     pub spawner_tag: Option<String>,
 }
@@ -65,6 +82,8 @@ pub struct RefListFilter {
 pub struct RefPatch {
     pub session_id: Option<String>,
     pub message_id: Option<String>,
+    pub effort: Option<String>,
+    pub last_state: Option<RefState>,
     pub repo: Option<String>,
     pub spawner_tag: Option<String>,
 }
@@ -79,6 +98,18 @@ impl RefPatch {
     #[must_use]
     pub fn with_message_id(mut self, message_id: impl Into<String>) -> Self {
         self.message_id = Some(message_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_effort(mut self, effort: impl Into<String>) -> Self {
+        self.effort = Some(effort.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn with_last_state(mut self, last_state: RefState) -> Self {
+        self.last_state = Some(last_state);
         self
     }
 
@@ -119,6 +150,11 @@ impl NewRef {
         Self {
             session_id: session_id.into(),
             message_id: None,
+            alias: None,
+            effort: None,
+            role: None,
+            cwd: None,
+            last_state: None,
             repo: None,
             spawner_tag: None,
         }
@@ -127,6 +163,23 @@ impl NewRef {
     #[must_use]
     pub fn with_message_id(mut self, message_id: impl Into<String>) -> Self {
         self.message_id = Some(message_id.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_control_metadata(
+        mut self,
+        alias: impl Into<String>,
+        effort: impl Into<String>,
+        role: impl Into<String>,
+        cwd: impl Into<String>,
+        last_state: RefState,
+    ) -> Self {
+        self.alias = Some(alias.into());
+        self.effort = Some(effort.into());
+        self.role = Some(role.into());
+        self.cwd = Some(cwd.into());
+        self.last_state = Some(last_state);
         self
     }
 
@@ -466,6 +519,11 @@ impl RefStore {
             id,
             session_id: new_ref.session_id,
             message_id: new_ref.message_id,
+            alias: new_ref.alias,
+            effort: new_ref.effort,
+            role: new_ref.role,
+            cwd: new_ref.cwd,
+            last_state: new_ref.last_state,
             repo: new_ref.repo,
             spawner_tag: new_ref.spawner_tag,
             tombstoned: false,
@@ -560,6 +618,12 @@ impl RefStore {
             }
             if let Some(message_id) = patch.message_id {
                 record.message_id = Some(message_id);
+            }
+            if let Some(effort) = patch.effort {
+                record.effort = Some(effort);
+            }
+            if let Some(last_state) = patch.last_state {
+                record.last_state = Some(last_state);
             }
             if let Some(repo) = patch.repo {
                 record.repo = Some(repo);
@@ -1056,6 +1120,11 @@ mod tests {
             id: "w0a1b2".to_string(),
             session_id: "session-one".to_string(),
             message_id: None,
+            alias: None,
+            effort: None,
+            role: None,
+            cwd: None,
+            last_state: None,
             repo: Some("repo-a".to_string()),
             spawner_tag: Some("parent-a".to_string()),
             tombstoned: false,
@@ -1067,6 +1136,11 @@ mod tests {
                 id: "w0a1b3".to_string(),
                 session_id: "session-two".to_string(),
                 message_id: None,
+                alias: None,
+                effort: None,
+                role: None,
+                cwd: None,
+                last_state: None,
                 repo: Some("repo-b".to_string()),
                 spawner_tag: Some("parent-c".to_string()),
                 tombstoned: false,
@@ -1108,7 +1182,7 @@ mod tests {
             1
         );
         assert!(matches!(
-            store.insert(RefRecord { id: "w0a1b2".to_string(), session_id: "new-session".to_string(), message_id: None, repo: None, spawner_tag: None, tombstoned: false }),
+            store.insert(RefRecord { id: "w0a1b2".to_string(), session_id: "new-session".to_string(), message_id: None, alias: None, effort: None, role: None, cwd: None, last_state: None, repo: None, spawner_tag: None, tombstoned: false }),
             Err(RefStoreError::RefAlreadyExists(id)) if id == "w0a1b2"
         ));
     }
@@ -1148,6 +1222,11 @@ mod tests {
                 id: value.to_string(),
                 session_id: "session-one".to_string(),
                 message_id: None,
+                alias: None,
+                effort: None,
+                role: None,
+                cwd: None,
+                last_state: None,
                 repo: None,
                 spawner_tag: None,
                 tombstoned: false,
