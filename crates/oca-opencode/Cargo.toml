@@ -6,7 +6,9 @@ rust-version.workspace = true
 
 [dependencies]
 oca-core = { path = "../oca-core" }
-reqwest = { version = "0.12", features = ["json", "stream"] }
+# OpenCode is loopback-only. Avoid initializing and linking an unused TLS backend on
+# every short-lived CLI invocation; reqwest's HTTP transport remains sufficient.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 url = "2"
