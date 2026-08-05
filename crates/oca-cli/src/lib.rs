@@ -6,9 +6,11 @@ use oca_core::{
 };
 use oca_state::OcaConfig;
 
+mod background;
 mod follow;
 mod foreground;
 
+pub use background::execute_background;
 pub use follow::{FollowCommandOutput, execute_follow};
 pub use foreground::execute_foreground;
 
@@ -85,6 +87,8 @@ pub enum AgentFlag {
     Role,
     /// Isolate worker edits in a worktree.
     Worktree,
+    /// Return after background prompt admission and acknowledgement.
+    Background,
     /// Run without an interactive terminal.
     Headless,
     /// Include completed workers in list output.
@@ -230,6 +234,7 @@ const DISPATCH_EXAMPLES: &[&[&str]] = &[
     &["oca", "terra:medium", "summarize", "the", "change"],
     &["oca", "flash:max", "run", "the", "tests"],
     &["oca", "deepseek:h", "check", "the", "parser"],
+    &["oca", "luna:h", "-b", "dispatch", "in", "background"],
     &["oca", "--json", "luna:h", "--", "--literal", "prompt"],
 ];
 const DISPATCH_FLAGS: &[FlagGrammar] = &[
@@ -273,6 +278,12 @@ const DISPATCH_FLAGS: &[FlagGrammar] = &[
             &["oca", "luna:h", "-w", "make", "an", "isolated", "change"],
             &["oca", "luna:h", "--worktree", "make", "another", "change"],
         ],
+    },
+    FlagGrammar {
+        kind: AgentFlag::Background,
+        spellings: &["-b"],
+        value: FlagValueForm::None,
+        argv_examples: &[&["oca", "luna:h", "-b", "dispatch", "without", "waiting"]],
     },
     FlagGrammar {
         kind: AgentFlag::Headless,
@@ -538,7 +549,7 @@ pub const fn public_commands() -> &'static [&'static str] {
 pub const fn help_text() -> &'static str {
     "Usage: oca [--json] <alias>:<effort> [options] [--] <prompt...>\n\
      \nCommands: m q f k ls events push pr\n\
-     \nModel options: -e, --role, -w, --headless, --json"
+     \nModel options: -e, --role, -w, -b, --headless, --json"
 }
 
 /// A model turn to dispatch to `OpenCode`.
@@ -548,6 +559,7 @@ pub struct DispatchCommand {
     pub prompt: String,
     pub role: String,
     pub worktree: bool,
+    pub background: bool,
     pub headless: bool,
     pub json: bool,
 }
@@ -721,6 +733,7 @@ fn parse_dispatch(
     let mut flagged_effort = None;
     let mut role = "impl".to_owned();
     let mut worktree = false;
+    let mut background = false;
     let mut headless = false;
     let mut json = false;
     let mut prompt = Vec::new();
@@ -757,6 +770,8 @@ fn parse_dispatch(
             role.clone_from(value);
         } else if argument == "-w" || argument == "--worktree" {
             worktree = true;
+        } else if argument == "-b" {
+            background = true;
         } else if argument == "--headless" {
             headless = true;
         } else if argument.starts_with('-') {
@@ -780,6 +795,7 @@ fn parse_dispatch(
         prompt: prompt.join(" "),
         role,
         worktree,
+        background,
         headless,
         json,
     })
@@ -1126,6 +1142,7 @@ mod tests {
                 prompt: "write a test".to_owned(),
                 role: "review".to_owned(),
                 worktree: true,
+                background: false,
                 headless: true,
                 json: true,
             }
@@ -1141,6 +1158,17 @@ mod tests {
         };
         assert_eq!(command.model.alias, "sol");
         assert_eq!(command.model.variant, "xhigh");
+        assert_eq!(command.prompt, "implement this");
+    }
+
+    #[test]
+    fn background_dispatch_is_a_typed_model_flag() {
+        let Command::Dispatch(command) =
+            parse_from(["oca", "luna:h", "-b", "implement", "this"]).unwrap()
+        else {
+            panic!("model grammar must produce dispatch");
+        };
+        assert!(command.background);
         assert_eq!(command.prompt, "implement this");
     }
 
