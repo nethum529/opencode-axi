@@ -631,13 +631,14 @@ mod tests {
     #[test]
     fn racing_cold_starts_spawn_once_and_the_loser_adopts_the_winner_record() {
         let directory = tempfile::tempdir().expect("temporary state directory");
+        let port = available_loopback_port();
         let runtime = Arc::new(RacingRuntime::default());
         let first_directory = directory.path().to_path_buf();
         let first_runtime = Arc::clone(&runtime);
         let first = std::thread::spawn(move || {
             let mut request = ReadyRequest;
             block_on(
-                ConnectOrStart::new(first_directory, 4096, [], Duration::from_millis(50))
+                ConnectOrStart::new(first_directory, port, [], Duration::from_millis(50))
                     .connect_or_start(first_runtime.as_ref(), &mut request),
             )
         });
@@ -647,7 +648,7 @@ mod tests {
 
         let mut request = ReadyRequest;
         block_on(
-            ConnectOrStart::new(directory.path(), 4096, [], Duration::from_millis(50))
+            ConnectOrStart::new(directory.path(), port, [], Duration::from_millis(50))
                 .connect_or_start(runtime.as_ref(), &mut request),
         )
         .expect("loser adopts the winner");
