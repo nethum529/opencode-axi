@@ -284,6 +284,8 @@ mod tests {
                 last_state: Some(worker_state),
                 repo: Some(scope.repo.clone()),
                 spawner_tag: Some(scope.spawner_tag.clone()),
+                display: None,
+                herdr_tab: None,
                 tombstoned: false,
             })
             .unwrap();

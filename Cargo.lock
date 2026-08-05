@@ -771,6 +771,9 @@ dependencies = [
  "oca-core",
  "serde",
  "serde_json",
+ "tempfile",
+ "thiserror",
+ "tokio",
 ]
 
 [[package]]

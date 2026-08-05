@@ -50,6 +50,10 @@ pub struct RefRecord {
     pub repo: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spawner_tag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub herdr_tab: Option<String>,
     #[serde(default)]
     pub tombstoned: bool,
 }
@@ -86,6 +90,8 @@ pub struct RefPatch {
     pub last_state: Option<RefState>,
     pub repo: Option<String>,
     pub spawner_tag: Option<String>,
+    pub display: Option<String>,
+    pub herdr_tab: Option<String>,
 }
 
 impl RefPatch {
@@ -122,6 +128,14 @@ impl RefPatch {
     #[must_use]
     pub fn with_spawner_tag(mut self, spawner_tag: impl Into<String>) -> Self {
         self.spawner_tag = Some(spawner_tag.into());
+        self
+    }
+
+    /// Records a herdr display attachment and its tab identifier.
+    #[must_use]
+    pub fn with_herdr_tab(mut self, tab_id: impl Into<String>) -> Self {
+        self.display = Some("herdr".to_owned());
+        self.herdr_tab = Some(tab_id.into());
         self
     }
 }
@@ -526,6 +540,8 @@ impl RefStore {
             last_state: new_ref.last_state,
             repo: new_ref.repo,
             spawner_tag: new_ref.spawner_tag,
+            display: None,
+            herdr_tab: None,
             tombstoned: false,
         };
         locked.records.push(record.clone());
@@ -630,6 +646,12 @@ impl RefStore {
             }
             if let Some(spawner_tag) = patch.spawner_tag {
                 record.spawner_tag = Some(spawner_tag);
+            }
+            if let Some(display) = patch.display {
+                record.display = Some(display);
+            }
+            if let Some(herdr_tab) = patch.herdr_tab {
+                record.herdr_tab = Some(herdr_tab);
             }
             Ok((record.clone(), true))
         })
@@ -1127,6 +1149,8 @@ mod tests {
             last_state: None,
             repo: Some("repo-a".to_string()),
             spawner_tag: Some("parent-a".to_string()),
+            display: None,
+            herdr_tab: None,
             tombstoned: false,
         };
 
@@ -1143,6 +1167,8 @@ mod tests {
                 last_state: None,
                 repo: Some("repo-b".to_string()),
                 spawner_tag: Some("parent-c".to_string()),
+                display: None,
+                herdr_tab: None,
                 tombstoned: false,
             })
             .unwrap();
@@ -1182,7 +1208,7 @@ mod tests {
             1
         );
         assert!(matches!(
-            store.insert(RefRecord { id: "w0a1b2".to_string(), session_id: "new-session".to_string(), message_id: None, alias: None, effort: None, role: None, cwd: None, last_state: None, repo: None, spawner_tag: None, tombstoned: false }),
+            store.insert(RefRecord { id: "w0a1b2".to_string(), session_id: "new-session".to_string(), message_id: None, alias: None, effort: None, role: None, cwd: None, last_state: None, repo: None, spawner_tag: None, display: None, herdr_tab: None, tombstoned: false }),
             Err(RefStoreError::RefAlreadyExists(id)) if id == "w0a1b2"
         ));
     }
@@ -1204,6 +1230,8 @@ mod tests {
                     last_state: None,
                     repo: None,
                     spawner_tag: None,
+                    display: None,
+                    herdr_tab: None,
                     tombstoned: false,
                 })
                 .unwrap();
@@ -1234,6 +1262,8 @@ mod tests {
                 last_state: None,
                 repo: None,
                 spawner_tag: None,
+                display: None,
+                herdr_tab: None,
                 tombstoned: false,
             });
 

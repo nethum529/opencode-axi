@@ -111,6 +111,8 @@ impl Fixture {
                 last_state: Some(worker_state),
                 repo: Some(self.repo.path().display().to_string()),
                 spawner_tag: Some("test-spawner".to_owned()),
+                display: None,
+                herdr_tab: None,
                 tombstoned: false,
             })
             .unwrap();

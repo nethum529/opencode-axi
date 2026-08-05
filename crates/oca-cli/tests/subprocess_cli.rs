@@ -210,6 +210,8 @@ fn prepared_home(port: u16) -> tempfile::TempDir {
             last_state: Some(oca_state::RefState::Running),
             repo: None,
             spawner_tag: None,
+            display: None,
+            herdr_tab: None,
             tombstoned: false,
         })
         .unwrap();
