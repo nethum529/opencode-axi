@@ -45,9 +45,9 @@ fn prompt_request() -> PromptRequest {
     PromptRequest {
         message_id: "msg_oca_01".to_owned(),
         model: ResolvedModel {
-            alias: "opus".to_owned(),
+            alias: "luna".to_owned(),
             provider: "openai".to_owned(),
-            model: "gpt-5.6".to_owned(),
+            model: "gpt-5.6-luna".to_owned(),
             effort: "high".to_owned(),
             variant: "high".to_owned(),
         },
@@ -70,7 +70,7 @@ fn assert_prompt_body(request: &str) {
         serde_json::json!({
             "agent": "worker",
             "messageID": "msg_oca_01",
-            "model": { "providerID": "openai", "modelID": "gpt-5.6" },
+            "model": { "providerID": "openai", "modelID": "gpt-5.6-luna" },
             "parts": [{ "type": "text", "text": "Implement the facade" }],
             "variant": "high",
         })
@@ -168,7 +168,7 @@ async fn prompt_async_wraps_an_output_schema_in_the_pinned_format_envelope() {
             "agent": "worker",
             "format": { "type": "json_schema", "schema": schema },
             "messageID": "msg_oca_01",
-            "model": { "providerID": "openai", "modelID": "gpt-5.6" },
+            "model": { "providerID": "openai", "modelID": "gpt-5.6-luna" },
             "parts": [{ "type": "text", "text": "Implement the facade" }],
             "variant": "high",
         })
@@ -339,7 +339,7 @@ async fn create_session_uses_the_create_model_envelope() {
         serde_json::from_str::<serde_json::Value>(body).expect("create body is JSON"),
         serde_json::json!({
             "model": {
-                "id": "gpt-5.6",
+                "id": "gpt-5.6-luna",
                 "providerID": "openai",
                 "variant": "high",
             }

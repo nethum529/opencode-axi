@@ -37,7 +37,7 @@ mod tests {
     fn end_of_options_keeps_help_and_json_as_literal_prompt_text() {
         let arguments = vec![
             "oca".to_owned(),
-            "opus:h".to_owned(),
+            "luna:h".to_owned(),
             "--".to_owned(),
             "--help".to_owned(),
             "--json".to_owned(),

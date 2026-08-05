@@ -71,19 +71,19 @@ const SPEC_CODES: [(&str, i32); 27] = [
 /// catalog/resolver lookup follows the same canonical form.
 #[test]
 fn aliases_are_normalized_without_a_public_wrapper_type() {
-    assert_eq!(normalize_alias("  OpUs  "), "opus");
+    assert_eq!(normalize_alias("  LuNa  "), "luna");
 
     let mut catalog = ModelCatalog::default();
     let definition = catalog
-        .get("opus")
-        .expect("the default opus definition must exist")
+        .get("luna")
+        .expect("the default luna definition must exist")
         .clone();
     catalog.insert("  CuStOm  ", definition);
     assert!(catalog.get("custom").is_some());
 
-    let opus =
-        resolve_model("  OpUs  ", "high", &catalog).expect("a normalized opus alias must resolve");
-    assert_eq!(opus.alias, "opus");
+    let luna =
+        resolve_model("  LuNa  ", "high", &catalog).expect("a normalized luna alias must resolve");
+    assert_eq!(luna.alias, "luna");
 
     let deepseek = resolve_model("  DeEpSeEk  ", "high", &catalog)
         .expect("a normalized deepseek alias must resolve");

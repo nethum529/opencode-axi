@@ -8,6 +8,7 @@ use std::{
     sync::OnceLock,
 };
 
+use oca_core::DEFAULT_MODEL_DEFINITIONS;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -434,46 +435,31 @@ impl From<ConfigError> for ConfigLoadError {
 }
 
 fn default_models() -> BTreeMap<String, ModelConfig> {
-    let full_efforts = ["low", "medium", "high", "xhigh", "max"];
-    BTreeMap::from([
-        (
-            "luna".to_owned(),
-            ModelConfig {
-                provider: "openai".to_owned(),
-                model: "gpt-5.6-luna".to_owned(),
-                efforts: full_efforts.iter().map(ToString::to_string).collect(),
-                ..ModelConfig::default()
-            },
-        ),
-        (
-            "sol".to_owned(),
-            ModelConfig {
-                provider: "openai".to_owned(),
-                model: "gpt-5.6-sol".to_owned(),
-                efforts: full_efforts.iter().map(ToString::to_string).collect(),
-                ..ModelConfig::default()
-            },
-        ),
-        (
-            "terra".to_owned(),
-            ModelConfig {
-                provider: "openai".to_owned(),
-                model: "gpt-5.6-terra".to_owned(),
-                efforts: full_efforts.iter().map(ToString::to_string).collect(),
-                ..ModelConfig::default()
-            },
-        ),
-        (
-            "flash".to_owned(),
-            ModelConfig {
-                provider: "opencode".to_owned(),
-                model: "deepseek-v4-flash-free".to_owned(),
-                efforts: ["high", "max"].iter().map(ToString::to_string).collect(),
-                synonyms: vec!["deepseek".to_owned()],
-                ..ModelConfig::default()
-            },
-        ),
-    ])
+    DEFAULT_MODEL_DEFINITIONS
+        .iter()
+        .map(|definition| {
+            (
+                definition.alias.to_owned(),
+                ModelConfig {
+                    provider: definition.provider.to_owned(),
+                    model: definition.model.to_owned(),
+                    efforts: definition
+                        .ladder
+                        .iter()
+                        .copied()
+                        .map(ToString::to_string)
+                        .collect(),
+                    synonyms: definition
+                        .synonyms
+                        .iter()
+                        .copied()
+                        .map(ToString::to_string)
+                        .collect(),
+                    ..ModelConfig::default()
+                },
+            )
+        })
+        .collect()
 }
 
 fn default_roles() -> BTreeMap<String, RoleConfig> {

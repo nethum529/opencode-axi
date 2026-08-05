@@ -1,4 +1,4 @@
 cursor: 0
 total: 1
 items[1]{ref,state,model}:
-  w00001,completed,"anthropic/claude-opus-4-1:low"
+  w00001,completed,"openai/gpt-5.6-luna:low"
