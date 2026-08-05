@@ -86,6 +86,11 @@ fn end_to_end_foreground_has_one_turn_one_terminal_and_one_golden_final_result()
     assert_eq!(refs[0]["id"], reference);
     assert_eq!(refs[0]["session_id"], "ses_target");
     assert_eq!(refs[0]["message_id"], message_id);
+    assert_eq!(refs[0]["alias"], "luna");
+    assert_eq!(refs[0]["effort"], "high");
+    assert_eq!(refs[0]["role"], "impl");
+    assert_eq!(refs[0]["cwd"], home.path().display().to_string());
+    assert_eq!(refs[0]["last_state"], "done");
 }
 
 fn serve_foreground(listener: TcpListener) -> Vec<CapturedRequest> {

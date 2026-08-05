@@ -200,7 +200,7 @@ impl OpenCodeClient {
         session: &str,
         request: PromptRequest,
     ) -> Result<PromptAccepted, OpenCodeError> {
-        self.send_prompt(session, request).await?;
+        self.send_prompt(session, request, None).await?;
         Ok(PromptAccepted)
     }
 
@@ -214,7 +214,7 @@ impl OpenCodeClient {
         session: &str,
         request: PromptRequest,
     ) -> Result<ControlAccepted, OpenCodeError> {
-        self.send_prompt(session, request).await?;
+        self.send_prompt(session, request, Some("queue")).await?;
         Ok(ControlAccepted)
     }
 
@@ -286,12 +286,16 @@ impl OpenCodeClient {
         &self,
         session: &str,
         request: PromptRequest,
+        delivery: Option<&str>,
     ) -> Result<(), OpenCodeError> {
         let mut body = Map::new();
         body.insert("messageID".to_owned(), Value::String(request.message_id));
         body.insert("model".to_owned(), model_value(&request.model, None));
         body.insert("variant".to_owned(), Value::String(request.variant));
         body.insert("agent".to_owned(), Value::String(request.role));
+        if let Some(delivery) = delivery {
+            body.insert("delivery".to_owned(), Value::String(delivery.to_owned()));
+        }
         body.insert(
             "parts".to_owned(),
             Value::Array(

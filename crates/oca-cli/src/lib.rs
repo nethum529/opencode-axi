@@ -6,9 +6,11 @@ use oca_core::{
 };
 use oca_state::OcaConfig;
 
+mod control;
 mod follow;
 mod foreground;
 
+pub use control::{ControlCommandOutput, execute_abort, execute_message, execute_queue};
 pub use follow::{FollowCommandOutput, execute_follow};
 pub use foreground::execute_foreground;
 
@@ -683,7 +685,6 @@ fn parse_arguments(
         "push" => parse_ref_command(tail).map(Command::Push),
         "pr" => parse_ref_command(tail).map(Command::PullRequest),
         "__attach" => parse_attach(tail).map(Command::Attach),
-        "s" => Err(usage("`s` is not a supported command")),
         _ => parse_dispatch(verb, tail, catalog).map(Command::Dispatch),
     };
     command.map(|mut command| {
@@ -1182,13 +1183,14 @@ mod tests {
     }
 
     #[test]
-    fn retired_steer_token_is_never_a_command() {
+    fn retired_steer_token_is_not_recognized_as_a_control_verb() {
         assert_eq!(
             parse_from(["oca", "s", "wabc12", "do", "this"])
                 .unwrap_err()
                 .code(),
-            ErrorCode::Usage.as_str()
+            ErrorCode::AliasUnknown.as_str()
         );
+        assert!(!public_commands().contains(&"s"));
     }
 
     #[test]

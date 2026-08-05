@@ -3,6 +3,7 @@
 mod config;
 mod journal;
 mod refs;
+mod session;
 
 pub use config::{
     ConfigDiagnostic, ConfigError, ConfigLoadError, ConfigLoader, HerdrConfig, ModelConfig,
@@ -14,3 +15,4 @@ pub use refs::{
     AtomicWriteHook, NewRef, PendingRefAllocation, RefAllocationCompletion, RefDurabilityWarning,
     RefIdSource, RefListFilter, RefPatch, RefRecord, RefStore, RefStoreError, RefStorePaths,
 };
+pub use session::{RefState, SessionTurnLock};

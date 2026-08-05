@@ -74,6 +74,7 @@ pub trait ForegroundBackend {
         &mut self,
         session_id: &str,
         message_id: &str,
+        request: &ForegroundRequest,
     ) -> Result<Self::PendingRef, OcaError>;
 
     fn acknowledge(
@@ -141,13 +142,13 @@ where
         model: request.model.clone(),
         variant: request.model.variant.clone(),
         role: request.role.clone(),
-        text: request.prompt,
+        text: request.prompt.clone(),
         output_schema: request.contract.schema(),
         permission: request.policy.permission_profile(),
     };
     backend.prompt_async(&session_id, &prompt).await?;
 
-    let pending = backend.write_ref(&session_id, &message_id)?;
+    let pending = backend.write_ref(&session_id, &message_id, &request)?;
     let reference = backend.acknowledge(pending, &request.model, request.json)?;
 
     // The helper cannot be spawned until the acknowledgement is emitted and
@@ -275,6 +276,7 @@ mod tests {
             &mut self,
             _session_id: &str,
             _message_id: &str,
+            _request: &ForegroundRequest,
         ) -> Result<Self::PendingRef, OcaError> {
             Ok("wgate0".to_owned())
         }
@@ -426,6 +428,7 @@ mod tests {
             &mut self,
             _session_id: &str,
             _message_id: &str,
+            _request: &ForegroundRequest,
         ) -> Result<Self::PendingRef, OcaError> {
             self.calls.push("write_ref");
             Ok("w00001".to_owned())
