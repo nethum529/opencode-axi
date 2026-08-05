@@ -223,6 +223,10 @@ impl OpenCodeClient {
 
     /// Queues a prompt with the legacy `prompt_async` endpoint.
     ///
+    /// A second plain legacy prompt is server-serialized after the active turn. The `delivery`
+    /// field belongs to OpenCode's disjoint v2 runtime and is silently dropped when mixed with a
+    /// legacy session, so it must not be sent here.
+    ///
     /// # Errors
     ///
     /// Returns an error when `OpenCode` rejects the request or its response is malformed.
@@ -231,7 +235,7 @@ impl OpenCodeClient {
         session: &str,
         request: PromptRequest,
     ) -> Result<ControlAccepted, OpenCodeError> {
-        self.send_prompt(session, request, Some("queue")).await?;
+        self.send_prompt(session, request, None).await?;
         Ok(ControlAccepted)
     }
 

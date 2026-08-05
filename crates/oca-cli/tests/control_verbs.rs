@@ -114,7 +114,7 @@ fn message_effort_override_applies_now_and_persists_for_later_turns() {
 }
 
 #[test]
-fn queue_sends_queue_delivery_returns_on_acceptance_without_state_or_effort_change() {
+fn queue_uses_plain_legacy_admission_without_state_or_effort_change() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
     let port = listener.local_addr().expect("fake server address").port();
     let server = thread::spawn(move || serve_prompt(listener, "204 No Content", ""));
@@ -125,7 +125,7 @@ fn queue_sends_queue_delivery_returns_on_acceptance_without_state_or_effort_chan
 
     assert_success(&output);
     assert_eq!(request.path, "/session/ses_prior_context/prompt_async");
-    assert_eq!(request.body["delivery"], "queue");
+    assert!(request.body.get("delivery").is_none());
     assert_eq!(request.body["variant"], "high");
     assert_eq!(
         String::from_utf8(output.stdout).expect("stdout is utf-8"),
@@ -166,7 +166,7 @@ fn queue_on_idle_session_leaves_state_unchanged_so_message_can_follow() {
     );
 
     let requests = server.join().expect("fake server completes");
-    assert_eq!(requests[0].body["delivery"], "queue");
+    assert!(requests[0].body.get("delivery").is_none());
     assert!(requests[1].body.get("delivery").is_none());
 }
 
