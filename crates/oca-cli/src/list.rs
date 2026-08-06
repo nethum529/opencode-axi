@@ -1,12 +1,12 @@
 //! Single-snapshot implementation of the `oca ls` fleet inbox.
 
-use std::{cmp::Ordering, collections::HashMap, path::Path, time::Duration};
+use std::{cmp::Ordering, collections::HashMap, fs, path::Path, time::Duration};
 
-use oca_core::{ErrorCode, OcaError};
+use oca_core::{ErrorCode, OcaError, RefId};
 use oca_display::{ListDocument, ListItem};
 use oca_state::{
-    JournalError, OcaConfig, RefListFilter, RefRecord, RefState, RefStore, RefStorePaths,
-    prune_expired_journals,
+    EventJournal, IntentPhase, IntentStore, JournalError, OcaConfig, RefListFilter, RefRecord,
+    RefState, RefStore, RefStorePaths, prune_expired_journals,
 };
 
 use crate::{
@@ -65,7 +65,7 @@ fn execute_list_with_scope(
         .filter(|record| {
             command.all
                 || record_matches_scope(record, scope)
-                || is_attention_record(record, &overrides)
+                || is_attention_record(home, record, &overrides)
         })
         .map(|record| worker_from_record(record, &overrides))
         .collect::<Vec<_>>();
@@ -186,12 +186,42 @@ fn record_matches_scope(record: &RefRecord, scope: &Scope) -> bool {
         && record.repo.as_ref() == Some(&scope.repo)
 }
 
-fn is_attention_record(record: &RefRecord, overrides: &HashMap<String, ReconciledState>) -> bool {
+fn is_attention_record(
+    home: &Path,
+    record: &RefRecord,
+    overrides: &HashMap<String, ReconciledState>,
+) -> bool {
     record.last_state == Some(RefState::Unknown)
         || matches!(
             overrides.get(&record.id),
             Some(ReconciledState::PromptUncertain | ReconciledState::PublishedUncertain)
         )
+        || (record.last_state == Some(RefState::Running) && !has_turn_evidence(home, record))
+}
+
+/// Returns whether local state proves that this ref's current turn progressed.
+///
+/// This mirrors worker-health's `NO_TURN_EVIDENCE` check: a non-empty
+/// per-message journal is evidence. An intent at or beyond `running` is also
+/// evidence because that phase is persisted only after prompt admission has
+/// been confirmed.
+fn has_turn_evidence(home: &Path, record: &RefRecord) -> bool {
+    let state_directory = home.join(".oca");
+    let journal_evidence = record.message_id.as_deref().is_some_and(|message_id| {
+        let Ok(reference) = RefId::new(&record.id) else {
+            return false;
+        };
+        let Ok(journal) = EventJournal::open(&state_directory, &reference, message_id) else {
+            return false;
+        };
+        fs::metadata(journal.path()).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+    });
+    let intent_evidence = IntentStore::in_directory(state_directory)
+        .read(&record.id)
+        .ok()
+        .flatten()
+        .is_some_and(|intent| intent.phase >= IntentPhase::Running);
+    journal_evidence || intent_evidence
 }
 
 fn runtime_error(detail: impl std::fmt::Display) -> OcaError {

@@ -3,7 +3,10 @@
 use std::process::{Command, Output};
 
 use oca_core::{OcaEvent, RefId};
-use oca_state::{EventJournal, RefRecord, RefState, RefStore, RefStorePaths};
+use oca_state::{
+    EventJournal, Intent, IntentDurability, IntentOperation, IntentPhase, IntentStore, RefRecord,
+    RefState, RefStore, RefStorePaths,
+};
 use serde_json::{Value, json};
 
 #[test]
@@ -112,6 +115,28 @@ fn unscoped_unknown_ref_remains_visible_to_default_ls() {
 }
 
 #[test]
+fn plain_ls_surfaces_only_out_of_scope_running_refs_without_turn_evidence() {
+    let fixture = Fixture::new();
+    fixture.insert("w00004", RefState::Blocked);
+    fixture.insert_out_of_scope("w00001", RefState::Running);
+    fixture.insert_out_of_scope("w00002", RefState::Running);
+    fixture.append_event("w00002", "session.busy", json!({}));
+    fixture.insert_out_of_scope("w00003", RefState::Running);
+    fixture.write_running_intent("w00003");
+
+    let output = fixture.run(&["ls", "--json"]);
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let page: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(page["total"], 2);
+    assert_eq!(page["items"][0]["ref"], "w00004");
+    assert_eq!(page["items"][0]["state"], "blocked");
+    assert_eq!(page["items"][1]["ref"], "w00001");
+    assert_eq!(page["items"][1]["state"], "running");
+}
+
+#[test]
 fn events_since_is_a_single_debugging_page() {
     let fixture = Fixture::new();
     fixture.insert("w00001", RefState::Done);
@@ -188,6 +213,30 @@ impl Fixture {
     }
 
     fn insert(&self, reference: &str, worker_state: RefState) {
+        self.insert_with_scope(
+            reference,
+            worker_state,
+            self.repo.path().display().to_string(),
+            "test-spawner".to_owned(),
+        );
+    }
+
+    fn insert_out_of_scope(&self, reference: &str, worker_state: RefState) {
+        self.insert_with_scope(
+            reference,
+            worker_state,
+            "/other/repo".to_owned(),
+            "other-spawner".to_owned(),
+        );
+    }
+
+    fn insert_with_scope(
+        &self,
+        reference: &str,
+        worker_state: RefState,
+        repo: String,
+        spawner_tag: String,
+    ) {
         let state = self.home.path().join(".oca");
         let turn = format!("turn_{reference}");
         let store = RefStore::with_paths(RefStorePaths::in_directory(&state));
@@ -199,10 +248,10 @@ impl Fixture {
                 alias: Some("luna".to_owned()),
                 effort: Some("high".to_owned()),
                 role: Some("impl".to_owned()),
-                cwd: Some(self.repo.path().display().to_string()),
+                cwd: Some(repo.clone()),
                 last_state: Some(worker_state),
-                repo: Some(self.repo.path().display().to_string()),
-                spawner_tag: Some("test-spawner".to_owned()),
+                repo: Some(repo),
+                spawner_tag: Some(spawner_tag),
                 worktree: None,
                 branch: None,
                 commit: None,
@@ -212,6 +261,16 @@ impl Fixture {
                 completion: None,
                 tombstoned: false,
             })
+            .unwrap();
+    }
+
+    fn write_running_intent(&self, reference: &str) {
+        let mut intent = Intent::new(reference, IntentOperation::Dispatch);
+        intent.session_id = Some(format!("ses_{reference}"));
+        intent.message_id = Some(format!("turn_{reference}"));
+        intent.set_phase(IntentPhase::Running);
+        IntentStore::in_directory(self.home.path().join(".oca"))
+            .write(&intent, IntentDurability::PreAck)
             .unwrap();
     }
 
