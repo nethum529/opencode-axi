@@ -55,7 +55,7 @@ pub(crate) struct DispatchSubscription {
 }
 
 impl DispatchSubscription {
-    fn new(inner: Subscription) -> Self {
+    pub(crate) fn new(inner: Subscription) -> Self {
         Self {
             inner,
             pending: VecDeque::new(),
@@ -83,6 +83,108 @@ impl DispatchSubscription {
     fn preserve(&mut self, result: Result<Option<SseEvent>, SseError>) {
         self.pending.push_back(result);
     }
+}
+
+/// Confirms that an accepted asynchronous prompt became visible to OpenCode.
+///
+/// The already-open event stream is the primary evidence source. Session
+/// history remains the authoritative fallback, including when its stored
+/// records are poisoned and the endpoint rejects them with HTTP 400.
+pub(crate) async fn confirm_prompt_landed(
+    client: &OpenCodeClient,
+    subscription: &mut DispatchSubscription,
+    session_id: &str,
+    message_id: &str,
+    prompt_text: &str,
+) -> Result<(), OcaError> {
+    let started = tokio::time::Instant::now();
+    let mut backoff = PROMPT_CONFIRM_INITIAL_BACKOFF;
+    let expected_hash = prompt_sha256(prompt_text);
+    let mut history_evidence = PromptHistoryEvidence::Missing;
+    let mut stream_open = true;
+
+    loop {
+        let elapsed = started.elapsed();
+        let Some(remaining) = PROMPT_CONFIRM_TIMEOUT.checked_sub(elapsed) else {
+            break;
+        };
+        let attempt_timeout = remaining.min(PROMPT_CONFIRM_MAX_BACKOFF);
+        let check = tokio::time::timeout(attempt_timeout, async {
+            if stream_open {
+                tokio::select! {
+                    biased;
+                    event = subscription.next_confirmation() => {
+                        PromptConfirmationCheck::Stream(event)
+                    },
+                    history = client.messages(session_id) => {
+                        PromptConfirmationCheck::History(history)
+                    }
+                }
+            } else {
+                PromptConfirmationCheck::History(client.messages(session_id).await)
+            }
+        })
+        .await;
+        match check {
+            Ok(PromptConfirmationCheck::Stream(Ok(Some(event)))) => {
+                if is_target_message_event(&event, session_id, message_id) {
+                    return Ok(());
+                }
+                subscription.preserve(Ok(Some(event)));
+                continue;
+            }
+            Ok(PromptConfirmationCheck::Stream(result @ (Ok(None) | Err(_)))) => {
+                stream_open = false;
+                subscription.preserve(result);
+                continue;
+            }
+            Ok(PromptConfirmationCheck::History(Ok(messages))) => {
+                if user_prompt_is_visible(&messages, session_id, message_id, &expected_hash) {
+                    return Ok(());
+                }
+                history_evidence = PromptHistoryEvidence::Missing;
+            }
+            Ok(PromptConfirmationCheck::History(Err(error))) => {
+                let rendered = error.to_string();
+                history_evidence = match error {
+                    OpenCodeError::Server { status: 400, .. } => {
+                        PromptHistoryEvidence::Rejected(rendered)
+                    }
+                    _ => PromptHistoryEvidence::Failed(rendered),
+                };
+            }
+            Err(_) => history_evidence = PromptHistoryEvidence::TimedOut,
+        }
+
+        let elapsed = started.elapsed();
+        let Some(remaining) = PROMPT_CONFIRM_TIMEOUT.checked_sub(elapsed) else {
+            break;
+        };
+        tokio::time::sleep(backoff.min(remaining)).await;
+        backoff = backoff.saturating_mul(2).min(PROMPT_CONFIRM_MAX_BACKOFF);
+    }
+
+    let detail = match history_evidence {
+        PromptHistoryEvidence::Missing => {
+            "the accepted user message did not appear in session history".to_owned()
+        }
+        PromptHistoryEvidence::Rejected(error) => {
+            format!("the session history endpoint rejected its stored records: {error}")
+        }
+        PromptHistoryEvidence::Failed(error) => {
+            format!("session history could not confirm the accepted prompt: {error}")
+        }
+        PromptHistoryEvidence::TimedOut => {
+            "session history could not confirm the accepted prompt: message lookup timed out"
+                .to_owned()
+        }
+    };
+    Err(OcaError::new(ErrorCode::PromptUncertain)
+        .with_error(format!(
+            "{detail} within {} ms",
+            PROMPT_CONFIRM_TIMEOUT.as_millis()
+        ))
+        .with_help("Run `oca m <ref> \"<resend>\"`; oca will not replay"))
 }
 
 /// Executes a parsed foreground dispatch using the user's local state root.
@@ -264,109 +366,6 @@ impl ProductionBackend {
             attributed_structured_reply(&messages, session_id, message_id)
                 .map(|structured| TerminalReply { structured }),
         )
-    }
-
-    async fn confirm_prompt_visibility(
-        &mut self,
-        subscription: &mut DispatchSubscription,
-        session_id: &str,
-        prompt: &DispatchPrompt,
-    ) -> Result<(), OcaError> {
-        let started = tokio::time::Instant::now();
-        let mut backoff = PROMPT_CONFIRM_INITIAL_BACKOFF;
-        let expected_hash = prompt_sha256(&prompt.text);
-        let mut history_evidence = PromptHistoryEvidence::Missing;
-        let mut stream_open = true;
-
-        loop {
-            let elapsed = started.elapsed();
-            let Some(remaining) = PROMPT_CONFIRM_TIMEOUT.checked_sub(elapsed) else {
-                break;
-            };
-            let attempt_timeout = remaining.min(PROMPT_CONFIRM_MAX_BACKOFF);
-            let client = self.client()?;
-            let check = tokio::time::timeout(attempt_timeout, async {
-                if stream_open {
-                    tokio::select! {
-                        biased;
-                        event = subscription.next_confirmation() => {
-                            PromptConfirmationCheck::Stream(event)
-                        },
-                        history = client.messages(session_id) => {
-                            PromptConfirmationCheck::History(history)
-                        }
-                    }
-                } else {
-                    PromptConfirmationCheck::History(client.messages(session_id).await)
-                }
-            })
-            .await;
-            match check {
-                Ok(PromptConfirmationCheck::Stream(Ok(Some(event)))) => {
-                    if is_target_message_event(&event, session_id, &prompt.message_id) {
-                        return Ok(());
-                    }
-                    subscription.preserve(Ok(Some(event)));
-                    continue;
-                }
-                Ok(PromptConfirmationCheck::Stream(result @ (Ok(None) | Err(_)))) => {
-                    stream_open = false;
-                    subscription.preserve(result);
-                    continue;
-                }
-                Ok(PromptConfirmationCheck::History(Ok(messages))) => {
-                    if user_prompt_is_visible(
-                        &messages,
-                        session_id,
-                        &prompt.message_id,
-                        &expected_hash,
-                    ) {
-                        return Ok(());
-                    }
-                    history_evidence = PromptHistoryEvidence::Missing;
-                }
-                Ok(PromptConfirmationCheck::History(Err(error))) => {
-                    let rendered = error.to_string();
-                    history_evidence = match error {
-                        OpenCodeError::Server { status: 400, .. } => {
-                            PromptHistoryEvidence::Rejected(rendered)
-                        }
-                        _ => PromptHistoryEvidence::Failed(rendered),
-                    };
-                }
-                Err(_) => history_evidence = PromptHistoryEvidence::TimedOut,
-            }
-
-            let elapsed = started.elapsed();
-            let Some(remaining) = PROMPT_CONFIRM_TIMEOUT.checked_sub(elapsed) else {
-                break;
-            };
-            tokio::time::sleep(backoff.min(remaining)).await;
-            backoff = backoff.saturating_mul(2).min(PROMPT_CONFIRM_MAX_BACKOFF);
-        }
-
-        let detail = match history_evidence {
-            PromptHistoryEvidence::Missing => {
-                "the accepted user message did not appear in session history".to_owned()
-            }
-            PromptHistoryEvidence::Rejected(error) => {
-                format!("the session history endpoint rejected its stored records: {error}")
-            }
-            PromptHistoryEvidence::Failed(error) => {
-                format!("session history could not confirm the accepted prompt: {error}")
-            }
-            PromptHistoryEvidence::TimedOut => {
-                "session history could not confirm the accepted prompt: message lookup timed out"
-                    .to_owned()
-            }
-        };
-        let error = OcaError::new(ErrorCode::PromptUncertain)
-            .with_error(format!(
-                "{detail} within {} ms",
-                PROMPT_CONFIRM_TIMEOUT.as_millis()
-            ))
-            .with_help("Run `oca m <ref> \"<resend>\"`; oca will not replay");
-        self.preserve_uncertain_prompt(session_id, prompt, error)
     }
 
     fn preserve_uncertain_prompt(
@@ -615,8 +614,18 @@ impl ForegroundBackend for ProductionBackend {
         session_id: &str,
         prompt: &DispatchPrompt,
     ) -> Result<(), OcaError> {
-        self.confirm_prompt_visibility(subscription, session_id, prompt)
-            .await
+        match confirm_prompt_landed(
+            self.client()?,
+            subscription,
+            session_id,
+            &prompt.message_id,
+            &prompt.text,
+        )
+        .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => self.preserve_uncertain_prompt(session_id, prompt, error),
+        }
     }
 
     fn fail_before_prompt(&mut self, error: OcaError) -> OcaError {

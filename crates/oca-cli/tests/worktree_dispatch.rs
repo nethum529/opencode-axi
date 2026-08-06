@@ -298,7 +298,8 @@ fn serve_partial_then_review(listener: TcpListener, review: ReviewReply) {
     let mut first_message = None;
     let mut first_prompt = None;
     let mut second_message = None;
-    for index in 0..9 {
+    let mut second_prompt = None;
+    for index in 0..11 {
         let (mut stream, _) = listener.accept().expect("fake accepts request");
         let request = read_request(&mut stream);
         match index {
@@ -352,13 +353,25 @@ fn serve_partial_then_review(listener: TcpListener, review: ReviewReply) {
                 );
                 write_response(&mut stream, "200 OK", "application/json", &body.to_string());
             }
-            6 => {
+            6 => write_response(&mut stream, "200 OK", "text/event-stream", ""),
+            7 => {
                 second_message = request.body["messageID"].as_str().map(ToOwned::to_owned);
+                second_prompt = request.body["parts"][0]["text"]
+                    .as_str()
+                    .map(ToOwned::to_owned);
                 std::fs::write(worktree.as_ref().unwrap().join("second.txt"), "review\n").unwrap();
                 write_response(&mut stream, "204 No Content", "text/plain", "");
             }
-            7 => write_response(&mut stream, "200 OK", "text/event-stream", ""),
             8 => {
+                let body = user_reply(
+                    "ses_worktree",
+                    second_message.as_deref().unwrap(),
+                    second_prompt.as_deref().unwrap(),
+                );
+                write_response(&mut stream, "200 OK", "application/json", &body.to_string());
+            }
+            9 => write_response(&mut stream, "200 OK", "text/event-stream", ""),
+            10 => {
                 let note = match review {
                     ReviewReply::Valid => {
                         "Applied every review finding in the existing worktree without changing the original task identity or commit message source. Verified the second checkpoint is complete and independently reviewable. WORKER-SUPPLIED"

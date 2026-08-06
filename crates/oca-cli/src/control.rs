@@ -23,6 +23,7 @@ use crate::{
     crash_recovery::{
         ReconcileCommand, persist_intent, prompt_sha256, reconcile_ref, remove_intent,
     },
+    foreground::{DispatchSubscription, confirm_prompt_landed},
     transport::{open_code_error, prompt_error},
 };
 
@@ -72,6 +73,11 @@ pub async fn execute_message(
     let config = load_config(home)?;
     let context = ControlContext::from_record(&record, &config, command.effort.as_deref())?;
     let client = discovered_client(home, &config, &command.reference)?;
+    let mut subscription = client
+        .subscribe(None)
+        .await
+        .map(DispatchSubscription::new)
+        .map_err(|error| open_code_error(error).with_ref(&command.reference))?;
     let message_id = mint_message_id()?;
     let mut intent = Intent::new(&command.reference, IntentOperation::Message);
     intent.session_id = Some(record.session_id.clone());
@@ -93,6 +99,15 @@ pub async fn execute_message(
         }
         return Err(error);
     }
+    confirm_prompt_landed(
+        &client,
+        &mut subscription,
+        &record.session_id,
+        &message_id,
+        &command.message,
+    )
+    .await
+    .map_err(|error| error.with_ref(&command.reference))?;
     intent.set_phase(IntentPhase::Running);
     persist_intent(&intents, &intent)?;
 
