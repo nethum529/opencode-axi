@@ -31,6 +31,19 @@ fn every_persisted_ref_state_is_visible_from_a_refs_json_fixture() {
         RefState::Partial,
         RefState::Aborted,
     ];
+    for state in states {
+        // Adding a RefState variant must not compile until it is listed above
+        // and therefore proven visible in `oca ls` by the assertions below.
+        match state {
+            RefState::Idle
+            | RefState::Running
+            | RefState::Unknown
+            | RefState::Done
+            | RefState::Blocked
+            | RefState::Partial
+            | RefState::Aborted => {}
+        }
+    }
     fixture.write_refs_fixture(&states);
 
     let output = fixture.run(&["ls", "--json"]);
