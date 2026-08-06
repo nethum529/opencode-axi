@@ -213,7 +213,9 @@ fn a_never_responding_herdr_socket_does_not_delay_dispatch_ack_or_completion() {
     let listener = UnixListener::bind(&socket).unwrap();
     let (accepted_tx, accepted_rx) = mpsc::channel();
     let herdr = thread::spawn(move || {
-        let (_stream, _) = listener.accept().unwrap();
+        accept_discovery_probe(&listener);
+        accept_discovery_probe(&listener);
+        let _stream = accept_unix_with_timeout(&listener);
         accepted_tx.send(()).unwrap();
         thread::sleep(Duration::from_millis(850));
     });
@@ -256,7 +258,9 @@ fn a_malformed_herdr_envelope_never_fails_the_dispatch() {
     let socket = home.path().join("malformed-herdr.sock");
     let listener = UnixListener::bind(&socket).unwrap();
     let herdr = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        accept_discovery_probe(&listener);
+        accept_discovery_probe(&listener);
+        let mut stream = accept_unix_with_timeout(&listener);
         let request = read_unix_request(&stream);
         writeln!(stream, "{}", json!({"id":request["id"],"result":{}})).unwrap();
     });
@@ -289,8 +293,9 @@ fn a_malformed_herdr_envelope_never_fails_the_dispatch() {
 fn spawn_herdr_lifecycle(socket: &Path, calls: Arc<Mutex<Vec<Value>>>) -> thread::JoinHandle<()> {
     let listener = UnixListener::bind(socket).unwrap();
     thread::spawn(move || {
+        accept_discovery_probe(&listener);
         for index in 0..5 {
-            let (mut stream, _) = listener.accept().unwrap();
+            let mut stream = accept_unix_with_timeout(&listener);
             let request = read_unix_request(&stream);
             let request_id = request["id"].as_str().unwrap();
             let result = match index {
@@ -316,6 +321,39 @@ fn spawn_herdr_lifecycle(socket: &Path, calls: Arc<Mutex<Vec<Value>>>) -> thread
             calls.lock().unwrap().push(request);
         }
     })
+}
+
+fn accept_discovery_probe(listener: &UnixListener) {
+    let mut stream = accept_unix_with_timeout(listener);
+    let mut byte = [0];
+    assert_eq!(
+        stream.read(&mut byte).unwrap(),
+        0,
+        "herdr discovery probe must not send a protocol request"
+    );
+}
+
+fn accept_unix_with_timeout(listener: &UnixListener) -> UnixStream {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                return stream;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for a herdr socket connection"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("could not accept a herdr socket connection: {error}"),
+        }
+    }
 }
 
 fn read_unix_request(stream: &UnixStream) -> Value {

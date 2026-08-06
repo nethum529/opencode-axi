@@ -9,6 +9,7 @@ use std::{
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
+use socket2::{Domain, SockAddr, Socket, Type};
 use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
@@ -16,7 +17,20 @@ use tokio::{
 };
 
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+const DISCOVERY_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+fn socket_accepts_connections(path: &Path) -> bool {
+    let Ok(address) = SockAddr::unix(path) else {
+        return false;
+    };
+    let Ok(socket) = Socket::new(Domain::UNIX, Type::STREAM, None) else {
+        return false;
+    };
+    socket
+        .connect_timeout(&address, DISCOVERY_CONNECT_TIMEOUT)
+        .is_ok()
+}
 
 /// A herdr workspace identifier.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -87,7 +101,7 @@ impl HerdrClient {
     ///
     /// `HERDR_SOCKET_PATH` wins, followed by `XDG_CONFIG_HOME`, then
     /// `$HOME/.config/herdr/herdr.sock`. A candidate is returned only when it
-    /// already exists, so discovery never starts herdr.
+    /// accepts a bounded connection probe, so discovery never starts herdr.
     #[must_use]
     pub fn discover() -> Option<Self> {
         let home = env::var_os("HOME").map(PathBuf::from)?;
@@ -114,7 +128,7 @@ impl HerdrClient {
                     .map(|root| root.join("herdr/herdr.sock"))
             })
             .unwrap_or_else(|| home.join(".config/herdr/herdr.sock"));
-        socket_path.exists().then_some(Self {
+        socket_accepts_connections(&socket_path).then_some(Self {
             socket_path,
             timeout,
         })

@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use oca_core::DisplayMode;
 use oca_display::{HerdrClient, HerdrError};
 use serde_json::{Value, json};
 
@@ -21,28 +22,61 @@ enum FakeResponse {
 }
 
 #[test]
-fn discover_finds_a_configured_socket_and_keeps_the_default_deadline() {
+fn discover_selects_herdr_for_a_live_configured_socket() {
     let temp = tempfile::tempdir().unwrap();
     let socket = temp.path().join("herdr.sock");
     let _listener = UnixListener::bind(&socket).unwrap();
 
-    assert!(
-        HerdrClient::discover_from(temp.path(), Some(&socket), HerdrClient::DEFAULT_TIMEOUT)
-            .is_some()
+    let selected = DisplayMode::select(
+        false,
+        || {
+            HerdrClient::discover_from(temp.path(), Some(&socket), HerdrClient::DEFAULT_TIMEOUT)
+                .is_some()
+        },
+        true,
     );
+
+    assert_eq!(selected, DisplayMode::Herdr);
     assert_eq!(HerdrClient::DEFAULT_TIMEOUT, Duration::from_millis(750));
 }
 
 #[test]
-fn discover_skips_a_missing_socket() {
+fn discover_falls_back_to_tmux_then_headless_for_a_stale_socket() {
     let temp = tempfile::tempdir().unwrap();
-    assert!(
-        HerdrClient::discover_from(
-            temp.path(),
-            Some(&temp.path().join("missing.sock")),
-            TEST_TIMEOUT,
-        )
-        .is_none()
+    let socket = temp.path().join("herdr.sock");
+    drop(UnixListener::bind(&socket).unwrap());
+
+    let herdr_available =
+        || HerdrClient::discover_from(temp.path(), Some(&socket), TEST_TIMEOUT).is_some();
+
+    assert_eq!(
+        DisplayMode::select(false, herdr_available, true),
+        DisplayMode::Tmux
+    );
+    assert_eq!(
+        DisplayMode::select(
+            false,
+            || HerdrClient::discover_from(temp.path(), Some(&socket), TEST_TIMEOUT).is_some(),
+            false,
+        ),
+        DisplayMode::Headless
+    );
+    assert!(socket.exists(), "discovery must not unlink a stale socket");
+}
+
+#[test]
+fn discover_falls_back_for_a_missing_socket() {
+    let temp = tempfile::tempdir().unwrap();
+    let missing_socket = temp.path().join("missing.sock");
+
+    assert_eq!(
+        DisplayMode::select(
+            false,
+            || HerdrClient::discover_from(temp.path(), Some(&missing_socket), TEST_TIMEOUT)
+                .is_some(),
+            true,
+        ),
+        DisplayMode::Tmux
     );
 }
 
