@@ -196,7 +196,13 @@ pub trait EventJournalWriter {
     fn append(&mut self, event: &OcaEvent) -> Result<(), String>;
 }
 
-/// Reconnection limits. The default is the frozen five-attempt, thirty-second cap.
+const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(10);
+
+/// Reconnection limits for a stream that is not making progress.
+///
+/// Receiving an event resets both limits. With an explicit follow timeout, a
+/// successful subscription also resets them. Without one, exhaustion starts a
+/// fresh reconnect cycle instead of imposing a hidden deadline on the park.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FollowPolicy {
     pub max_reconnect_attempts: usize,
@@ -309,6 +315,7 @@ where
     J: EventJournalWriter,
 {
     let connection_failed = Arc::new(AtomicBool::new(false));
+    let has_explicit_timeout = timeout.is_some();
     let follow = follow_inner(
         transport,
         target,
@@ -316,6 +323,7 @@ where
         policy,
         Arc::clone(&connection_failed),
         initial_cursor.map(str::to_owned),
+        has_explicit_timeout,
     );
     match timeout {
         Some(timeout) => match tokio::time::timeout(timeout, follow).await {
@@ -336,6 +344,7 @@ async fn follow_inner<T, J>(
     policy: FollowPolicy,
     connection_failed: Arc<AtomicBool>,
     initial_cursor: Option<String>,
+    has_explicit_timeout: bool,
 ) -> Result<FollowOutcome, FollowError>
 where
     T: FollowTransport,
@@ -372,11 +381,13 @@ where
     let mut reconnect_attempts = 0_usize;
     let mut last_event_id = initial_cursor;
     let mut no_cursor_reconciled = false;
-    let mut last_reconnect_succeeded = false;
 
     loop {
+        tokio::task::yield_now().await;
         match subscription.next().await {
             Ok(Some(event)) => {
+                reconnect_started = None;
+                reconnect_attempts = 0;
                 connection_failed.store(false, Ordering::Relaxed);
                 if let Some(cursor) = event.cursor.as_ref() {
                     last_event_id = Some(cursor.clone());
@@ -398,9 +409,11 @@ where
                     return Ok(FollowOutcome::Terminal(terminal));
                 }
             }
-            Ok(None) | Err(FollowTransportError::Unreachable { .. }) => {
-                connection_failed.store(true, Ordering::Relaxed);
-                let reconnect_started =
+            stream_end @ (Ok(None) | Err(FollowTransportError::Unreachable { .. })) => {
+                if stream_end.is_err() {
+                    connection_failed.store(true, Ordering::Relaxed);
+                }
+                let reconnect_since =
                     *reconnect_started.get_or_insert_with(tokio::time::Instant::now);
                 if last_event_id.is_none() && !no_cursor_reconciled {
                     no_cursor_reconciled = true;
@@ -419,29 +432,31 @@ where
                 }
 
                 if reconnect_attempts >= policy.max_reconnect_attempts
-                    || reconnect_started.elapsed() >= policy.max_reconnect_elapsed
+                    || reconnect_since.elapsed() >= policy.max_reconnect_elapsed
                 {
-                    return Ok(if last_reconnect_succeeded {
-                        FollowOutcome::Timeout
-                    } else {
-                        FollowOutcome::ServerUnreachable
-                    });
+                    if has_explicit_timeout && connection_failed.load(Ordering::Relaxed) {
+                        return Ok(FollowOutcome::ServerUnreachable);
+                    }
+                    reconnect_started = Some(tokio::time::Instant::now());
+                    reconnect_attempts = 0;
                 }
 
-                let delay =
-                    reconnect_delay(policy, reconnect_attempts, reconnect_started.elapsed());
-                if !delay.is_zero() {
-                    tokio::time::sleep(delay).await;
-                }
+                let reconnect_elapsed = reconnect_started
+                    .expect("reconnect cycle is initialized")
+                    .elapsed();
+                let delay = reconnect_delay(policy, reconnect_attempts, reconnect_elapsed);
+                tokio::time::sleep(delay).await;
                 reconnect_attempts += 1;
                 match transport.subscribe(last_event_id.as_deref()).await {
                     Ok(reconnected) => {
                         subscription = reconnected;
-                        last_reconnect_succeeded = true;
+                        if has_explicit_timeout {
+                            reconnect_started = None;
+                            reconnect_attempts = 0;
+                        }
                         connection_failed.store(false, Ordering::Relaxed);
                     }
                     Err(FollowTransportError::Unreachable { .. }) => {
-                        last_reconnect_succeeded = false;
                         connection_failed.store(true, Ordering::Relaxed);
                     }
                     Err(error) => return Err(protocol_error(error)),
@@ -456,7 +471,9 @@ fn reconnect_delay(policy: FollowPolicy, attempt: usize, elapsed: Duration) -> D
     let exponent = u32::try_from(attempt).unwrap_or(u32::MAX).min(31);
     let multiplier = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
     let delay = policy.initial_backoff.saturating_mul(multiplier);
-    delay.min(policy.max_reconnect_elapsed.saturating_sub(elapsed))
+    delay
+        .min(policy.max_reconnect_elapsed.saturating_sub(elapsed))
+        .max(MIN_RECONNECT_DELAY)
 }
 
 fn protocol_error(error: FollowTransportError) -> FollowError {
@@ -540,7 +557,13 @@ fn terminal_from_message(message: FollowMessage) -> Result<FollowTerminal, Follo
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::VecDeque, sync::Mutex};
+    use std::{
+        collections::VecDeque,
+        sync::{
+            Mutex,
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+        },
+    };
 
     use super::*;
 
@@ -587,6 +610,55 @@ mod tests {
             _session_id: &str,
         ) -> Result<Vec<FollowMessage>, FollowTransportError> {
             self.reconciliations.lock().unwrap().pop_front().unwrap()
+        }
+    }
+
+    struct AlwaysEmptyTransport {
+        subscriptions: AtomicUsize,
+        fail_at: Option<std::time::Instant>,
+    }
+
+    impl AlwaysEmptyTransport {
+        fn new(fail_after: Option<Duration>) -> Self {
+            Self {
+                subscriptions: AtomicUsize::new(0),
+                fail_at: fail_after.map(|duration| std::time::Instant::now() + duration),
+            }
+        }
+    }
+
+    struct EmptySubscription;
+
+    impl EventSubscription for EmptySubscription {
+        async fn next(&mut self) -> Result<Option<OcaEvent>, FollowTransportError> {
+            Ok(None)
+        }
+    }
+
+    impl FollowTransport for AlwaysEmptyTransport {
+        type Subscription = EmptySubscription;
+
+        async fn subscribe(
+            &self,
+            _last_event_id: Option<&str>,
+        ) -> Result<Self::Subscription, FollowTransportError> {
+            self.subscriptions.fetch_add(1, AtomicOrdering::Relaxed);
+            if self
+                .fail_at
+                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                return Err(FollowTransportError::protocol(
+                    "test watchdog reached before the runtime deadline",
+                ));
+            }
+            Ok(EmptySubscription)
+        }
+
+        async fn messages(
+            &self,
+            _session_id: &str,
+        ) -> Result<Vec<FollowMessage>, FollowTransportError> {
+            Ok(Vec::new())
         }
     }
 
@@ -880,7 +952,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnect_is_capped_at_five_attempts() {
+    async fn explicit_follow_reconnect_is_capped_at_five_attempts() {
         let mut subscriptions = VecDeque::from([subscription([Ok(None)])]);
         subscriptions.extend((0..5).map(|_| {
             Err(FollowTransportError::unreachable(
@@ -901,7 +973,7 @@ mod tests {
         let outcome = follow_until_terminal_with_policy(
             &transport,
             &target(),
-            None,
+            Some(Duration::from_secs(1)),
             None::<&mut Journal>,
             policy,
         )
@@ -912,6 +984,287 @@ mod tests {
         assert_eq!(transport.cursors.lock().unwrap().len(), 6);
         assert!(transport.subscriptions.lock().unwrap().is_empty());
         assert!(transport.reconciliations.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stream_progress_resets_the_reconnect_budget_without_an_explicit_timeout() {
+        let transport = ScriptedTransport {
+            subscriptions: Mutex::new(VecDeque::from([
+                subscription([Ok(Some(event("evt-progress-1", "session.idle", None)))]),
+                subscription([Ok(Some(event("evt-progress-2", "session.idle", None)))]),
+                subscription([
+                    Ok(Some(event(
+                        "evt-terminal",
+                        "message.updated",
+                        Some(message("msg_this_dispatch", "blocked", true)),
+                    ))),
+                    Ok(Some(event("evt-idle", "session.idle", None))),
+                ]),
+            ])),
+            reconciliations: Mutex::new(VecDeque::from([Ok(Vec::new())])),
+            cursors: Mutex::new(Vec::new()),
+        };
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            follow_until_terminal_with_policy(
+                &transport,
+                &target(),
+                None,
+                None::<&mut Journal>,
+                FollowPolicy {
+                    max_reconnect_attempts: 1,
+                    max_reconnect_elapsed: Duration::from_secs(1),
+                    initial_backoff: Duration::ZERO,
+                },
+            ),
+        )
+        .await
+        .expect("a progressing stream must not stall the follow loop")
+        .unwrap();
+
+        assert_eq!(
+            outcome.exit(),
+            FollowExit::Blocked,
+            "each received event must restore the full reconnect budget"
+        );
+        assert_eq!(
+            transport.cursors.lock().unwrap().as_slice(),
+            [
+                None,
+                Some("evt-progress-1".to_owned()),
+                Some("evt-progress-2".to_owned())
+            ],
+            "every reconnect must resume from the last observed cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_empty_resubscriptions_park_without_explicit_timeout() {
+        let transport = AlwaysEmptyTransport::new(None);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(90),
+            follow_until_terminal_with_policy(
+                &transport,
+                &target(),
+                None,
+                None::<&mut Journal>,
+                FollowPolicy {
+                    max_reconnect_attempts: 3,
+                    max_reconnect_elapsed: Duration::from_millis(50),
+                    initial_backoff: Duration::from_millis(10),
+                },
+            ),
+        )
+        .await;
+
+        assert!(
+            outcome.is_err(),
+            "a reconnect budget must not terminate a no-deadline park"
+        );
+        let subscriptions = transport.subscriptions.load(AtomicOrdering::Relaxed);
+        assert!(subscriptions > 4, "the park must reconnect past one budget");
+        assert!(
+            subscriptions <= 10,
+            "the reconnect floor must bound work during the park; got {subscriptions} subscriptions"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zero_backoff_park_is_bounded_by_the_reconnect_floor() {
+        let transport = AlwaysEmptyTransport::new(None);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(90),
+            follow_until_terminal_with_policy(
+                &transport,
+                &target(),
+                None,
+                None::<&mut Journal>,
+                test_policy(),
+            ),
+        )
+        .await;
+
+        assert!(outcome.is_err(), "a zero-backoff park must not terminate");
+        let subscriptions = transport.subscriptions.load(AtomicOrdering::Relaxed);
+        assert!(
+            subscriptions <= 20,
+            "without a reconnect floor a zero-backoff park busy-spins; got {subscriptions} subscriptions in 90ms"
+        );
+    }
+
+    #[test]
+    fn reconnect_delay_has_a_floor_after_a_zero_elapsed_budget() {
+        let delay = reconnect_delay(
+            FollowPolicy {
+                max_reconnect_attempts: 0,
+                max_reconnect_elapsed: Duration::ZERO,
+                initial_backoff: Duration::ZERO,
+            },
+            usize::MAX,
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(delay, MIN_RECONNECT_DELAY);
+        assert!(!delay.is_zero());
+    }
+
+    #[tokio::test]
+    async fn terminal_event_remains_prompt_after_successful_reconnects() {
+        let transport = ScriptedTransport {
+            subscriptions: Mutex::new(VecDeque::from([
+                subscription([Ok(None)]),
+                subscription([Ok(None)]),
+                subscription([
+                    Ok(Some(event(
+                        "evt-terminal",
+                        "message.updated",
+                        Some(message("msg_this_dispatch", "blocked", true)),
+                    ))),
+                    Ok(Some(event("evt-idle", "session.idle", None))),
+                ]),
+            ])),
+            reconciliations: Mutex::new(VecDeque::from([Ok(Vec::new()), Ok(Vec::new())])),
+            cursors: Mutex::new(Vec::new()),
+        };
+        let policy = FollowPolicy {
+            max_reconnect_attempts: 5,
+            max_reconnect_elapsed: Duration::from_secs(1),
+            initial_backoff: Duration::ZERO,
+        };
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            follow_until_terminal_with_policy(
+                &transport,
+                &target(),
+                None,
+                None::<&mut Journal>,
+                policy,
+            ),
+        )
+        .await
+        .expect("terminal event must remain prompt")
+        .unwrap();
+
+        assert_eq!(outcome.exit(), FollowExit::Blocked);
+        assert_eq!(
+            transport.cursors.lock().unwrap().as_slice(),
+            [None, None, None]
+        );
+    }
+
+    #[tokio::test]
+    async fn successful_reconnects_wait_for_the_user_deadline() {
+        let transport = ScriptedTransport {
+            subscriptions: Mutex::new(VecDeque::from([
+                subscription([Ok(None)]),
+                subscription([Ok(None)]),
+                Ok(ScriptedSubscription {
+                    events: VecDeque::new(),
+                    pending: true,
+                }),
+            ])),
+            reconciliations: Mutex::new(VecDeque::from([Ok(Vec::new()), Ok(Vec::new())])),
+            cursors: Mutex::new(Vec::new()),
+        };
+        let policy = FollowPolicy {
+            max_reconnect_attempts: 1,
+            max_reconnect_elapsed: Duration::from_secs(1),
+            initial_backoff: Duration::ZERO,
+        };
+        let requested_timeout = Duration::from_millis(80);
+        let started = std::time::Instant::now();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            follow_until_terminal_with_policy(
+                &transport,
+                &target(),
+                Some(requested_timeout),
+                None::<&mut Journal>,
+                policy,
+            ),
+        )
+        .await
+        .expect("the regression test has a bounded wait")
+        .unwrap();
+
+        assert_eq!(outcome, FollowOutcome::Timeout);
+        assert!(
+            started.elapsed() >= requested_timeout,
+            "successful reconnects must not return the timeout outcome before the user deadline"
+        );
+        assert_eq!(
+            transport.cursors.lock().unwrap().as_slice(),
+            [None, None, None],
+            "the follow loop must reconnect past its old cumulative attempt cap"
+        );
+    }
+
+    #[tokio::test]
+    async fn zero_backoff_empty_stream_still_observes_the_explicit_deadline() {
+        let transport = AlwaysEmptyTransport::new(Some(Duration::from_millis(250)));
+        let requested_timeout = Duration::from_millis(20);
+        let started = std::time::Instant::now();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            follow_until_terminal_with_policy(
+                &transport,
+                &target(),
+                Some(requested_timeout),
+                None::<&mut Journal>,
+                FollowPolicy {
+                    max_reconnect_attempts: 1,
+                    max_reconnect_elapsed: Duration::from_secs(1),
+                    initial_backoff: Duration::ZERO,
+                },
+            ),
+        )
+        .await
+        .expect("zero-backoff reconnects must yield to the runtime deadline")
+        .unwrap();
+
+        assert_eq!(outcome, FollowOutcome::Timeout);
+        assert!(started.elapsed() >= requested_timeout);
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert!(transport.subscriptions.load(AtomicOrdering::Relaxed) > 1);
+    }
+
+    #[tokio::test]
+    async fn clean_stream_end_with_cursor_at_the_deadline_is_a_timeout() {
+        let transport = ScriptedTransport {
+            subscriptions: Mutex::new(VecDeque::from([subscription([Ok(None)])])),
+            reconciliations: Mutex::new(VecDeque::from([Ok(Vec::new())])),
+            cursors: Mutex::new(Vec::new()),
+        };
+        let requested_timeout = Duration::from_millis(40);
+        let started = std::time::Instant::now();
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            follow_with_policy_and_cursor(
+                &transport,
+                &target(),
+                Some(requested_timeout),
+                None::<&mut Journal>,
+                FollowPolicy {
+                    max_reconnect_attempts: 5,
+                    max_reconnect_elapsed: Duration::from_secs(2),
+                    initial_backoff: Duration::from_secs(1),
+                },
+                Some("evt-before-clean-eof"),
+            ),
+        )
+        .await
+        .expect("the clean-stream regression test has a bounded wait")
+        .unwrap();
+
+        assert_eq!(outcome, FollowOutcome::Timeout);
+        assert!(started.elapsed() >= requested_timeout);
     }
 
     #[tokio::test]
