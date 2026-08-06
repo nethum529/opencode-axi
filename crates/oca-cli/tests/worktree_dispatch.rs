@@ -101,12 +101,22 @@ fn worktree_rate_limit_creates_no_commit() {
 
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("code: rate_limited"));
-    let record = only_stored_ref(home.path());
-    let worktree = PathBuf::from(record["worktree"].as_str().unwrap());
-    assert!(record.get("commit").is_none());
+    let refs: Vec<Value> =
+        serde_json::from_slice(&std::fs::read(home.path().join(".oca/refs.json")).unwrap())
+            .unwrap();
+    assert!(
+        refs.is_empty(),
+        "rejected prompt must discard its reserved ref"
+    );
     assert_eq!(
-        git_output(&worktree, ["rev-list", "--count", "HEAD"]).trim(),
+        git_output(repository.path(), ["rev-list", "--count", "HEAD"]).trim(),
         "1"
+    );
+    assert!(
+        git_output(repository.path(), ["branch", "--list", "oca/*"])
+            .trim()
+            .is_empty(),
+        "rejected prompt must clean its reserved branch and worktree"
     );
 }
 

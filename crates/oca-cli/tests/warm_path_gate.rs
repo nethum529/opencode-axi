@@ -23,10 +23,14 @@ use serde_json::{Value, json};
 
 const WARMUP_INVOCATIONS: usize = 10;
 const MEASURED_INVOCATIONS: usize = 100;
-const WARM_P95_LIMIT: Duration = Duration::from_millis(10);
+// Issue #60 adds two synchronous admission proofs: the directory-scoped agent
+// precheck and the authoritative prompt-history confirmation. Keep a hard
+// process-to-ack ceiling for that safer five-request prefix without pretending
+// it still has the latency profile of the previous three-request path.
+const WARM_P95_LIMIT: Duration = Duration::from_millis(25);
 
 #[test]
-fn warm_subprocess_ack_p95_is_under_ten_milliseconds() {
+fn warm_safe_admission_p95_is_under_twenty_five_milliseconds() {
     let fixture = WarmFixture::new();
 
     for _ in 0..WARMUP_INVOCATIONS {
@@ -53,7 +57,7 @@ fn warm_subprocess_ack_p95_is_under_ten_milliseconds() {
     );
     assert!(
         p95 < WARM_P95_LIMIT,
-        "warm dispatch exceeded the hard 10 ms ack gate: p50={:.3} ms, p95={:.3} ms, samples_ms={:?}",
+        "warm dispatch exceeded the hard 25 ms safe-admission gate: p50={:.3} ms, p95={:.3} ms, samples_ms={:?}",
         milliseconds(median),
         milliseconds(p95),
         elapsed

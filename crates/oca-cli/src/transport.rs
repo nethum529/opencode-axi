@@ -28,10 +28,9 @@ impl OpenCodeRequest for CreateSessionOperation {
     ) -> impl Future<Output = Result<Self::Output, RequestFailure<Self::Error>>> + Send {
         let request = self.request.clone();
         async move {
-            let agent = request
-                .agent
-                .as_deref()
-                .ok_or_else(|| RequestFailure::Application(CreateSessionError::MissingAgentName))?;
+            let agent = request.agent.as_deref().ok_or(RequestFailure::Application(
+                CreateSessionError::MissingAgentName,
+            ))?;
             let agents = client
                 .agents(request.directory.as_deref(), request.workspace.as_deref())
                 .await
