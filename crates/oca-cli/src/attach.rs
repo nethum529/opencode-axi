@@ -100,6 +100,8 @@ async fn run_herdr_attach(
                 &tab,
                 vec![
                     "opencode".to_owned(),
+                    "attach".to_owned(),
+                    base_url.to_string(),
                     "--session".to_owned(),
                     command.session_id.clone(),
                 ],

@@ -1,6 +1,8 @@
 //! Background dispatch ownership over the shared foreground admission prefix.
 
-use crate::{ForegroundBackend, ForegroundRequest, OcaError, foreground::start_dispatch};
+use crate::{
+    DisplayMode, ForegroundBackend, ForegroundRequest, OcaError, foreground::start_dispatch,
+};
 
 /// A background dispatch has the same fully resolved local inputs as a
 /// foreground dispatch; only terminal ownership differs.
@@ -35,7 +37,8 @@ pub async fn run_background<B>(
 where
     B: ForegroundBackend,
 {
-    let started = start_dispatch(backend, request).await?;
+    let confirm_prompt_visibility = request.display != DisplayMode::Headless;
+    let started = start_dispatch(backend, request, confirm_prompt_visibility).await?;
     Ok(BackgroundOutcome {
         reference: started.reference,
         session_id: started.session_id,
@@ -116,6 +119,11 @@ mod tests {
             Ok(())
         }
 
+        fn mark_prompt_running(&mut self) -> Result<(), OcaError> {
+            self.calls.push("running");
+            Ok(())
+        }
+
         fn write_ref(
             &mut self,
             _session_id: &str,
@@ -193,6 +201,7 @@ mod tests {
                 "subscribe",
                 "mint",
                 "prompt",
+                "running",
                 "write_ref",
                 "ack",
                 "spawn"

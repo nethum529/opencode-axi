@@ -11,6 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use oca_core::{ErrorCode, parse_error_envelope};
 use oca_server::{ConnectOrStart, ServerRecord};
 use oca_state::{RefRecord, RefState, RefStore, RefStorePaths};
 use serde_json::{Value, json};
@@ -96,7 +97,7 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
         calls[3]["params"]["args"],
         json!([
             "attach",
-            format!("http://127.0.0.1:{port}"),
+            format!("http://127.0.0.1:{port}/"),
             "--session",
             "ses_headed_background"
         ])
@@ -108,6 +109,68 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
     assert_eq!(record.last_state, Some(RefState::Running));
     assert_eq!(record.display.as_deref(), Some("herdr"));
     assert_eq!(record.herdr_tab.as_deref(), Some("t1"));
+}
+
+#[test]
+fn headed_background_missing_prompt_is_uncertain_and_never_spawns_attach() {
+    let home = tempfile::tempdir().unwrap();
+    let socket = home.path().join("unused-herdr.sock");
+    let herdr = UnixListener::bind(&socket).unwrap();
+    herdr.set_nonblocking(true).unwrap();
+    let (port, opencode) = spawn_unconfirmed_prompt_opencode();
+    prepare_dispatch_home(home.path(), &socket, port);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args([
+            "--json", "luna:h", "-b", "do", "not", "claim", "a", "missing", "prompt",
+        ])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(
+        output.stdout.is_empty(),
+        "uncertain dispatch is not acknowledged"
+    );
+    let rendered = String::from_utf8(output.stderr).unwrap();
+    let error = parse_error_envelope(rendered.trim()).expect("structured prompt error");
+    assert_eq!(error.code(), ErrorCode::PromptUncertain.as_str());
+    let reference = error.reference().expect("uncertain ref is surfaced");
+
+    assert!(matches!(
+        herdr.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    let requests = opencode.join().unwrap();
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/session/ses_unconfirmed/message")
+            .count()
+            >= 2,
+        "prompt visibility retries are bounded but not single-shot"
+    );
+
+    let record = ref_store(home.path()).resolve(reference).unwrap().unwrap();
+    assert_eq!(record.session_id, "ses_unconfirmed");
+    assert!(record.message_id.is_some());
+    assert_eq!(record.last_state, Some(RefState::Unknown));
+    assert_eq!(record.display.as_deref(), Some("herdr"));
+    assert_eq!(record.herdr_tab, None);
+
+    let intents = fs::read_dir(home.path().join(".oca/intents"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    assert_eq!(intents.len(), 1);
+    let intent: Value = serde_json::from_slice(&fs::read(&intents[0]).unwrap()).unwrap();
+    assert_eq!(intent["phase"], "prompt_uncertain");
+    assert_eq!(intent["ref"], reference);
+    assert_eq!(intent["session_id"], "ses_unconfirmed");
+    assert_eq!(intent["message_id"], record.message_id.unwrap());
 }
 
 #[test]
@@ -159,7 +222,12 @@ fn headed_attach_records_and_closes_the_tab_after_terminal_state() {
     assert_eq!(calls[3]["params"]["kind"], "opencode");
     assert_eq!(
         calls[3]["params"]["args"],
-        json!(["--session", "ses_target"])
+        json!([
+            "attach",
+            format!("http://127.0.0.1:{port}/"),
+            "--session",
+            "ses_target"
+        ])
     );
     assert!(
         calls[3]["params"]["args"]
@@ -401,8 +469,7 @@ fn spawn_herdr_lifecycle(socket: &Path, calls: Arc<Mutex<Vec<Value>>>) -> thread
                 }),
                 3 => json!({
                     "type":"agent_started",
-                    "agent":{"terminal_id":"term1"},
-                    "argv":["opencode","--session","ses_target"]
+                    "agent":{"terminal_id":"term1"}
                 }),
                 4 => json!({"type":"ok"}),
                 _ => unreachable!(),
@@ -498,6 +565,54 @@ fn spawn_headed_background_opencode() -> (u16, thread::JoinHandle<Vec<HttpReques
                     prompt_text.as_deref().expect("prompt text was captured"),
                 );
                 write_http_response(&mut stream, "200 OK", "application/json", &body);
+            } else {
+                panic!("unexpected OpenCode request path: {}", request.path);
+            }
+            requests.push(request);
+            last_request = Some(Instant::now());
+        }
+        requests
+    });
+    (port, server)
+}
+
+fn spawn_unconfirmed_prompt_opencode() -> (u16, thread::JoinHandle<Vec<HttpRequest>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let started = Instant::now();
+        let mut last_request = None;
+        let mut requests = Vec::new();
+
+        while started.elapsed() < Duration::from_secs(5) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if last_request
+                        .is_some_and(|last: Instant| last.elapsed() >= Duration::from_millis(500))
+                    {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("fake OpenCode accept failed: {error}"),
+            };
+            let request = read_http_request(&mut stream);
+            if request.path.starts_with("/session?directory=") {
+                write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"{"id":"ses_unconfirmed"}"#,
+                );
+            } else if request.path == "/event" {
+                write_http_response(&mut stream, "200 OK", "text/event-stream", "");
+            } else if request.path == "/session/ses_unconfirmed/prompt_async" {
+                write_http_response(&mut stream, "204 No Content", "text/plain", "");
+            } else if request.path == "/session/ses_unconfirmed/message" {
+                write_http_response(&mut stream, "200 OK", "application/json", "[]");
             } else {
                 panic!("unexpected OpenCode request path: {}", request.path);
             }
