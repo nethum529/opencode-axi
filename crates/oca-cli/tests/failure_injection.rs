@@ -726,7 +726,7 @@ fn assert_uncertain_missing_prompt(
     assert_eq!(intent["ref"], reference);
     assert_eq!(intent["session_id"], session_id);
 
-    let listed = run(home, ["ls", "--all", "--json"]);
+    let listed = run(home, ["ls", "--json"]);
     assert!(listed.status.success());
     let list: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(list["total"], 1);

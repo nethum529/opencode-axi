@@ -53,21 +53,20 @@ fn execute_list_with_scope(
     prune_expired_journals(&state_directory, retention(config.retention.journal_days))
         .map_err(|error| journal_error(None, error))?;
 
-    let filter = if command.all {
-        RefListFilter::across_spawners_and_repos()
-    } else {
-        RefListFilter {
-            spawner_tag: Some(scope.spawner_tag.clone()),
-            repo: Some(scope.repo.clone()),
-            ..RefListFilter::default()
-        }
-    };
-    let records = store
-        .list(&filter)
-        .map_err(|error| runtime_error(error.to_string()))?;
     let overrides = reconciled.iter().cloned().collect::<HashMap<_, _>>();
+    // Read the active snapshot without scope narrowing first. An uncertain ref
+    // is an operator-attention item, so legacy or stranded records cannot
+    // disappear from the inbox merely because their scope metadata is absent.
+    let records = store
+        .list(&RefListFilter::across_spawners_and_repos())
+        .map_err(|error| runtime_error(error.to_string()))?;
     let mut workers = records
         .into_iter()
+        .filter(|record| {
+            command.all
+                || record_matches_scope(record, scope)
+                || is_attention_record(record, &overrides)
+        })
         .map(|record| worker_from_record(record, &overrides))
         .collect::<Vec<_>>();
     if command.blocked {
@@ -180,6 +179,19 @@ fn worker_from_record(record: RefRecord, overrides: &HashMap<String, ReconciledS
         reference: record.id,
         state,
     }
+}
+
+fn record_matches_scope(record: &RefRecord, scope: &Scope) -> bool {
+    record.spawner_tag.as_ref() == Some(&scope.spawner_tag)
+        && record.repo.as_ref() == Some(&scope.repo)
+}
+
+fn is_attention_record(record: &RefRecord, overrides: &HashMap<String, ReconciledState>) -> bool {
+    record.last_state == Some(RefState::Unknown)
+        || matches!(
+            overrides.get(&record.id),
+            Some(ReconciledState::PromptUncertain | ReconciledState::PublishedUncertain)
+        )
 }
 
 fn runtime_error(detail: impl std::fmt::Display) -> OcaError {
