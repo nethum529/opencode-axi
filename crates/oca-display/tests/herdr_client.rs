@@ -275,6 +275,19 @@ fn close_tab_succeeds_against_a_fake_socket() {
 }
 
 #[test]
+fn close_tab_id_succeeds_for_a_persisted_identifier() {
+    let fixture = Fixture::new(1, |_, request| {
+        assert_request(request, "tab.close");
+        assert_eq!(request["params"]["tab_id"], "persisted-t1");
+        FakeResponse::Result(json!({"type":"ok"}))
+    });
+    let client = fixture.client();
+
+    run(client.close_tab_id("persisted-t1")).unwrap();
+    fixture.finish();
+}
+
+#[test]
 fn close_tab_times_out_against_a_fake_socket() {
     let fixture = Fixture::new(3, |index, request| match index {
         0 => existing_workspace(request),
