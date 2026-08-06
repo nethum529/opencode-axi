@@ -4,7 +4,7 @@ use std::{path::Path, process::Command};
 
 use oca_core::{ErrorCode, OcaError, RoleReply};
 use oca_git::{RefId, cleanup_orphaned_worktree};
-use oca_opencode::{MessageWithParts, OpenCodeClient};
+use oca_opencode::{MessageWithParts, OpenCodeClient, OpenCodeError};
 use oca_server::ConnectOrStart;
 use oca_state::{
     Intent, IntentDurability, IntentPhase, IntentStore, IntentStoreError, NewRef, OcaConfig,
@@ -13,6 +13,8 @@ use oca_state::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use url::Url;
+
+use crate::transport::open_code_error;
 
 pub(crate) const RESERVED_SESSION_ID: &str = "oca_worktree_session_pending";
 
@@ -503,15 +505,16 @@ fn prompt_uncertain(reference: &str) -> OcaError {
         .with_ref(reference)
         .with_error("the stored prompt demonstrably did not land")
         .with_help(format!(
-            "Explicitly resend with `oca m {reference} \"<message>\"`"
+            "Explicitly resend with `oca m {reference} \"<resend>\"`; oca will not replay"
         ))
 }
 
-fn transport_error(reference: &str, error: impl std::fmt::Display) -> OcaError {
-    OcaError::new(ErrorCode::ServerUnreachable)
+fn transport_error(reference: &str, error: OpenCodeError) -> OcaError {
+    let detail = error.to_string();
+    open_code_error(error)
         .with_ref(reference)
         .with_error(format!(
-            "intent reconciliation could not query OpenCode: {error}"
+            "intent reconciliation could not query OpenCode: {detail}"
         ))
 }
 
@@ -579,6 +582,20 @@ mod tests {
             &[message(matching.info, "different")],
             &intent
         ));
+    }
+
+    #[test]
+    fn reachable_history_rejection_is_not_a_reconciliation_outage() {
+        let error = transport_error(
+            "w4f2a1",
+            OpenCodeError::Server {
+                status: 400,
+                body: "stored format contains retryCount".to_owned(),
+            },
+        );
+
+        assert_eq!(error.code(), ErrorCode::ProtocolMismatch.as_str());
+        assert_eq!(error.exit_code(), 1);
     }
 
     fn message(info: Value, text: &str) -> MessageWithParts {

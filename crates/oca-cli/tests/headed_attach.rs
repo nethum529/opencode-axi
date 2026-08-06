@@ -257,6 +257,10 @@ fn headed_background_rejected_history_without_sse_evidence_stays_uncertain() {
         rendered.contains("session history endpoint rejected its stored records"),
         "history rejection must remain distinct from a missing message: {rendered}"
     );
+    assert!(
+        rendered.contains(r#"oca m <ref> \"<resend>\""#),
+        "poisoned prompt recovery must name the explicit resend command: {rendered}"
+    );
     assert!(matches!(
         herdr.accept(),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
@@ -338,6 +342,80 @@ fn headed_background_sse_confirms_prompt_when_history_rejects_its_stored_record(
         "the admission stream must be followed by the detached event stream"
     );
     assert_eq!(calls.lock().unwrap()[3]["method"], "agent.start");
+}
+
+#[test]
+fn follow_reports_done_and_journals_terminal_events_when_history_stays_poisoned() {
+    let home = tempfile::tempdir().unwrap();
+    let socket = home.path().join("unused-herdr.sock");
+    let (port, opencode, release_terminal) = spawn_poisoned_history_opencode();
+    prepare_dispatch_home(home.path(), &socket, port);
+
+    let dispatch = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args([
+            "luna:h",
+            "--headless",
+            "-b",
+            "follow",
+            "poisoned",
+            "history",
+        ])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert!(
+        dispatch.status.success(),
+        "background dispatch failed: {}",
+        String::from_utf8_lossy(&dispatch.stderr)
+    );
+    let acknowledgement = String::from_utf8(dispatch.stdout).unwrap();
+    let reference = acknowledgement.split_whitespace().next().unwrap();
+    release_terminal.store(true, Ordering::SeqCst);
+
+    let follow = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["f", reference])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert!(
+        follow.status.success(),
+        "poisoned-history follow failed: {}",
+        String::from_utf8_lossy(&follow.stderr)
+    );
+    let rendered = String::from_utf8(follow.stdout).unwrap();
+    assert!(
+        rendered.contains("state=done"),
+        "unexpected follow output: {rendered}"
+    );
+    assert!(rendered.contains("status: done"));
+
+    let events = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["events", reference, "--json"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert!(events.status.success());
+    let page: Value = serde_json::from_slice(&events.stdout).unwrap();
+    let kinds = page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["session.busy", "message.updated", "session.idle"]);
+
+    let requests = opencode.join().unwrap();
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/session/ses_poisoned/message")
+            .count()
+            >= 2,
+        "admission confirmation and follow reconciliation must both exercise poisoned history"
+    );
 }
 
 #[test]
@@ -1160,7 +1238,6 @@ fn spawn_poisoned_history_opencode() -> (u16, thread::JoinHandle<Vec<HttpRequest
     let release_terminal = Arc::new(AtomicBool::new(false));
     let server_release = Arc::clone(&release_terminal);
     let message_id = Arc::new(Mutex::new(None::<String>));
-    let prompt_text = Arc::new(Mutex::new(None::<String>));
     let history_reads = Arc::new(AtomicUsize::new(0));
     let server = thread::spawn(move || {
         let started = Instant::now();
@@ -1238,30 +1315,15 @@ fn spawn_poisoned_history_opencode() -> (u16, thread::JoinHandle<Vec<HttpRequest
             } else if request.path == "/session/ses_poisoned/prompt_async" {
                 *message_id.lock().unwrap() =
                     request.body["messageID"].as_str().map(ToOwned::to_owned);
-                *prompt_text.lock().unwrap() = request.body["parts"][0]["text"]
-                    .as_str()
-                    .map(ToOwned::to_owned);
                 write_http_response(&mut stream, "204 No Content", "text/plain", "");
             } else if request.path == "/session/ses_poisoned/message" {
-                if history_reads.fetch_add(1, Ordering::SeqCst) == 0 {
-                    // Reproduce the poisoned admission read. Later reads come
-                    // from the independently spawned attach helper and return
-                    // a user projection so this regression stays scoped to
-                    // prompt confirmation rather than follow reconciliation.
-                    write_http_response(
-                        &mut stream,
-                        "400 Bad Request",
-                        "application/json",
-                        r#"{"error":"Expected OutputFormatJsonSchema, got retryCount"}"#,
-                    );
-                } else {
-                    let body = user_messages(
-                        "ses_poisoned",
-                        message_id.lock().unwrap().as_deref().unwrap(),
-                        prompt_text.lock().unwrap().as_deref().unwrap(),
-                    );
-                    write_http_response(&mut stream, "200 OK", "application/json", &body);
-                }
+                history_reads.fetch_add(1, Ordering::SeqCst);
+                write_http_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    "application/json",
+                    r#"{"error":"Expected OutputFormatJsonSchema, got retryCount"}"#,
+                );
             } else {
                 panic!("unexpected OpenCode request path: {}", request.path);
             }
@@ -1415,12 +1477,17 @@ fn poisoned_terminal_sse(parent_id: &str) -> String {
                 "structured": {
                     "status": "done",
                     "files": [],
-                    "note": "The poisoned-history regression confirms the prompt from the subscribed message stream, acknowledges it, and preserves detached event flow."
+                    "note": "The poisoned-history regression confirms the prompt from the subscribed message stream, acknowledges it, and preserves detached event flow without relying on unreadable history. The attributed idle boundary completes the turn successfully."
                 }
             }
         }
     });
-    format!("id: evt_poisoned_terminal\ndata: {message}\n\n")
+    let idle = json!({
+        "id": "evt_poisoned_idle",
+        "type": "session.idle",
+        "properties": {"sessionID": "ses_poisoned"}
+    });
+    format!("id: evt_poisoned_terminal\ndata: {message}\n\nid: evt_poisoned_idle\ndata: {idle}\n\n")
 }
 
 fn poisoned_busy_sse() -> String {

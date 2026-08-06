@@ -136,6 +136,9 @@ pub enum FollowTransportError {
     Unreachable {
         message: String,
     },
+    HistoryRejected {
+        message: String,
+    },
     Protocol {
         message: String,
     },
@@ -156,6 +159,13 @@ impl FollowTransportError {
     #[must_use]
     pub fn protocol(message: impl Into<String>) -> Self {
         Self::Protocol {
+            message: message.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn history_rejected(message: impl Into<String>) -> Self {
+        Self::HistoryRejected {
             message: message.into(),
         }
     }
@@ -362,6 +372,7 @@ where
             connection_failed.store(true, Ordering::Relaxed);
             return Ok(FollowOutcome::ServerUnreachable);
         }
+        Err(FollowTransportError::HistoryRejected { .. }) => Vec::new(),
         Err(error) => return Err(protocol_error(error)),
     };
     if let Some(terminal) = tracker.reconcile(messages)? {
@@ -414,6 +425,7 @@ where
                         Err(FollowTransportError::Unreachable { .. }) => {
                             connection_failed.store(true, Ordering::Relaxed);
                         }
+                        Err(FollowTransportError::HistoryRejected { .. }) => {}
                         Err(error) => return Err(protocol_error(error)),
                     }
                 }
@@ -461,7 +473,8 @@ fn reconnect_delay(policy: FollowPolicy, attempt: usize, elapsed: Duration) -> D
 
 fn protocol_error(error: FollowTransportError) -> FollowError {
     let message = match error {
-        FollowTransportError::Protocol { message }
+        FollowTransportError::HistoryRejected { message }
+        | FollowTransportError::Protocol { message }
         | FollowTransportError::Unreachable { message } => message,
         FollowTransportError::RateLimited {
             message,
@@ -743,6 +756,44 @@ mod tests {
             ],
             "the foreign idle must not end the follow on the incomplete snapshot"
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_history_falls_back_to_attributed_terminal_events_and_journals_them() {
+        let transport = ScriptedTransport {
+            subscriptions: Mutex::new(VecDeque::from([subscription([
+                Ok(Some(event(
+                    "evt-own",
+                    "message.updated",
+                    Some(message("msg_this_dispatch", "done", true)),
+                ))),
+                Ok(Some(event("evt-idle-own", "session.idle", None))),
+            ])])),
+            reconciliations: Mutex::new(VecDeque::from([Err(
+                FollowTransportError::history_rejected(
+                    "OpenCode returned HTTP 400 while reading session history",
+                ),
+            )])),
+            cursors: Mutex::new(Vec::new()),
+        };
+        let mut journal = Journal::default();
+
+        let outcome = follow_until_terminal_with_policy(
+            &transport,
+            &target(),
+            None,
+            Some(&mut journal),
+            test_policy(),
+        )
+        .await
+        .unwrap();
+
+        let FollowOutcome::Terminal(terminal) = outcome else {
+            panic!("SSE evidence must settle a turn whose history is poisoned");
+        };
+        assert_eq!(terminal.state, WorkerState::Done);
+        assert_eq!(journal.0, ["message.updated", "session.idle"]);
+        assert!(transport.reconciliations.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

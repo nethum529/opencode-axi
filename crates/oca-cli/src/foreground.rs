@@ -16,8 +16,8 @@ use oca_core::{
 use oca_display::{Acknowledgement, CompletionRecord, HerdrClient};
 use oca_opencode::{
     CreateSessionRequest, MessageWithParts, OpenCodeClient, OpenCodeError, PromptRequest, SseError,
-    SseEvent, SseSourceErrorKind, Subscription, TextPart, attributed_structured_reply,
-    is_target_message_event, is_target_session_idle,
+    SseEvent, SseSourceErrorKind, Subscription, TextPart, attributed_streamed_reply,
+    attributed_structured_reply, is_target_message_event, is_target_session_idle,
 };
 use oca_server::{ConnectOrStart, SystemRuntime};
 use oca_state::{
@@ -255,11 +255,11 @@ impl ProductionBackend {
         session_id: &str,
         message_id: &str,
     ) -> Result<Option<TerminalReply>, OcaError> {
-        let messages = self
-            .client()?
-            .messages(session_id)
-            .await
-            .map_err(open_code_error)?;
+        let messages = match self.client()?.messages(session_id).await {
+            Ok(messages) => messages,
+            Err(OpenCodeError::Server { status: 400, .. }) => return Ok(None),
+            Err(error) => return Err(open_code_error(error)),
+        };
         Ok(
             attributed_structured_reply(&messages, session_id, message_id)
                 .map(|structured| TerminalReply { structured }),
@@ -365,7 +365,7 @@ impl ProductionBackend {
                 "{detail} within {} ms",
                 PROMPT_CONFIRM_TIMEOUT.as_millis()
             ))
-            .with_help("reconcile the stored message id; never replay this prompt automatically");
+            .with_help("Run `oca m <ref> \"<resend>\"`; oca will not replay");
         self.preserve_uncertain_prompt(session_id, prompt, error)
     }
 
@@ -743,6 +743,7 @@ impl ForegroundBackend for ProductionBackend {
         session_id: &str,
         message_id: &str,
     ) -> Result<TerminalReply, OcaError> {
+        let mut streamed_reply = None;
         loop {
             let event = match subscription.next().await {
                 Ok(Some(event)) => event,
@@ -761,10 +762,16 @@ impl ForegroundBackend for ProductionBackend {
                         .with_error(format!("OpenCode event stream failed: {stream_error}")));
                 }
             };
-            if is_target_session_idle(&event, session_id)
-                && let Some(reply) = self.read_attributed_reply(session_id, message_id).await?
-            {
-                return Ok(reply);
+            if let Some(structured) = attributed_streamed_reply(&event, session_id, message_id) {
+                streamed_reply = Some(TerminalReply { structured });
+            }
+            if is_target_session_idle(&event, session_id) {
+                if let Some(reply) = streamed_reply.take() {
+                    return Ok(reply);
+                }
+                if let Some(reply) = self.read_attributed_reply(session_id, message_id).await? {
+                    return Ok(reply);
+                }
             }
         }
     }
