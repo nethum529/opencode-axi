@@ -69,6 +69,12 @@ pub struct MessageWithParts {
     pub extra: Map<String, Value>,
 }
 
+/// One registered OpenCode agent returned by the instance-scoped agent list.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct AgentInfo {
+    pub name: String,
+}
+
 /// The acknowledgement returned by an accepted asynchronous prompt.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PromptAccepted;
@@ -202,6 +208,27 @@ impl OpenCodeClient {
             request.directory.as_deref(),
             request.workspace.as_deref(),
             Some(Value::Object(body)),
+            StatusCode::OK,
+        )
+        .await
+    }
+
+    /// Lists the agents registered for one OpenCode directory/workspace scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when OpenCode rejects the request or its response is malformed.
+    pub async fn agents(
+        &self,
+        directory: Option<&str>,
+        workspace: Option<&str>,
+    ) -> Result<Vec<AgentInfo>, OpenCodeError> {
+        self.json(
+            Method::GET,
+            "agent",
+            directory,
+            workspace,
+            None,
             StatusCode::OK,
         )
         .await

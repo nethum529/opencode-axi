@@ -1,8 +1,6 @@
 //! Background dispatch ownership over the shared foreground admission prefix.
 
-use crate::{
-    DisplayMode, ForegroundBackend, ForegroundRequest, OcaError, foreground::start_dispatch,
-};
+use crate::{ForegroundBackend, ForegroundRequest, OcaError, foreground::start_dispatch};
 
 /// A background dispatch has the same fully resolved local inputs as a
 /// foreground dispatch; only terminal ownership differs.
@@ -37,8 +35,7 @@ pub async fn run_background<B>(
 where
     B: ForegroundBackend,
 {
-    let confirm_prompt_visibility = request.display != DisplayMode::Headless;
-    let started = start_dispatch(backend, request, confirm_prompt_visibility).await?;
+    let started = start_dispatch(backend, request).await?;
     Ok(BackgroundOutcome {
         reference: started.reference,
         session_id: started.session_id,
@@ -91,6 +88,11 @@ mod tests {
         type Subscription = Subscription;
         type PendingRef = String;
 
+        async fn ensure_agent(&mut self, _request: &BackgroundRequest) -> Result<(), OcaError> {
+            self.calls.push("agent");
+            Ok(())
+        }
+
         async fn create_session(
             &mut self,
             _request: &BackgroundRequest,
@@ -115,7 +117,16 @@ mod tests {
             _prompt: &DispatchPrompt,
         ) -> Result<(), OcaError> {
             self.calls.push("prompt");
-            assert_eq!(self.calls[..2], ["create", "subscribe"]);
+            assert_eq!(self.calls[1..3], ["create", "subscribe"]);
+            Ok(())
+        }
+
+        async fn confirm_prompt_landed(
+            &mut self,
+            _session_id: &str,
+            _prompt: &DispatchPrompt,
+        ) -> Result<(), OcaError> {
+            self.calls.push("confirm");
             Ok(())
         }
 
@@ -197,10 +208,12 @@ mod tests {
         assert_eq!(
             backend.calls,
             [
+                "agent",
                 "create",
                 "subscribe",
                 "mint",
                 "prompt",
+                "confirm",
                 "running",
                 "write_ref",
                 "ack",

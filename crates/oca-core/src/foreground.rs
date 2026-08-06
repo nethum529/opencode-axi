@@ -79,6 +79,12 @@ pub trait ForegroundBackend {
         Ok(())
     }
 
+    /// Resolves the requested role to its OpenCode agent and verifies that the
+    /// server has registered it before any session or prompt is created.
+    async fn ensure_agent(&mut self, _request: &ForegroundRequest) -> Result<(), OcaError> {
+        Ok(())
+    }
+
     async fn create_session(&mut self, request: &ForegroundRequest) -> Result<String, OcaError>;
 
     async fn subscribe(&mut self) -> Result<Self::Subscription, OcaError>;
@@ -92,9 +98,7 @@ pub trait ForegroundBackend {
     ) -> Result<(), OcaError>;
 
     /// Confirms that an asynchronously accepted prompt is visible in the
-    /// authoritative session before a detached headed helper is launched.
-    ///
-    /// Headless background and foreground dispatches do not call this hook.
+    /// authoritative session before any dispatch mode can acknowledge or wait.
     async fn confirm_prompt_landed(
         &mut self,
         _session_id: &str,
@@ -176,7 +180,7 @@ pub async fn run_foreground<B>(
 where
     B: ForegroundBackend,
 {
-    let mut started = start_dispatch(backend, request, false).await?;
+    let mut started = start_dispatch(backend, request).await?;
 
     let terminal = match backend
         .reconcile_once(&started.session_id, &started.message_id)
@@ -214,7 +218,6 @@ where
 pub(crate) async fn start_dispatch<B>(
     backend: &mut B,
     mut request: ForegroundRequest,
-    confirm_prompt_visibility: bool,
 ) -> Result<StartedDispatch<B::Subscription>, OcaError>
 where
     B: ForegroundBackend,
@@ -224,6 +227,7 @@ where
     // session again on recovery, which is safe because that step patches an
     // existing ref rather than allocating a new one.
     backend.prepare(&mut request)?;
+    backend.ensure_agent(&request).await?;
     let mut session_id = backend.create_session(&request).await?;
     let mut retried_session_creation = false;
 
@@ -259,9 +263,7 @@ where
         }
         Err(error) => return Err(error),
     }
-    if confirm_prompt_visibility {
-        backend.confirm_prompt_landed(&session_id, &prompt).await?;
-    }
+    backend.confirm_prompt_landed(&session_id, &prompt).await?;
     backend.mark_prompt_running()?;
 
     let pending = backend.write_ref(&session_id, &message_id, &request)?;
@@ -492,6 +494,11 @@ mod tests {
         type Subscription = ();
         type PendingRef = String;
 
+        async fn ensure_agent(&mut self, _request: &ForegroundRequest) -> Result<(), OcaError> {
+            self.calls.push("agent");
+            Ok(())
+        }
+
         async fn create_session(
             &mut self,
             request: &ForegroundRequest,
@@ -535,6 +542,20 @@ mod tests {
                 rule.action == crate::PermissionAction::Deny && rule.pattern == "*"
             }));
             self.prompt = Some(prompt.clone());
+            Ok(())
+        }
+
+        async fn confirm_prompt_landed(
+            &mut self,
+            _session_id: &str,
+            _prompt: &DispatchPrompt,
+        ) -> Result<(), OcaError> {
+            self.calls.push("confirm");
+            Ok(())
+        }
+
+        fn mark_prompt_running(&mut self) -> Result<(), OcaError> {
+            self.calls.push("running");
             Ok(())
         }
 
@@ -618,10 +639,13 @@ mod tests {
             assert_eq!(
                 backend.calls,
                 [
+                    "agent",
                     "create",
                     "subscribe",
                     "mint",
                     "prompt",
+                    "confirm",
+                    "running",
                     "write_ref",
                     "ack",
                     "spawn",

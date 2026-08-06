@@ -1,6 +1,7 @@
 //! Production adapters for the core foreground dispatch state machine.
 
 use std::{
+    collections::HashSet,
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
@@ -27,11 +28,13 @@ use crate::{
     DispatchCommand,
     crash_recovery::{RESERVED_SESSION_ID, intent_failpoint, persist_intent, prompt_sha256},
     scope::Scope,
-    transport::{CreateSessionOperation, connect_error, open_code_error, prompt_error},
+    transport::{
+        CreateSessionOperation, ListAgentsOperation, connect_error, open_code_error, prompt_error,
+    },
     worktree_dispatch::{WorktreeDispatch, finalize_turn},
 };
 
-const HEADED_BACKGROUND_PROMPT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+const PROMPT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 const PROMPT_CONFIRM_INITIAL_BACKOFF: Duration = Duration::from_millis(20);
 const PROMPT_CONFIRM_MAX_BACKOFF: Duration = Duration::from_millis(200);
 
@@ -147,6 +150,7 @@ pub(crate) struct ProductionBackend {
     scope: Scope,
     worktree: Option<WorktreeDispatch>,
     dispatch_cwd: Option<PathBuf>,
+    available_agents: Option<HashSet<String>>,
 }
 
 pub(crate) enum PendingProductionRef {
@@ -176,6 +180,7 @@ impl ProductionBackend {
             scope,
             worktree,
             dispatch_cwd: None,
+            available_agents: None,
         }
     }
 
@@ -228,8 +233,7 @@ impl ProductionBackend {
 
         loop {
             let elapsed = started.elapsed();
-            let Some(remaining) = HEADED_BACKGROUND_PROMPT_CONFIRM_TIMEOUT.checked_sub(elapsed)
-            else {
+            let Some(remaining) = PROMPT_CONFIRM_TIMEOUT.checked_sub(elapsed) else {
                 break;
             };
             let attempt_timeout = remaining.min(PROMPT_CONFIRM_MAX_BACKOFF);
@@ -249,8 +253,7 @@ impl ProductionBackend {
             }
 
             let elapsed = started.elapsed();
-            let Some(remaining) = HEADED_BACKGROUND_PROMPT_CONFIRM_TIMEOUT.checked_sub(elapsed)
-            else {
+            let Some(remaining) = PROMPT_CONFIRM_TIMEOUT.checked_sub(elapsed) else {
                 break;
             };
             tokio::time::sleep(backoff.min(remaining)).await;
@@ -264,7 +267,7 @@ impl ProductionBackend {
         let error = OcaError::new(ErrorCode::PromptUncertain)
             .with_error(format!(
                 "{detail} within {} ms",
-                HEADED_BACKGROUND_PROMPT_CONFIRM_TIMEOUT.as_millis()
+                PROMPT_CONFIRM_TIMEOUT.as_millis()
             ))
             .with_help("reconcile the stored message id; never replay this prompt automatically");
         self.preserve_uncertain_prompt(session_id, prompt, error)
@@ -321,6 +324,18 @@ impl ProductionBackend {
         }
         Err(error.with_ref(reference))
     }
+
+    fn cleanup_pre_prompt_failure(&self, error: OcaError) -> OcaError {
+        let Ok(reference) = self.reference().map(str::to_owned) else {
+            return error;
+        };
+        if let Some(worktree) = &self.worktree {
+            let _ = worktree.cleanup(&reference);
+        }
+        let _ = self.intents.remove(&reference);
+        let _ = self.refs.discard_unacknowledged(&reference);
+        error.with_ref(reference)
+    }
 }
 
 impl ForegroundBackend for ProductionBackend {
@@ -370,8 +385,40 @@ impl ForegroundBackend for ProductionBackend {
             let reference = self.reference.as_deref().expect("set above");
             let intent = self.intent.as_mut().expect("set above");
             worktree.prepare(&self.refs, request, reference, &self.intents, intent)?;
+            persist_intent(&self.intents, intent)?;
         }
         Ok(())
+    }
+
+    async fn ensure_agent(&mut self, request: &ForegroundRequest) -> Result<(), OcaError> {
+        if self.available_agents.is_none() {
+            let mut operation = ListAgentsOperation::new(request.cwd.display().to_string());
+            let agents = self
+                .manager
+                .connect_or_start(&self.runtime, &mut operation)
+                .await
+                .map_err(connect_error)
+                .map_err(|error| self.cleanup_pre_prompt_failure(error))?;
+            self.available_agents = Some(agents.into_iter().map(|agent| agent.name).collect());
+        }
+
+        let agent = request.role.as_str();
+        if self
+            .available_agents
+            .as_ref()
+            .is_some_and(|agents| agents.contains(agent))
+        {
+            return Ok(());
+        }
+
+        let error = OcaError::new(ErrorCode::ProtocolMismatch)
+            .with_error(format!(
+                "OpenCode agent `{agent}` is not registered in ~/.config/opencode/opencode.jsonc"
+            ))
+            .with_help(format!(
+                "Register agent `{agent}` in ~/.config/opencode/opencode.jsonc and retry"
+            ));
+        Err(self.cleanup_pre_prompt_failure(error))
     }
 
     async fn create_session(&mut self, request: &ForegroundRequest) -> Result<String, OcaError> {
@@ -393,10 +440,6 @@ impl ForegroundBackend for ProductionBackend {
             )]),
             ..CreateSessionRequest::default()
         });
-        if self.worktree.is_some() {
-            let intent = self.intent.as_ref().expect("intent set during prepare");
-            persist_intent(&self.intents, intent)?;
-        }
         let session = match self
             .manager
             .connect_or_start(&self.runtime, &mut operation)
@@ -404,14 +447,7 @@ impl ForegroundBackend for ProductionBackend {
         {
             Ok(session) => session,
             Err(error) => {
-                let error = connect_error(error);
-                let reference = self.reference()?.to_owned();
-                if let Some(worktree) = &self.worktree {
-                    let _ = worktree.cleanup(&reference);
-                }
-                let _ = self.intents.remove(&reference);
-                let _ = self.refs.discard_unacknowledged(&reference);
-                return Err(error.with_ref(reference));
+                return Err(self.cleanup_pre_prompt_failure(connect_error(error)));
             }
         };
         let record = self
@@ -640,17 +676,23 @@ impl ForegroundBackend for ProductionBackend {
         message_id: &str,
     ) -> Result<TerminalReply, OcaError> {
         loop {
-            let event = subscription
-                .next()
-                .await
-                .map_err(|error| {
-                    OcaError::new(ErrorCode::ServerUnreachable)
-                        .with_error(format!("OpenCode event stream failed: {error}"))
-                })?
-                .ok_or_else(|| {
-                    OcaError::new(ErrorCode::ServerUnreachable)
-                        .with_error("OpenCode event stream closed before a terminal event")
-                })?;
+            let event = match subscription.next().await {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    if let Some(reply) = self.read_attributed_reply(session_id, message_id).await? {
+                        return Ok(reply);
+                    }
+                    return Err(OcaError::new(ErrorCode::ProtocolMismatch)
+                        .with_error("OpenCode event stream closed before a terminal event"));
+                }
+                Err(_stream_error) => {
+                    if let Some(reply) = self.read_attributed_reply(session_id, message_id).await? {
+                        return Ok(reply);
+                    }
+                    return Err(OcaError::new(ErrorCode::ProtocolMismatch)
+                        .with_error("OpenCode event stream violated the expected protocol"));
+                }
+            };
             if is_target_session_idle(&event, session_id)
                 && let Some(reply) = self.read_attributed_reply(session_id, message_id).await?
             {

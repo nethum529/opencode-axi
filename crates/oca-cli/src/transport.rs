@@ -4,7 +4,7 @@ use std::future::Future;
 
 use oca_core::{ErrorCode, OcaError};
 use oca_opencode::{
-    CreateSessionRequest, OpenCodeClient, OpenCodeError, Session, TransmissionStage,
+    AgentInfo, CreateSessionRequest, OpenCodeClient, OpenCodeError, Session, TransmissionStage,
 };
 use oca_server::{ConnectError, OpenCodeRequest, RequestFailure};
 
@@ -37,6 +37,42 @@ impl OpenCodeRequest for CreateSessionOperation {
                     RequestFailure::Application(error)
                 }
             })
+        }
+    }
+}
+
+pub(crate) struct ListAgentsOperation {
+    directory: String,
+}
+
+impl ListAgentsOperation {
+    pub(crate) fn new(directory: impl Into<String>) -> Self {
+        Self {
+            directory: directory.into(),
+        }
+    }
+}
+
+impl OpenCodeRequest for ListAgentsOperation {
+    type Output = Vec<AgentInfo>;
+    type Error = OpenCodeError;
+
+    fn send(
+        &mut self,
+        client: &OpenCodeClient,
+    ) -> impl Future<Output = Result<Self::Output, RequestFailure<Self::Error>>> + Send {
+        let directory = self.directory.clone();
+        async move {
+            client
+                .agents(Some(&directory), None)
+                .await
+                .map_err(|error| {
+                    if matches!(error, OpenCodeError::Transport { .. }) {
+                        RequestFailure::Connection(error)
+                    } else {
+                        RequestFailure::Application(error)
+                    }
+                })
         }
     }
 }

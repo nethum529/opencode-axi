@@ -95,9 +95,17 @@ fn background_then_separate_follow_reconciles_an_already_finished_turn() {
             .iter()
             .map(|request| route(&request.path))
             .collect::<Vec<_>>(),
-        ["session", "event", "prompt_async", "event", "messages"]
+        [
+            "agents",
+            "session",
+            "event",
+            "prompt_async",
+            "messages",
+            "event",
+            "messages"
+        ]
     );
-    let message_id = trace[2].body["messageID"]
+    let message_id = trace[3].body["messageID"]
         .as_str()
         .expect("caller message id");
     assert!(is_opencode_message_id(message_id));
@@ -115,11 +123,20 @@ fn background_then_separate_follow_reconciles_an_already_finished_turn() {
 fn serve_background_then_follow(listener: TcpListener) -> Vec<CapturedRequest> {
     let mut captured = Vec::new();
     let mut message_id = None;
-    for index in 0..5 {
+    for index in 0..7 {
         let (mut stream, _) = listener.accept().expect("fake accepts request");
         let request = read_request(&mut stream);
         match index {
             0 => {
+                assert!(request.path.starts_with("/agent?directory="));
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"[{"name":"impl"}]"#,
+                );
+            }
+            1 => {
                 assert!(request.path.starts_with("/session?directory="));
                 write_response(
                     &mut stream,
@@ -128,16 +145,28 @@ fn serve_background_then_follow(listener: TcpListener) -> Vec<CapturedRequest> {
                     r#"{"id":"ses_background"}"#,
                 );
             }
-            1 | 3 => {
+            2 | 5 => {
                 assert_eq!(request.path, "/event");
                 write_response(&mut stream, "200 OK", "text/event-stream", "");
             }
-            2 => {
+            3 => {
                 assert_eq!(request.path, "/session/ses_background/prompt_async");
                 message_id = request.body["messageID"].as_str().map(ToOwned::to_owned);
                 write_response(&mut stream, "204 No Content", "text/plain", "");
             }
             4 => {
+                assert_eq!(request.path, "/session/ses_background/message");
+                let body = json!([{
+                    "info": {
+                        "id": message_id.as_deref().unwrap(),
+                        "sessionID": "ses_background",
+                        "role": "user"
+                    },
+                    "parts": [{"type":"text","text":"finish immediately"}]
+                }]);
+                write_response(&mut stream, "200 OK", "application/json", &body.to_string());
+            }
+            6 => {
                 assert_eq!(request.path, "/session/ses_background/message");
                 let body = json!([{
                     "info": {
@@ -164,7 +193,9 @@ fn serve_background_then_follow(listener: TcpListener) -> Vec<CapturedRequest> {
 }
 
 fn route(path: &str) -> &'static str {
-    if path.starts_with("/session?") {
+    if path.starts_with("/agent?") {
+        "agents"
+    } else if path.starts_with("/session?") {
         "session"
     } else if path == "/event" {
         // Request order distinguishes dispatch ownership from follow ownership.

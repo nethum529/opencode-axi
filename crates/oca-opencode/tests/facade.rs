@@ -117,6 +117,32 @@ fn session_operations_accept_string_slices() {
     std::mem::drop(client.queue(session, prompt_request()));
     std::mem::drop(client.abort(session));
     std::mem::drop(client.messages(session));
+    std::mem::drop(client.agents(Some("/workspace"), None));
+}
+
+#[tokio::test]
+async fn agents_uses_the_scoped_instance_endpoint_and_projects_names() {
+    let server = FakeServer::once(response(
+        "200 OK",
+        "application/json",
+        r#"[{"name":"build","mode":"primary"},{"name":"impl","mode":"primary"}]"#,
+    ));
+    let client = OpenCodeClient::new(server.base_url.parse().expect("valid URL"));
+
+    let agents = client
+        .agents(Some("/workspace"), None)
+        .await
+        .expect("agents are returned");
+
+    assert_eq!(
+        agents
+            .iter()
+            .map(|agent| agent.name.as_str())
+            .collect::<Vec<_>>(),
+        ["build", "impl"]
+    );
+    let request = server.finish();
+    assert!(request.starts_with("GET /agent?directory=%2Fworkspace HTTP/1.1\r\n"));
 }
 
 #[tokio::test]

@@ -18,6 +18,9 @@ pub enum FailureAction {
     Respond(HttpResponse),
     /// Return headers and the configured chunks, then close before the terminal chunk.
     RespondThenDrop(HttpResponse),
+    /// Return a session-history user message derived from the most recently
+    /// captured asynchronous prompt. This preserves caller-minted message IDs.
+    EchoPrompt { session_id: String },
 }
 
 /// A bounded fake HTTP server that consumes an explicit failure script.
@@ -120,10 +123,56 @@ impl FailureHttpServer {
                         return Err(error);
                     }
                 }
+                FailureAction::EchoPrompt { session_id } => {
+                    let response = prompt_echo_response(&requests, &session_id)?;
+                    if let Err(error) = write_http_response(&mut stream, &response)
+                        && !is_peer_disconnect(&error)
+                    {
+                        return Err(error);
+                    }
+                }
             }
         }
         Ok(requests)
     }
+}
+
+fn prompt_echo_response(
+    requests: &[HttpRequest],
+    session_id: &str,
+) -> Result<HttpResponse, ReplayHttpServerError> {
+    let prompt = requests
+        .iter()
+        .rev()
+        .find(|request| request.path.ends_with("/prompt_async"))
+        .ok_or_else(|| {
+            ReplayHttpServerError::InvalidRequest(
+                "prompt echo requested before a prompt was captured".to_owned(),
+            )
+        })?;
+    let prompt: serde_json::Value = serde_json::from_slice(&prompt.body).map_err(|error| {
+        ReplayHttpServerError::InvalidRequest(format!("captured prompt body is not JSON: {error}"))
+    })?;
+    let message_id = prompt["messageID"].as_str().ok_or_else(|| {
+        ReplayHttpServerError::InvalidRequest(
+            "captured prompt body has no string messageID".to_owned(),
+        )
+    })?;
+    let parts = prompt["parts"].clone();
+    let body = serde_json::json!([{
+        "info": {
+            "id": message_id,
+            "sessionID": session_id,
+            "role": "user"
+        },
+        "parts": parts
+    }])
+    .to_string();
+    Ok(HttpResponse::new(
+        200,
+        [("content-type", "application/json")],
+        [body.into_bytes()],
+    ))
 }
 
 fn is_peer_disconnect(error: &ReplayHttpServerError) -> bool {

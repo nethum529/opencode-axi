@@ -19,7 +19,7 @@ use std::{
 };
 
 use oca_state::{RefRecord, RefState, RefStore, RefStorePaths};
-use serde_json::json;
+use serde_json::{Value, json};
 
 const WARMUP_INVOCATIONS: usize = 10;
 const MEASURED_INVOCATIONS: usize = 100;
@@ -193,9 +193,11 @@ fn warm_prefix_sources_reject_forbidden_operation_families() {
         dispatch_prefix,
         &[
             "backend.prepare(",
+            "backend.ensure_agent(",
             "backend.create_session(",
             "backend.subscribe(",
             "backend.prompt_async(",
+            "backend.confirm_prompt_landed(",
             "backend.write_ref(",
             "backend.acknowledge(",
             "backend.spawn_attach(",
@@ -368,17 +370,20 @@ impl WarmFixture {
                 .iter()
                 .map(|path| route(path))
                 .collect::<Vec<_>>(),
-            ["session.create", "event.subscribe", "session.prompt_async"],
+            [
+                "agent.list",
+                "session.create",
+                "event.subscribe",
+                "session.prompt_async",
+                "session.messages"
+            ],
             "the warm path made a forbidden request before acknowledgement"
         );
         assert!(
             sample.pre_ack_requests.iter().all(|path| {
-                !path.contains("health")
-                    && !path.contains("status")
-                    && !path.ends_with("/message")
-                    && path != "/doc"
+                !path.contains("health") && !path.contains("status") && path != "/doc"
             }),
-            "health, status, documentation, and full-history reads are forbidden before ack: {:?}",
+            "health, status, and documentation reads are forbidden before ack: {:?}",
             sample.pre_ack_requests
         );
     }
@@ -443,7 +448,7 @@ fn finish_after_ack(child: &mut Child) {
         .read_to_end(&mut stderr)
         .expect("child stderr reads");
     assert!(
-        String::from_utf8_lossy(&stderr).contains("server_unreachable"),
+        String::from_utf8_lossy(&stderr).contains("protocol_mismatch"),
         "unexpected post-ack failure: {}",
         String::from_utf8_lossy(&stderr)
     );
@@ -482,6 +487,9 @@ struct ServerState {
 struct CurrentDispatch {
     awaiting_ack: bool,
     pre_ack_requests: Vec<String>,
+    session_id: String,
+    message_id: Option<String>,
+    prompt_text: Option<String>,
 }
 
 impl FakeServer {
@@ -570,9 +578,10 @@ fn serve(listener: TcpListener, shared: &Arc<(Mutex<ServerState>, Condvar)>) {
                 return;
             }
         }
-        let Some(path) = read_request_path(&mut stream) else {
+        let Some(request) = read_request(&mut stream) else {
             continue;
         };
+        let path = request.path;
         if path == "/__warm_test_barrier" {
             write_response(&mut stream, "204 No Content", "text/plain", "");
             let (lock, ready) = &**shared;
@@ -586,13 +595,26 @@ fn serve(listener: TcpListener, shared: &Arc<(Mutex<ServerState>, Condvar)>) {
             let mut state = lock.lock().expect("server state locks");
             state.requests.push(path.clone());
 
-            if path.starts_with("/session?") {
-                state.next_session += 1;
-                let session_id = format!("ses_warm_{}", state.next_session);
+            if path.starts_with("/agent?") {
                 state.current = Some(CurrentDispatch {
                     awaiting_ack: true,
                     pre_ack_requests: vec![path.clone()],
+                    session_id: String::new(),
+                    message_id: None,
+                    prompt_text: None,
                 });
+                (
+                    "200 OK",
+                    "application/json",
+                    r#"[{"name":"impl"}]"#.to_owned(),
+                    false,
+                )
+            } else if path.starts_with("/session?") {
+                state.next_session += 1;
+                let session_id = format!("ses_warm_{}", state.next_session);
+                let current = state.current.as_mut().expect("agent probe starts dispatch");
+                current.pre_ack_requests.push(path.clone());
+                current.session_id.clone_from(&session_id);
                 (
                     "200 OK",
                     "application/json",
@@ -617,9 +639,31 @@ fn serve(listener: TcpListener, shared: &Arc<(Mutex<ServerState>, Condvar)>) {
                 if path == "/event" {
                     ("200 OK", "text/event-stream", String::new(), false)
                 } else if path.ends_with("/prompt_async") {
-                    ("204 No Content", "text/plain", String::new(), true)
+                    let current = state.current.as_mut().expect("active dispatch");
+                    current.message_id = request.body["messageID"].as_str().map(ToOwned::to_owned);
+                    current.prompt_text = request.body["parts"][0]["text"]
+                        .as_str()
+                        .map(ToOwned::to_owned);
+                    ("204 No Content", "text/plain", String::new(), false)
                 } else if path.ends_with("/message") {
-                    ("200 OK", "application/json", "[]".to_owned(), false)
+                    let current = state.current.as_ref().expect("active dispatch");
+                    if current.awaiting_ack {
+                        let body = json!([{
+                            "info": {
+                                "id": current.message_id.as_deref().unwrap(),
+                                "sessionID": current.session_id,
+                                "role": "user"
+                            },
+                            "parts": [{
+                                "type": "text",
+                                "text": current.prompt_text.as_deref().unwrap()
+                            }]
+                        }])
+                        .to_string();
+                        ("200 OK", "application/json", body, true)
+                    } else {
+                        ("200 OK", "application/json", "[]".to_owned(), false)
+                    }
                 } else {
                     ("200 OK", "application/json", "{}".to_owned(), false)
                 }
@@ -645,16 +689,40 @@ fn serve(listener: TcpListener, shared: &Arc<(Mutex<ServerState>, Condvar)>) {
     }
 }
 
-fn read_request_path(stream: &mut TcpStream) -> Option<String> {
+struct FakeRequest {
+    path: String,
+    body: Value,
+}
+
+fn read_request(stream: &mut TcpStream) -> Option<FakeRequest> {
     let mut reader = BufReader::new(stream.try_clone().expect("request stream clones"));
     let mut request_line = String::new();
     reader
         .read_line(&mut request_line)
         .expect("request line reads");
-    request_line
+    let path = request_line
         .split_whitespace()
         .nth(1)
-        .map(ToOwned::to_owned)
+        .map(ToOwned::to_owned)?;
+    let mut content_length = 0;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("request header reads");
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            content_length = value.trim().parse().expect("content length");
+        }
+    }
+    let mut bytes = vec![0; content_length];
+    reader.read_exact(&mut bytes).expect("request body reads");
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).expect("request JSON")
+    };
+    Some(FakeRequest { path, body })
 }
 
 fn write_response(stream: &mut TcpStream, status: &str, content_type: &str, body: &str) {
@@ -667,14 +735,16 @@ fn write_response(stream: &mut TcpStream, status: &str, content_type: &str, body
 }
 
 fn route(path: &str) -> &'static str {
-    if path.starts_with("/session?") {
+    if path.starts_with("/agent?") {
+        "agent.list"
+    } else if path.starts_with("/session?") {
         "session.create"
     } else if path == "/event" {
         "event.subscribe"
     } else if path.ends_with("/prompt_async") {
         "session.prompt_async"
     } else if path.ends_with("/message") {
-        "messages"
+        "session.messages"
     } else if path.contains("health") {
         "health"
     } else if path.contains("status") {

@@ -18,7 +18,7 @@ mod generated;
 
 pub use dispatch::{attributed_structured_reply, is_target_session_idle};
 pub use facade::{
-    AbortAccepted, ControlAccepted, CreateSessionRequest, MessageId, MessageWithParts,
+    AbortAccepted, AgentInfo, ControlAccepted, CreateSessionRequest, MessageId, MessageWithParts,
     OpenCodeClient, OpenCodeError, PromptAccepted, PromptRequest, Session, SessionId, Subscription,
     TextPart,
 };

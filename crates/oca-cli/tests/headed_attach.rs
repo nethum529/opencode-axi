@@ -63,6 +63,7 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
             .collect::<Vec<_>>(),
         [
             requests[0].path.as_str(),
+            requests[1].path.as_str(),
             "/event",
             "/session/ses_headed_background/prompt_async",
             "/session/ses_headed_background/message",
@@ -71,12 +72,13 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
         ],
         "headed background admission must confirm the user message before spawning the helper"
     );
-    assert!(requests[0].path.starts_with("/session?directory="));
-    let message_id = requests[2].body["messageID"]
+    assert!(requests[0].path.starts_with("/agent?directory="));
+    assert!(requests[1].path.starts_with("/session?directory="));
+    let message_id = requests[3].body["messageID"]
         .as_str()
         .expect("prompt carries a caller message id");
-    assert_eq!(requests[3].body, Value::Null);
-    assert_eq!(requests[5].body, Value::Null);
+    assert_eq!(requests[4].body, Value::Null);
+    assert_eq!(requests[6].body, Value::Null);
 
     let calls = calls.lock().unwrap();
     assert_eq!(
@@ -171,6 +173,18 @@ fn headed_background_missing_prompt_is_uncertain_and_never_spawns_attach() {
     assert_eq!(intent["ref"], reference);
     assert_eq!(intent["session_id"], "ses_unconfirmed");
     assert_eq!(intent["message_id"], record.message_id.unwrap());
+
+    let listed = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["ls", "--all", "--json"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert!(listed.status.success());
+    let list: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(list["total"], 1);
+    assert_eq!(list["items"][0]["ref"], reference);
+    assert_eq!(list["items"][0]["state"], "prompt_uncertain");
 }
 
 #[test]
@@ -523,7 +537,7 @@ fn spawn_headed_background_opencode() -> (u16, thread::JoinHandle<Vec<HttpReques
         let mut prompt_text = None;
         let mut event_subscriptions = 0;
 
-        while requests.len() < 6 && started.elapsed() < Duration::from_secs(5) {
+        while requests.len() < 7 && started.elapsed() < Duration::from_secs(5) {
             let (mut stream, _) = match listener.accept() {
                 Ok(connection) => connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -538,7 +552,14 @@ fn spawn_headed_background_opencode() -> (u16, thread::JoinHandle<Vec<HttpReques
                 Err(error) => panic!("fake OpenCode accept failed: {error}"),
             };
             let request = read_http_request(&mut stream);
-            if request.path.starts_with("/session?directory=") {
+            if request.path.starts_with("/agent?directory=") {
+                write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"[{"name":"impl"}]"#,
+                );
+            } else if request.path.starts_with("/session?directory=") {
                 write_http_response(
                     &mut stream,
                     "200 OK",
@@ -600,7 +621,14 @@ fn spawn_unconfirmed_prompt_opencode() -> (u16, thread::JoinHandle<Vec<HttpReque
                 Err(error) => panic!("fake OpenCode accept failed: {error}"),
             };
             let request = read_http_request(&mut stream);
-            if request.path.starts_with("/session?directory=") {
+            if request.path.starts_with("/agent?directory=") {
+                write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"[{"name":"impl"}]"#,
+                );
+            } else if request.path.starts_with("/session?directory=") {
                 write_http_response(
                     &mut stream,
                     "200 OK",
@@ -670,11 +698,21 @@ fn spawn_foreground_opencode() -> (u16, thread::JoinHandle<()>) {
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
         let mut message_id = None;
-        for index in 0..5 {
+        let mut prompt_text = None;
+        for index in 0..6 {
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_http_request(&mut stream);
             match index {
                 0 => {
+                    assert!(request.path.starts_with("/agent?directory="));
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        "application/json",
+                        r#"[{"name":"impl"}]"#,
+                    );
+                }
+                1 => {
                     assert!(request.path.starts_with("/session?directory="));
                     write_http_response(
                         &mut stream,
@@ -683,7 +721,7 @@ fn spawn_foreground_opencode() -> (u16, thread::JoinHandle<()>) {
                         r#"{"id":"ses_target"}"#,
                     );
                 }
-                1 => {
+                2 => {
                     assert_eq!(request.path, "/event");
                     write_http_response(
                         &mut stream,
@@ -696,16 +734,35 @@ fn spawn_foreground_opencode() -> (u16, thread::JoinHandle<()>) {
                         ),
                     );
                 }
-                2 => {
+                3 => {
                     assert_eq!(request.path, "/session/ses_target/prompt_async");
                     message_id = request.body["messageID"].as_str().map(ToOwned::to_owned);
+                    prompt_text = request.body["parts"][0]["text"]
+                        .as_str()
+                        .map(ToOwned::to_owned);
                     write_http_response(&mut stream, "204 No Content", "text/plain", "");
                 }
-                3 => {
-                    assert_eq!(request.path, "/session/ses_target/message");
-                    write_http_response(&mut stream, "200 OK", "application/json", "[]");
-                }
                 4 => {
+                    assert_eq!(request.path, "/session/ses_target/message");
+                    let body = json!([{
+                        "info": {
+                            "id": message_id.as_deref().unwrap(),
+                            "sessionID": "ses_target",
+                            "role": "user"
+                        },
+                        "parts": [{
+                            "type": "text",
+                            "text": prompt_text.as_deref().unwrap()
+                        }]
+                    }]);
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        "application/json",
+                        &body.to_string(),
+                    );
+                }
+                5 => {
                     assert_eq!(request.path, "/session/ses_target/message");
                     write_http_response(
                         &mut stream,
@@ -726,10 +783,19 @@ fn spawn_tmux_foreground_opencode() -> (u16, thread::JoinHandle<()>) {
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
         let mut message_id = None;
-        for _ in 0..6 {
+        let mut prompt_text = None;
+        let mut message_reads = 0;
+        for _ in 0..8 {
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_http_request(&mut stream);
-            if request.path.starts_with("/session?directory=") {
+            if request.path.starts_with("/agent?directory=") {
+                write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"[{"name":"impl"}]"#,
+                );
+            } else if request.path.starts_with("/session?directory=") {
                 write_http_response(
                     &mut stream,
                     "200 OK",
@@ -749,14 +815,29 @@ fn spawn_tmux_foreground_opencode() -> (u16, thread::JoinHandle<()>) {
                 );
             } else if request.path == "/session/ses_target/prompt_async" {
                 message_id = request.body["messageID"].as_str().map(ToOwned::to_owned);
+                prompt_text = request.body["parts"][0]["text"]
+                    .as_str()
+                    .map(ToOwned::to_owned);
                 write_http_response(&mut stream, "204 No Content", "text/plain", "");
             } else if request.path == "/session/ses_target/message" {
-                write_http_response(
-                    &mut stream,
-                    "200 OK",
-                    "application/json",
-                    &terminal_messages(message_id.as_deref().unwrap()),
-                );
+                let body = if message_reads == 0 {
+                    json!([{
+                        "info": {
+                            "id": message_id.as_deref().unwrap(),
+                            "sessionID": "ses_target",
+                            "role": "user"
+                        },
+                        "parts": [{
+                            "type": "text",
+                            "text": prompt_text.as_deref().unwrap()
+                        }]
+                    }])
+                    .to_string()
+                } else {
+                    terminal_messages(message_id.as_deref().unwrap())
+                };
+                message_reads += 1;
+                write_http_response(&mut stream, "200 OK", "application/json", &body);
             } else {
                 panic!("unexpected OpenCode request path: {}", request.path);
             }
