@@ -3,7 +3,10 @@
 use oca_core::{EventSubscription, FollowMessage, FollowTransport, FollowTransportError, OcaEvent};
 use serde_json::Value;
 
-use crate::{MessageWithParts, OpenCodeClient, OpenCodeError, SseError, SseEvent, Subscription};
+use crate::{
+    MessageWithParts, OpenCodeClient, OpenCodeError, SseError, SseEvent, SseSourceErrorKind,
+    Subscription,
+};
 
 /// Adapts one projected REST message into the follow state machine's stable shape.
 ///
@@ -179,7 +182,14 @@ fn map_client_error(error: OpenCodeError) -> FollowTransportError {
 
 fn map_sse_error(error: SseError) -> FollowTransportError {
     match error {
-        SseError::Source { message } => FollowTransportError::unreachable(message),
+        SseError::Source {
+            message,
+            kind: SseSourceErrorKind::Transport,
+        } => FollowTransportError::unreachable(message),
+        SseError::Source {
+            message,
+            kind: SseSourceErrorKind::Protocol,
+        } => FollowTransportError::protocol(message),
         SseError::InvalidUtf8 { .. } => {
             FollowTransportError::protocol("event stream contains invalid UTF-8")
         }

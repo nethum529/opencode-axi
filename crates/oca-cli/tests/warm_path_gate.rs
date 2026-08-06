@@ -83,6 +83,43 @@ fn warm_ack_has_no_forbidden_network_process_or_herdr_operation() {
 }
 
 #[test]
+fn live_but_garbling_event_stream_is_a_protocol_mismatch() {
+    let fixture = WarmFixture::with_stream_failure(StreamFailure::MalformedChunk);
+    let mut command = fixture.command(["luna:h", "--headless", "garbled", "stream"]);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = command.spawn().expect("garbling subprocess starts");
+    let mut stdout = BufReader::new(child.stdout.take().expect("child stdout is piped"));
+    let mut acknowledgement = String::new();
+    stdout
+        .read_line(&mut acknowledgement)
+        .expect("acknowledgement reads");
+    assert!(acknowledgement.starts_with('w'));
+    fixture.server.acknowledge();
+
+    let status = child.wait().expect("garbling subprocess exits");
+    let mut stderr = Vec::new();
+    child
+        .stderr
+        .take()
+        .expect("child stderr is piped")
+        .read_to_end(&mut stderr)
+        .expect("child stderr reads");
+    fixture.server.barrier();
+
+    let stderr = String::from_utf8(stderr).unwrap();
+    assert_eq!(status.code(), Some(1), "unexpected stderr: {stderr}");
+    assert!(
+        stderr.contains("protocol_mismatch"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("SSE source failed: error decoding response body"),
+        "the live response-body decode failure must be preserved: {stderr}"
+    );
+}
+
+#[test]
 fn worktree_list_never_runs_dispatch_git_or_network_operations() {
     let fixture = WarmFixture::new();
     fixture.insert_worktree_ref();
@@ -275,11 +312,15 @@ struct WarmFixture {
 
 impl WarmFixture {
     fn new() -> Self {
+        Self::with_stream_failure(StreamFailure::DropReconciliation)
+    }
+
+    fn with_stream_failure(stream_failure: StreamFailure) -> Self {
         let home = tempfile::tempdir().expect("temporary home");
         let repo = tempfile::tempdir().expect("temporary repository");
         fs::create_dir(repo.path().join(".git")).expect("repository marker");
 
-        let server = FakeServer::start();
+        let server = FakeServer::start(stream_failure);
         let state = home.path().join(".oca");
         fs::create_dir(&state).expect("state directory");
         fs::write(
@@ -451,10 +492,11 @@ fn finish_after_ack(child: &mut Child) {
         .read_to_end(&mut stderr)
         .expect("child stderr reads");
     assert!(
-        String::from_utf8_lossy(&stderr).contains("protocol_mismatch"),
+        String::from_utf8_lossy(&stderr).contains("server_unreachable"),
         "unexpected post-ack failure: {}",
         String::from_utf8_lossy(&stderr)
     );
+    assert_eq!(status.code(), Some(5));
 }
 
 fn install_process_spies(directory: &Path) {
@@ -495,13 +537,29 @@ struct CurrentDispatch {
     prompt_text: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamFailure {
+    DropReconciliation,
+    MalformedChunk,
+}
+
+enum ServerResponse {
+    Normal {
+        status: &'static str,
+        content_type: &'static str,
+        body: String,
+    },
+    Drop,
+    MalformedChunk,
+}
+
 impl FakeServer {
-    fn start() -> Self {
+    fn start(stream_failure: StreamFailure) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("warm fake server binds");
         let port = listener.local_addr().expect("fake server address").port();
         let shared = Arc::new((Mutex::new(ServerState::default()), Condvar::new()));
         let server_shared = Arc::clone(&shared);
-        let worker = thread::spawn(move || serve(listener, &server_shared));
+        let worker = thread::spawn(move || serve(listener, &server_shared, stream_failure));
         Self {
             port,
             shared,
@@ -572,7 +630,11 @@ impl Drop for FakeServer {
     }
 }
 
-fn serve(listener: TcpListener, shared: &Arc<(Mutex<ServerState>, Condvar)>) {
+fn serve(
+    listener: TcpListener,
+    shared: &Arc<(Mutex<ServerState>, Condvar)>,
+    stream_failure: StreamFailure,
+) {
     loop {
         let (mut stream, _) = listener.accept().expect("fake server accepts");
         {
@@ -593,7 +655,7 @@ fn serve(listener: TcpListener, shared: &Arc<(Mutex<ServerState>, Condvar)>) {
             continue;
         }
 
-        let (response_status, response_type, response_body, wait_for_ack) = {
+        let (response, wait_for_ack) = {
             let (lock, _) = &**shared;
             let mut state = lock.lock().expect("server state locks");
             state.requests.push(path.clone());
@@ -607,9 +669,11 @@ fn serve(listener: TcpListener, shared: &Arc<(Mutex<ServerState>, Condvar)>) {
                     prompt_text: None,
                 });
                 (
-                    "200 OK",
-                    "application/json",
-                    r#"[{"name":"impl"}]"#.to_owned(),
+                    ServerResponse::Normal {
+                        status: "200 OK",
+                        content_type: "application/json",
+                        body: r#"[{"name":"impl"}]"#.to_owned(),
+                    },
                     false,
                 )
             } else if path.starts_with("/session?") {
@@ -619,9 +683,11 @@ fn serve(listener: TcpListener, shared: &Arc<(Mutex<ServerState>, Condvar)>) {
                 current.pre_ack_requests.push(path.clone());
                 current.session_id.clone_from(&session_id);
                 (
-                    "200 OK",
-                    "application/json",
-                    format!(r#"{{"id":"{session_id}"}}"#),
+                    ServerResponse::Normal {
+                        status: "200 OK",
+                        content_type: "application/json",
+                        body: format!(r#"{{"id":"{session_id}"}}"#),
+                    },
                     false,
                 )
             } else {
@@ -640,14 +706,29 @@ fn serve(listener: TcpListener, shared: &Arc<(Mutex<ServerState>, Condvar)>) {
                 }
 
                 if path == "/event" {
-                    ("200 OK", "text/event-stream", String::new(), false)
+                    let response = match stream_failure {
+                        StreamFailure::DropReconciliation => ServerResponse::Normal {
+                            status: "200 OK",
+                            content_type: "text/event-stream",
+                            body: String::new(),
+                        },
+                        StreamFailure::MalformedChunk => ServerResponse::MalformedChunk,
+                    };
+                    (response, false)
                 } else if path.ends_with("/prompt_async") {
                     let current = state.current.as_mut().expect("active dispatch");
                     current.message_id = request.body["messageID"].as_str().map(ToOwned::to_owned);
                     current.prompt_text = request.body["parts"][0]["text"]
                         .as_str()
                         .map(ToOwned::to_owned);
-                    ("204 No Content", "text/plain", String::new(), false)
+                    (
+                        ServerResponse::Normal {
+                            status: "204 No Content",
+                            content_type: "text/plain",
+                            body: String::new(),
+                        },
+                        false,
+                    )
                 } else if path.ends_with("/message") {
                     let current = state.current.as_ref().expect("active dispatch");
                     if current.awaiting_ack {
@@ -663,16 +744,52 @@ fn serve(listener: TcpListener, shared: &Arc<(Mutex<ServerState>, Condvar)>) {
                             }]
                         }])
                         .to_string();
-                        ("200 OK", "application/json", body, true)
+                        (
+                            ServerResponse::Normal {
+                                status: "200 OK",
+                                content_type: "application/json",
+                                body,
+                            },
+                            true,
+                        )
                     } else {
-                        ("200 OK", "application/json", "[]".to_owned(), false)
+                        let response = match stream_failure {
+                            StreamFailure::DropReconciliation => ServerResponse::Drop,
+                            StreamFailure::MalformedChunk => ServerResponse::Normal {
+                                status: "200 OK",
+                                content_type: "application/json",
+                                body: "[]".to_owned(),
+                            },
+                        };
+                        (response, false)
                     }
                 } else {
-                    ("200 OK", "application/json", "{}".to_owned(), false)
+                    (
+                        ServerResponse::Normal {
+                            status: "200 OK",
+                            content_type: "application/json",
+                            body: "{}".to_owned(),
+                        },
+                        false,
+                    )
                 }
             }
         };
-        write_response(&mut stream, response_status, response_type, &response_body);
+        match response {
+            ServerResponse::Normal {
+                status,
+                content_type,
+                body,
+            } => write_response(&mut stream, status, content_type, &body),
+            ServerResponse::Drop => {}
+            ServerResponse::MalformedChunk => {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\nnot-a-chunk\r\n",
+                    )
+                    .expect("malformed SSE response writes");
+            }
+        }
 
         if wait_for_ack {
             let (lock, ready) = &**shared;

@@ -14,8 +14,9 @@ use oca_core::{
 };
 use oca_display::{Acknowledgement, CompletionRecord, HerdrClient};
 use oca_opencode::{
-    CreateSessionRequest, MessageWithParts, OpenCodeClient, PromptRequest, Subscription, TextPart,
-    attributed_structured_reply, is_target_session_idle,
+    CreateSessionRequest, MessageWithParts, OpenCodeClient, PromptRequest, SseError,
+    SseSourceErrorKind, Subscription, TextPart, attributed_structured_reply,
+    is_target_session_idle,
 };
 use oca_server::{ConnectOrStart, SystemRuntime};
 use oca_state::{
@@ -649,12 +650,23 @@ impl ForegroundBackend for ProductionBackend {
                     return Err(OcaError::new(ErrorCode::ProtocolMismatch)
                         .with_error("OpenCode event stream closed before a terminal event"));
                 }
-                Err(_stream_error) => {
+                Err(stream_error) => {
                     if let Some(reply) = self.read_attributed_reply(session_id, message_id).await? {
                         return Ok(reply);
                     }
-                    return Err(OcaError::new(ErrorCode::ProtocolMismatch)
-                        .with_error("OpenCode event stream violated the expected protocol"));
+                    let code = match &stream_error {
+                        SseError::Source {
+                            kind: SseSourceErrorKind::Transport,
+                            ..
+                        } => ErrorCode::ServerUnreachable,
+                        SseError::Source {
+                            kind: SseSourceErrorKind::Protocol,
+                            ..
+                        }
+                        | SseError::InvalidUtf8 { .. } => ErrorCode::ProtocolMismatch,
+                    };
+                    return Err(OcaError::new(code)
+                        .with_error(format!("OpenCode event stream failed: {stream_error}")));
                 }
             };
             if is_target_session_idle(&event, session_id)
