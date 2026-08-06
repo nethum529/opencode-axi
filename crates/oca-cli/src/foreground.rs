@@ -654,18 +654,7 @@ impl ForegroundBackend for ProductionBackend {
                     if let Some(reply) = self.read_attributed_reply(session_id, message_id).await? {
                         return Ok(reply);
                     }
-                    let code = match &stream_error {
-                        SseError::Source {
-                            kind: SseSourceErrorKind::Transport,
-                            ..
-                        } => ErrorCode::ServerUnreachable,
-                        SseError::Source {
-                            kind: SseSourceErrorKind::Protocol,
-                            ..
-                        }
-                        | SseError::InvalidUtf8 { .. } => ErrorCode::ProtocolMismatch,
-                    };
-                    return Err(OcaError::new(code)
+                    return Err(OcaError::new(sse_failure_code(&stream_error))
                         .with_error(format!("OpenCode event stream failed: {stream_error}")));
                 }
             };
@@ -712,6 +701,23 @@ impl ForegroundBackend for ProductionBackend {
         let mut stdout = io::stdout().lock();
         stdout.write_all(rendered.as_bytes()).map_err(io_error)?;
         stdout.flush().map_err(io_error)
+    }
+}
+
+/// Maps one event-stream failure onto its truthful public code: a lost
+/// connection is an unreachable server, while a connected server that supplies
+/// an undecodable body is a protocol mismatch.
+fn sse_failure_code(error: &SseError) -> ErrorCode {
+    match error {
+        SseError::Source {
+            kind: SseSourceErrorKind::Transport,
+            ..
+        } => ErrorCode::ServerUnreachable,
+        SseError::Source {
+            kind: SseSourceErrorKind::Protocol,
+            ..
+        }
+        | SseError::InvalidUtf8 { .. } => ErrorCode::ProtocolMismatch,
     }
 }
 
@@ -771,4 +777,33 @@ fn request_display(intent: Option<&Intent>) -> &str {
 
 fn server_state_error(context: &str, error: io::Error) -> OcaError {
     state_error(context, error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lost_connection_and_an_undecodable_body_get_different_codes() {
+        assert_eq!(
+            sse_failure_code(&SseError::Source {
+                message: "connection reset".to_owned(),
+                kind: SseSourceErrorKind::Transport,
+            }),
+            ErrorCode::ServerUnreachable,
+            "a server that went away must not be reported as a protocol mismatch"
+        );
+        assert_eq!(
+            sse_failure_code(&SseError::Source {
+                message: "error decoding response body".to_owned(),
+                kind: SseSourceErrorKind::Protocol,
+            }),
+            ErrorCode::ProtocolMismatch,
+            "a reachable server that garbles its body must not be reported unreachable"
+        );
+        assert_eq!(
+            sse_failure_code(&SseError::InvalidUtf8 { line: Vec::new() }),
+            ErrorCode::ProtocolMismatch
+        );
+    }
 }
