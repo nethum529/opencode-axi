@@ -338,7 +338,7 @@ fn background_spawn_then_kill_closes_the_tab_and_exits_its_tui_process() {
         fs::read_to_string(home.path().join("attached-opencode-args"))
             .unwrap()
             .trim(),
-        "--session ses_target"
+        format!("attach http://127.0.0.1:{port}/ --session ses_target")
     );
 }
 
@@ -679,15 +679,24 @@ fn spawn_background_abort_opencode(tab_closed: Arc<AtomicBool>) -> (u16, thread:
     let server = thread::spawn(move || {
         let event_count = Arc::new(AtomicUsize::new(0));
         let message_id = Arc::new(Mutex::new(None::<String>));
+        let prompt_text = Arc::new(Mutex::new(None::<String>));
         let mut handlers = Vec::new();
-        for _ in 0..6 {
+        for _ in 0..8 {
             let (mut stream, _) = accept_tcp_before(&listener, Duration::from_secs(3));
             let event_count = Arc::clone(&event_count);
             let message_id = Arc::clone(&message_id);
+            let prompt_text = Arc::clone(&prompt_text);
             let tab_closed = Arc::clone(&tab_closed);
             handlers.push(thread::spawn(move || {
                 let request = read_http_request(&mut stream);
-                if request.path.starts_with("/session?") {
+                if request.path.starts_with("/agent?") {
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        "application/json",
+                        r#"[{"name":"impl"}]"#,
+                    );
+                } else if request.path.starts_with("/session?") {
                     write_http_response(
                         &mut stream,
                         "200 OK",
@@ -707,14 +716,30 @@ fn spawn_background_abort_opencode(tab_closed: Arc<AtomicBool>) -> (u16, thread:
                         stream.flush().unwrap();
                         wait_for_flag(&tab_closed, Duration::from_secs(2));
                         let parent_id = message_id.lock().unwrap().clone().unwrap();
-                        write!(stream, "{}", terminal_sse(&parent_id)).unwrap();
+                        write!(stream, "{}", abort_terminal_sse(&parent_id)).unwrap();
                     }
                 } else if request.path == "/session/ses_target/prompt_async" {
                     *message_id.lock().unwrap() =
                         request.body["messageID"].as_str().map(ToOwned::to_owned);
+                    *prompt_text.lock().unwrap() = request.body["parts"][0]["text"]
+                        .as_str()
+                        .map(ToOwned::to_owned);
                     write_http_response(&mut stream, "204 No Content", "text/plain", "");
                 } else if request.path == "/session/ses_target/message" {
-                    write_http_response(&mut stream, "200 OK", "application/json", "[]");
+                    let body = user_messages(
+                        "ses_target",
+                        message_id
+                            .lock()
+                            .unwrap()
+                            .as_deref()
+                            .expect("prompt precedes message history"),
+                        prompt_text
+                            .lock()
+                            .unwrap()
+                            .as_deref()
+                            .expect("prompt text precedes message history"),
+                    );
+                    write_http_response(&mut stream, "200 OK", "application/json", &body);
                 } else if request.path == "/session/ses_target/abort" {
                     write_http_response(&mut stream, "200 OK", "application/json", "true");
                 } else {
@@ -729,7 +754,7 @@ fn spawn_background_abort_opencode(tab_closed: Arc<AtomicBool>) -> (u16, thread:
     (port, server)
 }
 
-fn terminal_sse(parent_id: &str) -> String {
+fn abort_terminal_sse(parent_id: &str) -> String {
     let message = json!({
         "id":"evt_message",
         "type":"message.updated",
@@ -907,6 +932,7 @@ fn spawn_headed_background_opencode() -> (u16, thread::JoinHandle<Vec<HttpReques
                 write_http_response(&mut stream, "204 No Content", "text/plain", "");
             } else if request.path == "/session/ses_headed_background/message" {
                 let body = user_messages(
+                    "ses_headed_background",
                     message_id.as_deref().expect("prompt precedes messages"),
                     prompt_text.as_deref().expect("prompt text was captured"),
                 );
@@ -977,11 +1003,11 @@ fn spawn_unconfirmed_prompt_opencode() -> (u16, thread::JoinHandle<Vec<HttpReque
     (port, server)
 }
 
-fn user_messages(message_id: &str, prompt_text: &str) -> String {
+fn user_messages(session_id: &str, message_id: &str, prompt_text: &str) -> String {
     json!([{
         "info": {
             "id": message_id,
-            "sessionID": "ses_headed_background",
+            "sessionID": session_id,
             "role": "user",
             "time": {"created": 1}
         },
