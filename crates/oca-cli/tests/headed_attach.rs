@@ -262,6 +262,9 @@ fn headed_background_rejected_history_without_sse_evidence_stays_uncertain() {
         rendered.contains(r#"oca m <ref> \"<resend>\""#),
         "poisoned prompt recovery must name the explicit resend command: {rendered}"
     );
+    // fix/57 production probes the herdr socket once during admission; an
+    // uncertain prompt must stop there, with no protocol connection after it.
+    accept_discovery_probe(&herdr);
     assert!(matches!(
         herdr.accept(),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
@@ -848,6 +851,8 @@ fn accept_unix_with_timeout(listener: &UnixListener) -> UnixStream {
             Err(error) => panic!("could not accept a herdr socket connection: {error}"),
         }
     }
+}
+
 fn spawn_herdr_until_agent_start(
     socket: &Path,
     calls: Arc<Mutex<Vec<Value>>>,
