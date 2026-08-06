@@ -3,7 +3,10 @@
 use std::process::{Command, Output};
 
 use oca_core::{OcaEvent, RefId};
-use oca_state::{EventJournal, RefRecord, RefState, RefStore, RefStorePaths};
+use oca_state::{
+    EventJournal, Intent, IntentDurability, IntentOperation, IntentPhase, IntentStore, RefRecord,
+    RefState, RefStore, RefStorePaths,
+};
 use serde_json::{Value, json};
 
 #[test]
@@ -17,6 +20,122 @@ fn blocked_count_is_a_byte_exact_bare_integer() {
     assert!(output.status.success());
     assert_eq!(output.stdout, b"1");
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn every_persisted_ref_state_is_visible_from_a_refs_json_fixture() {
+    let fixture = Fixture::new();
+    let states = [
+        RefState::Idle,
+        RefState::Running,
+        RefState::Unknown,
+        RefState::Done,
+        RefState::Blocked,
+        RefState::Partial,
+        RefState::Aborted,
+    ];
+    for state in states {
+        // Adding a RefState variant must not compile until it is listed above
+        // and therefore proven visible in `oca ls` by the assertions below.
+        match state {
+            RefState::Idle
+            | RefState::Running
+            | RefState::Unknown
+            | RefState::Done
+            | RefState::Blocked
+            | RefState::Partial
+            | RefState::Aborted => {}
+        }
+    }
+    fixture.write_refs_fixture(&states);
+
+    let output = fixture.run(&["ls", "--json"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let page: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(page["total"], states.len());
+    for (index, state) in states.iter().enumerate() {
+        let reference = format!("w{:05}", index + 1);
+        let item = page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["ref"] == reference)
+            .unwrap_or_else(|| panic!("{reference} vanished from ls output"));
+        assert_eq!(item["state"], state.as_str());
+    }
+}
+
+#[test]
+fn ls_keeps_attention_states_ranked_first_and_hides_tombstones() {
+    let fixture = Fixture::new();
+    fixture.write_refs_fixture(&[
+        RefState::Done,
+        RefState::Unknown,
+        RefState::Blocked,
+        RefState::Running,
+    ]);
+    fixture.append_tombstoned_ref("w00005", RefState::Blocked);
+
+    let output = fixture.run(&["ls", "--json"]);
+
+    assert!(output.status.success());
+    let page: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(page["total"], 4);
+    assert_eq!(page["items"][0]["state"], "blocked");
+    assert_eq!(page["items"][1]["state"], "unknown");
+    assert_eq!(page["items"][2]["state"], "running");
+    assert_eq!(page["items"][3]["state"], "done");
+    assert!(
+        page["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|item| item["ref"] != "w00005")
+    );
+}
+
+#[test]
+fn unscoped_unknown_ref_remains_visible_to_default_ls() {
+    let fixture = Fixture::new();
+    fixture.write_unscoped_unknown_fixture();
+
+    let output = fixture.run(&["ls", "--json"]);
+
+    assert!(output.status.success());
+    let page: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(page["total"], 1);
+    assert_eq!(page["items"][0]["ref"], "w00001");
+    assert_eq!(page["items"][0]["state"], "unknown");
+}
+
+#[test]
+fn plain_ls_surfaces_only_out_of_scope_running_refs_without_turn_evidence() {
+    let fixture = Fixture::new();
+    fixture.insert("w00004", RefState::Blocked);
+    fixture.insert_out_of_scope("w00001", RefState::Running);
+    fixture.insert_out_of_scope("w00002", RefState::Running);
+    fixture.append_event("w00002", "session.busy", json!({}));
+    fixture.insert_out_of_scope("w00003", RefState::Running);
+    fixture.write_running_intent("w00003");
+
+    let output = fixture.run(&["ls", "--json"]);
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let page: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(page["total"], 3);
+    assert_eq!(page["items"][0]["ref"], "w00004");
+    assert_eq!(page["items"][0]["state"], "blocked");
+    assert_eq!(page["items"][1]["ref"], "w00001");
+    assert_eq!(page["items"][1]["state"], "running");
+    assert_eq!(page["items"][2]["ref"], "w00003");
+    assert_eq!(page["items"][2]["state"], "running");
 }
 
 #[test]
@@ -96,6 +215,30 @@ impl Fixture {
     }
 
     fn insert(&self, reference: &str, worker_state: RefState) {
+        self.insert_with_scope(
+            reference,
+            worker_state,
+            self.repo.path().display().to_string(),
+            "test-spawner".to_owned(),
+        );
+    }
+
+    fn insert_out_of_scope(&self, reference: &str, worker_state: RefState) {
+        self.insert_with_scope(
+            reference,
+            worker_state,
+            "/other/repo".to_owned(),
+            "other-spawner".to_owned(),
+        );
+    }
+
+    fn insert_with_scope(
+        &self,
+        reference: &str,
+        worker_state: RefState,
+        repo: String,
+        spawner_tag: String,
+    ) {
         let state = self.home.path().join(".oca");
         let turn = format!("turn_{reference}");
         let store = RefStore::with_paths(RefStorePaths::in_directory(&state));
@@ -107,10 +250,10 @@ impl Fixture {
                 alias: Some("luna".to_owned()),
                 effort: Some("high".to_owned()),
                 role: Some("impl".to_owned()),
-                cwd: Some(self.repo.path().display().to_string()),
+                cwd: Some(repo.clone()),
                 last_state: Some(worker_state),
-                repo: Some(self.repo.path().display().to_string()),
-                spawner_tag: Some("test-spawner".to_owned()),
+                repo: Some(repo),
+                spawner_tag: Some(spawner_tag),
                 worktree: None,
                 branch: None,
                 commit: None,
@@ -121,6 +264,67 @@ impl Fixture {
                 tombstoned: false,
             })
             .unwrap();
+    }
+
+    fn write_running_intent(&self, reference: &str) {
+        let mut intent = Intent::new(reference, IntentOperation::Dispatch);
+        intent.session_id = Some(format!("ses_{reference}"));
+        intent.message_id = Some(format!("turn_{reference}"));
+        intent.set_phase(IntentPhase::Running);
+        IntentStore::in_directory(self.home.path().join(".oca"))
+            .write(&intent, IntentDurability::PreAck)
+            .unwrap();
+    }
+
+    fn write_refs_fixture(&self, states: &[RefState]) {
+        let state = self.home.path().join(".oca");
+        std::fs::create_dir_all(&state).expect("state directory");
+        let records = states
+            .iter()
+            .enumerate()
+            .map(|(index, worker_state)| {
+                let reference = format!("w{:05}", index + 1);
+                format!(
+                    r#"{{"id":"{reference}","session_id":"ses_{reference}","message_id":"turn_{reference}","last_state":"{}","repo":"{}","spawner_tag":"test-spawner","tombstoned":false}}"#,
+                    worker_state.as_str(),
+                    self.repo.path().display()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        std::fs::write(state.join("refs.json"), format!("[{records}]")).expect("refs.json fixture");
+    }
+
+    fn append_tombstoned_ref(&self, reference: &str, worker_state: RefState) {
+        let state = self.home.path().join(".oca");
+        let mut records: Vec<Value> = serde_json::from_slice(
+            &std::fs::read(state.join("refs.json")).expect("refs.json fixture exists"),
+        )
+        .expect("valid refs.json fixture");
+        records.push(serde_json::json!({
+            "id": reference,
+            "session_id": format!("ses_{reference}"),
+            "message_id": format!("turn_{reference}"),
+            "last_state": worker_state.as_str(),
+            "repo": self.repo.path().display().to_string(),
+            "spawner_tag": "test-spawner",
+            "tombstoned": true,
+        }));
+        std::fs::write(
+            state.join("refs.json"),
+            serde_json::to_vec(&records).expect("serialize refs.json fixture"),
+        )
+        .expect("write refs.json fixture");
+    }
+
+    fn write_unscoped_unknown_fixture(&self) {
+        let state = self.home.path().join(".oca");
+        std::fs::create_dir_all(&state).expect("state directory");
+        std::fs::write(
+            state.join("refs.json"),
+            br#"[{"id":"w00001","session_id":"ses_w00001","last_state":"unknown","tombstoned":false}]"#,
+        )
+        .expect("unscoped refs.json fixture");
     }
 
     fn append_event(&self, reference: &str, kind: &str, payload: Value) {

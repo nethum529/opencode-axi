@@ -1,12 +1,12 @@
 //! Single-snapshot implementation of the `oca ls` fleet inbox.
 
-use std::{cmp::Ordering, collections::HashMap, path::Path, time::Duration};
+use std::{cmp::Ordering, collections::HashMap, fs, path::Path, time::Duration};
 
-use oca_core::{ErrorCode, OcaError};
+use oca_core::{ErrorCode, OcaError, RefId};
 use oca_display::{ListDocument, ListItem};
 use oca_state::{
-    JournalError, OcaConfig, RefListFilter, RefRecord, RefState, RefStore, RefStorePaths,
-    prune_expired_journals,
+    EventJournal, JournalError, OcaConfig, RefListFilter, RefRecord, RefState, RefStore,
+    RefStorePaths, prune_expired_journals,
 };
 
 use crate::{
@@ -53,21 +53,20 @@ fn execute_list_with_scope(
     prune_expired_journals(&state_directory, retention(config.retention.journal_days))
         .map_err(|error| journal_error(None, error))?;
 
-    let filter = if command.all {
-        RefListFilter::across_spawners_and_repos()
-    } else {
-        RefListFilter {
-            spawner_tag: Some(scope.spawner_tag.clone()),
-            repo: Some(scope.repo.clone()),
-            ..RefListFilter::default()
-        }
-    };
-    let records = store
-        .list(&filter)
-        .map_err(|error| runtime_error(error.to_string()))?;
     let overrides = reconciled.iter().cloned().collect::<HashMap<_, _>>();
+    // Read the active snapshot without scope narrowing first. An uncertain ref
+    // is an operator-attention item, so legacy or stranded records cannot
+    // disappear from the inbox merely because their scope metadata is absent.
+    let records = store
+        .list(&RefListFilter::across_spawners_and_repos())
+        .map_err(|error| runtime_error(error.to_string()))?;
     let mut workers = records
         .into_iter()
+        .filter(|record| {
+            command.all
+                || record_matches_scope(record, scope)
+                || is_attention_record(home, record, &overrides)
+        })
         .map(|record| worker_from_record(record, &overrides))
         .collect::<Vec<_>>();
     if command.blocked {
@@ -180,6 +179,44 @@ fn worker_from_record(record: RefRecord, overrides: &HashMap<String, ReconciledS
         reference: record.id,
         state,
     }
+}
+
+fn record_matches_scope(record: &RefRecord, scope: &Scope) -> bool {
+    record.spawner_tag.as_ref() == Some(&scope.spawner_tag)
+        && record.repo.as_ref() == Some(&scope.repo)
+}
+
+fn is_attention_record(
+    home: &Path,
+    record: &RefRecord,
+    overrides: &HashMap<String, ReconciledState>,
+) -> bool {
+    record.last_state == Some(RefState::Unknown)
+        || matches!(
+            overrides.get(&record.id),
+            Some(ReconciledState::PromptUncertain | ReconciledState::PublishedUncertain)
+        )
+        || (record.last_state == Some(RefState::Running) && !has_turn_evidence(home, record))
+}
+
+/// Returns whether local state proves that this ref's current turn progressed.
+///
+/// This mirrors worker-health's `NO_TURN_EVIDENCE` check: a non-empty
+/// per-message journal is the only evidence.
+fn has_turn_evidence(home: &Path, record: &RefRecord) -> bool {
+    let state_directory = home.join(".oca");
+    let journal_evidence = record.message_id.as_deref().is_some_and(|message_id| {
+        let Ok(reference) = RefId::new(&record.id) else {
+            return false;
+        };
+        let Ok(journal) = EventJournal::open(&state_directory, &reference, message_id) else {
+            return false;
+        };
+        fs::metadata(journal.path()).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
+    });
+    // A live out-of-scope worker may briefly surface before its first journal
+    // event; that is the safe direction for an operator-facing listing.
+    journal_evidence
 }
 
 fn runtime_error(detail: impl std::fmt::Display) -> OcaError {
