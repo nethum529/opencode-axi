@@ -9,28 +9,16 @@ use std::{
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
-use socket2::{Domain, SockAddr, Socket, Type};
 use thiserror::Error;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixStream,
 };
 
-const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
-const DISCOVERY_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
-static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+use crate::probe::socket_accepts_connections;
 
-fn socket_accepts_connections(path: &Path) -> bool {
-    let Ok(address) = SockAddr::unix(path) else {
-        return false;
-    };
-    let Ok(socket) = Socket::new(Domain::UNIX, Type::STREAM, None) else {
-        return false;
-    };
-    socket
-        .connect_timeout(&address, DISCOVERY_CONNECT_TIMEOUT)
-        .is_ok()
-}
+const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
+static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 /// A herdr workspace identifier.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -112,6 +100,8 @@ impl HerdrClient {
     ///
     /// The configured path has highest priority. This form keeps `oca` tests
     /// and alternate state roots independent of the ambient home directory.
+    /// The resolved candidate must pass the bounded liveness probe, so a stale
+    /// socket file reads as no herdr at all.
     #[must_use]
     pub fn discover_from(
         home: &Path,
