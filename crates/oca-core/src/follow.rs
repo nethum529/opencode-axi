@@ -977,6 +977,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stream_progress_resets_the_reconnect_budget_without_an_explicit_timeout() {
+        let transport = ScriptedTransport {
+            subscriptions: Mutex::new(VecDeque::from([
+                subscription([Ok(Some(event("evt-progress-1", "session.idle", None)))]),
+                subscription([Ok(Some(event("evt-progress-2", "session.idle", None)))]),
+                subscription([
+                    Ok(Some(event(
+                        "evt-terminal",
+                        "message.updated",
+                        Some(message("msg_this_dispatch", "blocked", true)),
+                    ))),
+                    Ok(Some(event("evt-idle", "session.idle", None))),
+                ]),
+            ])),
+            reconciliations: Mutex::new(VecDeque::from([Ok(Vec::new())])),
+            cursors: Mutex::new(Vec::new()),
+        };
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            follow_until_terminal_with_policy(
+                &transport,
+                &target(),
+                None,
+                None::<&mut Journal>,
+                FollowPolicy {
+                    max_reconnect_attempts: 1,
+                    max_reconnect_elapsed: Duration::from_secs(1),
+                    initial_backoff: Duration::ZERO,
+                },
+            ),
+        )
+        .await
+        .expect("a progressing stream must not stall the follow loop")
+        .unwrap();
+
+        assert_eq!(
+            outcome.exit(),
+            FollowExit::Blocked,
+            "each received event must restore the full reconnect budget"
+        );
+        assert_eq!(
+            transport.cursors.lock().unwrap().as_slice(),
+            [
+                None,
+                Some("evt-progress-1".to_owned()),
+                Some("evt-progress-2".to_owned())
+            ],
+            "every reconnect must resume from the last observed cursor"
+        );
+    }
+
+    #[tokio::test]
     async fn successful_empty_resubscriptions_exhaust_budget_without_explicit_timeout() {
         let transport = AlwaysEmptyTransport::new(None);
         let started = std::time::Instant::now();
@@ -1091,7 +1144,7 @@ mod tests {
 
         assert_eq!(outcome, FollowOutcome::Timeout);
         assert!(
-            started.elapsed() >= requested_timeout / 2,
+            started.elapsed() >= requested_timeout,
             "successful reconnects must not return the timeout outcome before the user deadline"
         );
         assert_eq!(
@@ -1126,7 +1179,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome, FollowOutcome::Timeout);
-        assert!(started.elapsed() >= requested_timeout / 2);
+        assert!(started.elapsed() >= requested_timeout);
         assert!(started.elapsed() < Duration::from_millis(250));
         assert!(transport.subscriptions.load(AtomicOrdering::Relaxed) > 1);
     }
@@ -1161,7 +1214,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome, FollowOutcome::Timeout);
-        assert!(started.elapsed() >= requested_timeout / 2);
+        assert!(started.elapsed() >= requested_timeout);
     }
 
     #[tokio::test]
