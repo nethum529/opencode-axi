@@ -52,7 +52,7 @@ fn message_on_terminal_sessions_reuses_the_session_and_sends_full_turn_context()
     ] {
         let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
         let port = listener.local_addr().expect("fake server address").port();
-        let server = thread::spawn(move || serve_prompt(listener, "204 No Content", ""));
+        let server = thread::spawn(move || serve_confirmed_prompt(&listener));
         let home = prepared_home(port, state, "high");
 
         let output = run_oca(
@@ -81,13 +81,94 @@ fn message_on_terminal_sessions_reuses_the_session_and_sends_full_turn_context()
 }
 
 #[test]
+fn silently_dropped_message_stays_prompt_uncertain_without_a_running_ghost() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
+    let port = listener.local_addr().expect("fake server address").port();
+    let server = thread::spawn(move || serve_silently_dropped_prompt(listener));
+    let home = prepared_home(port, RefState::Done, "high");
+
+    let output = run_oca(home.path(), ["m", "w4f2a1", "dropped", "resend"]);
+    let requests = server.join().expect("fake server completes");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8(output.stderr).expect("stderr is utf-8");
+    assert!(stderr.contains("code: prompt_uncertain"), "{stderr}");
+    assert_eq!(
+        stored_record(home.path()).last_state,
+        Some(RefState::Done),
+        "a dropped resend must not persist Running on the ref"
+    );
+    assert_eq!(
+        stored_record(home.path()).message_id.as_deref(),
+        Some("msg_prior_turn"),
+        "a dropped resend must not replace the last evidenced message"
+    );
+    let intent: Value = serde_json::from_slice(
+        &std::fs::read(home.path().join(".oca/intents/w4f2a1.json"))
+            .expect("uncertain resend intent persists"),
+    )
+    .expect("intent is JSON");
+    assert_eq!(intent["phase"], "prompt_uncertain");
+    assert_eq!(intent["op"], "message");
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path == "/session/ses_prior_context/message"),
+        "confirmation must consult history after the SSE stream closes"
+    );
+}
+
+#[test]
+fn message_sse_evidence_overrides_poisoned_history_and_marks_running() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
+    let port = listener.local_addr().expect("fake server address").port();
+    let server = thread::spawn(move || serve_poisoned_history_confirmed_prompt(listener));
+    let home = prepared_home(port, RefState::Done, "high");
+
+    let output = run_oca(home.path(), ["m", "w4f2a1", "landed", "resend"]);
+    let requests = server.join().expect("fake server completes");
+
+    assert_success(&output);
+    assert_eq!(
+        stored_record(home.path()).last_state,
+        Some(RefState::Running)
+    );
+    assert!(
+        requests
+            .iter()
+            .any(|request| request.path == "/session/ses_prior_context/message"),
+        "the regression must exercise rejected poisoned history"
+    );
+}
+
+#[test]
+fn message_history_evidence_marks_the_resend_running() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
+    let port = listener.local_addr().expect("fake server address").port();
+    let server = thread::spawn(move || serve_history_confirmed_prompt(listener));
+    let home = prepared_home(port, RefState::Done, "high");
+
+    let output = run_oca(home.path(), ["m", "w4f2a1", "history", "evidence"]);
+    let requests = server.join().expect("fake server completes");
+
+    assert_success(&output);
+    let record = stored_record(home.path());
+    assert_eq!(record.last_state, Some(RefState::Running));
+    assert_eq!(
+        record.message_id.as_deref(),
+        requests[1].body["messageID"].as_str(),
+        "Running must retain the message ID proven by history"
+    );
+}
+
+#[test]
 fn message_effort_override_applies_now_and_persists_for_later_turns() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
     let port = listener.local_addr().expect("fake server address").port();
     let server = thread::spawn(move || {
         [
-            serve_one_prompt(&listener, "204 No Content", ""),
-            serve_one_prompt(&listener, "204 No Content", ""),
+            serve_confirmed_prompt(&listener),
+            serve_confirmed_prompt(&listener),
         ]
     });
     let home = prepared_home(port, RefState::Done, "high");
@@ -150,7 +231,7 @@ fn queue_on_idle_session_leaves_state_unchanged_so_message_can_follow() {
     let server = thread::spawn(move || {
         [
             serve_one_prompt(&listener, "204 No Content", ""),
-            serve_one_prompt(&listener, "204 No Content", ""),
+            serve_confirmed_prompt(&listener),
         ]
     });
     let home = prepared_home(port, RefState::Idle, "high");
@@ -349,10 +430,18 @@ fn concurrent_messages_are_serialized_and_never_create_parallel_turns() {
     let (admitted_tx, admitted_rx) = mpsc::channel();
     let (release_tx, release_rx) = mpsc::channel();
     let server = thread::spawn(move || {
+        let (mut events, _) = listener
+            .accept()
+            .expect("confirmation subscription arrives");
+        let subscription = read_request(&mut events);
+        assert_eq!(subscription.path, "/event");
+        write_sse_headers(&mut events);
         let (mut stream, _) = listener.accept().expect("first message arrives");
         let first = read_request(&mut stream);
         admitted_tx.send(()).expect("signal first admission");
         release_rx.recv().expect("release first response");
+        let message_id = first.body["messageID"].as_str().expect("message id");
+        write_confirmation_event(&mut events, message_id);
         write_response(&mut stream, "204 No Content", "");
         listener
             .set_nonblocking(true)
@@ -528,6 +617,144 @@ fn assert_success(output: &Output) {
     assert!(output.stderr.is_empty());
 }
 
+fn serve_confirmed_prompt(listener: &TcpListener) -> CapturedRequest {
+    let (mut events, subscription) = accept_request(listener, "SSE subscription");
+    assert_eq!(subscription.path, "/event");
+    write_sse_headers(&mut events);
+
+    let (mut prompt_stream, request) = accept_request(listener, "prompt");
+    let message_id = request.body["messageID"]
+        .as_str()
+        .expect("prompt carries message id");
+    write_confirmation_event(&mut events, message_id);
+    write_response(&mut prompt_stream, "204 No Content", "");
+    request
+}
+
+fn serve_poisoned_history_confirmed_prompt(listener: TcpListener) -> Vec<CapturedRequest> {
+    let (mut events, _) = listener.accept().expect("fake accepts SSE subscription");
+    let subscription = read_request(&mut events);
+    assert_eq!(subscription.path, "/event");
+    write_sse_headers(&mut events);
+
+    let prompt = serve_one_prompt(&listener, "204 No Content", "");
+    let message_id = prompt.body["messageID"]
+        .as_str()
+        .expect("prompt carries message id")
+        .to_owned();
+
+    let (mut history_stream, _) = listener.accept().expect("history fallback arrives");
+    let history = read_request(&mut history_stream);
+    assert_eq!(history.path, "/session/ses_prior_context/message");
+    write_response(
+        &mut history_stream,
+        "400 Bad Request",
+        r#"{"error":"Expected OutputFormatJsonSchema, got retryCount"}"#,
+    );
+    write_confirmation_event(&mut events, &message_id);
+    vec![subscription, prompt, history]
+}
+
+fn serve_history_confirmed_prompt(listener: TcpListener) -> Vec<CapturedRequest> {
+    let (mut events, _) = listener.accept().expect("fake accepts SSE subscription");
+    let subscription = read_request(&mut events);
+    assert_eq!(subscription.path, "/event");
+    write!(
+        events,
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+    )
+    .expect("fake closes empty SSE stream");
+
+    let prompt = serve_one_prompt(&listener, "204 No Content", "");
+    let message_id = prompt.body["messageID"]
+        .as_str()
+        .expect("prompt carries message id");
+    let prompt_text = prompt.body["parts"][0]["text"]
+        .as_str()
+        .expect("prompt carries text");
+    let history_body = serde_json::json!([{
+        "info": {
+            "id": message_id,
+            "sessionID": "ses_prior_context",
+            "role": "user",
+            "time": {"created": 1}
+        },
+        "parts": [{"type": "text", "text": prompt_text}]
+    }])
+    .to_string();
+
+    let (mut history_stream, _) = listener.accept().expect("history fallback arrives");
+    let history = read_request(&mut history_stream);
+    assert_eq!(history.path, "/session/ses_prior_context/message");
+    write_response(&mut history_stream, "200 OK", &history_body);
+    vec![subscription, prompt, history]
+}
+
+fn serve_silently_dropped_prompt(listener: TcpListener) -> Vec<CapturedRequest> {
+    let mut requests = Vec::new();
+    let (mut events, _) = listener.accept().expect("fake accepts SSE subscription");
+    requests.push(read_request(&mut events));
+    assert_eq!(requests[0].path, "/event");
+    write!(
+        events,
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
+    )
+    .expect("fake closes empty SSE stream");
+
+    requests.push(serve_one_prompt(&listener, "204 No Content", ""));
+    listener
+        .set_nonblocking(true)
+        .expect("fake listener becomes nonblocking");
+    let started = Instant::now();
+    let mut last_request = Instant::now();
+    while started.elapsed() < Duration::from_secs(4) {
+        match listener.accept() {
+            Ok((mut stream, _)) => {
+                let request = read_request(&mut stream);
+                assert_eq!(request.path, "/session/ses_prior_context/message");
+                write_response(&mut stream, "200 OK", "[]");
+                requests.push(request);
+                last_request = Instant::now();
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if started.elapsed() >= Duration::from_secs(2)
+                    && last_request.elapsed() >= Duration::from_millis(300)
+                {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("fake listener failed: {error}"),
+        }
+    }
+    requests
+}
+
+fn write_sse_headers(stream: &mut TcpStream) {
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
+    )
+    .expect("fake writes SSE headers");
+    stream.flush().expect("fake flushes SSE headers");
+}
+
+fn write_confirmation_event(stream: &mut TcpStream, message_id: &str) {
+    let event = serde_json::json!({
+        "type": "message.updated",
+        "properties": {
+            "info": {
+                "id": message_id,
+                "sessionID": "ses_prior_context",
+                "role": "user",
+                "time": {"created": 1}
+            }
+        }
+    });
+    write!(stream, "id: evt_prompt\ndata: {event}\n\n").expect("fake writes prompt confirmation");
+    stream.flush().expect("fake flushes prompt confirmation");
+}
+
 fn serve_prompt(listener: TcpListener, status: &str, body: &str) -> CapturedRequest {
     serve_one_prompt(&listener, status, body)
 }
@@ -539,12 +766,29 @@ fn serve_one_prompt(listener: &TcpListener, status: &str, body: &str) -> Capture
     request
 }
 
+fn accept_request(listener: &TcpListener, kind: &str) -> (TcpStream, CapturedRequest) {
+    loop {
+        let (mut stream, _) = listener.accept().unwrap_or_else(|error| {
+            panic!("fake accepts {kind}: {error}");
+        });
+        if let Some(request) = try_read_request(&mut stream) {
+            return (stream, request);
+        }
+    }
+}
+
 fn read_request(stream: &mut TcpStream) -> CapturedRequest {
+    try_read_request(stream).expect("request closed before headers arrived")
+}
+
+fn try_read_request(stream: &mut TcpStream) -> Option<CapturedRequest> {
     let mut request = Vec::new();
     let mut buffer = [0_u8; 4096];
     while !request.windows(4).any(|window| window == b"\r\n\r\n") {
         let read = stream.read(&mut buffer).expect("request headers");
-        assert_ne!(read, 0, "request closed before headers arrived");
+        if read == 0 {
+            return None;
+        }
         request.extend_from_slice(&buffer[..read]);
     }
     let headers_end = request
@@ -578,7 +822,7 @@ fn read_request(stream: &mut TcpStream) -> CapturedRequest {
     } else {
         serde_json::from_str(body).expect("request body is JSON")
     };
-    CapturedRequest { path, body }
+    Some(CapturedRequest { path, body })
 }
 
 fn write_response(stream: &mut TcpStream, status: &str, body: &str) {

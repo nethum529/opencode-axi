@@ -118,6 +118,7 @@ mod tests {
 
         async fn confirm_prompt_landed(
             &mut self,
+            _subscription: &mut Self::Subscription,
             _session_id: &str,
             _prompt: &DispatchPrompt,
         ) -> Result<(), OcaError> {

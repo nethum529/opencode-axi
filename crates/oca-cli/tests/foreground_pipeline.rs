@@ -2,7 +2,12 @@ use std::{
     io::{BufRead, Read, Write},
     net::{TcpListener, TcpStream},
     process::Command,
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     thread,
+    time::{Duration, Instant},
 };
 
 use oca_core::is_opencode_message_id;
@@ -104,6 +109,183 @@ fn end_to_end_foreground_has_one_turn_one_terminal_and_one_golden_final_result()
         "a clean terminal dispatch leaves no orphaned intent"
     );
     assert_eq!(refs[0]["display"], "headless");
+}
+
+#[test]
+fn foreground_uses_terminal_sse_when_session_history_is_poisoned() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
+    let port = listener.local_addr().expect("fake server address").port();
+    let server = thread::spawn(move || serve_poisoned_foreground(listener));
+
+    let home = tempfile::tempdir().expect("temporary home");
+    let state = home.path().join(".oca");
+    std::fs::create_dir(&state).expect("state directory");
+    std::fs::write(
+        state.join("server.json"),
+        serde_json::to_vec(&json!({
+            "port": port,
+            "version": installed_opencode_version(),
+            "environment_hash": environment_hash_for(home.path())
+        }))
+        .unwrap(),
+    )
+    .expect("server record");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args([
+            "luna:h",
+            "--headless",
+            "complete",
+            "despite",
+            "poisoned",
+            "history",
+        ])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .expect("oca runs");
+    let trace = server.join().expect("fake server completes");
+
+    assert!(
+        output.status.success(),
+        "foreground poisoned-history dispatch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        trace
+            .iter()
+            .map(|request| route(&request.path))
+            .collect::<Vec<_>>(),
+        [
+            "agents",
+            "session",
+            "event",
+            "prompt_async",
+            "messages",
+            "messages"
+        ],
+        "prompt confirmation and one-shot reconciliation may read poisoned history, but terminal SSE must avoid another read"
+    );
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
+    assert!(stdout.contains("state: completed"));
+    assert!(stdout.contains("outcome: success"));
+}
+
+fn serve_poisoned_foreground(listener: TcpListener) -> Vec<CapturedRequest> {
+    let message_id = Arc::new(Mutex::new(None::<String>));
+    let history_reads = Arc::new(AtomicUsize::new(0));
+    let mut event_handler = None;
+    let mut captured = Vec::new();
+
+    for _ in 0..6 {
+        let (mut stream, _) = listener.accept().expect("fake accepts request");
+        let request = read_request(&mut stream);
+        if request.path.starts_with("/agent?directory=") {
+            write_response(
+                &mut stream,
+                "200 OK",
+                "application/json",
+                r#"[{"name":"impl"}]"#,
+            );
+        } else if request.path.starts_with("/session?directory=") {
+            write_response(
+                &mut stream,
+                "200 OK",
+                "application/json",
+                r#"{"id":"ses_poisoned_foreground"}"#,
+            );
+        } else if request.path == "/event" {
+            let event_message_id = Arc::clone(&message_id);
+            let event_history_reads = Arc::clone(&history_reads);
+            event_handler = Some(thread::spawn(move || {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
+                )
+                .unwrap();
+                stream.flush().unwrap();
+                wait_until(Duration::from_secs(2), || {
+                    event_history_reads.load(Ordering::SeqCst) >= 1
+                        && event_message_id.lock().unwrap().is_some()
+                });
+                let parent_id = event_message_id.lock().unwrap().clone().unwrap();
+                write!(stream, "{}", prompt_confirmation_event(&parent_id)).unwrap();
+                stream.flush().unwrap();
+                wait_until(Duration::from_secs(2), || {
+                    event_history_reads.load(Ordering::SeqCst) >= 2
+                });
+                write!(stream, "{}", poisoned_terminal_events(&parent_id)).unwrap();
+                stream.flush().unwrap();
+            }));
+        } else if request.path == "/session/ses_poisoned_foreground/prompt_async" {
+            *message_id.lock().unwrap() = request.body["messageID"].as_str().map(ToOwned::to_owned);
+            write_response(&mut stream, "204 No Content", "text/plain", "");
+        } else if request.path == "/session/ses_poisoned_foreground/message" {
+            history_reads.fetch_add(1, Ordering::SeqCst);
+            write_response(
+                &mut stream,
+                "400 Bad Request",
+                "application/json",
+                r#"{"error":"Expected OutputFormatJsonSchema, got retryCount"}"#,
+            );
+        } else {
+            panic!("unexpected fake request path: {}", request.path);
+        }
+        captured.push(request);
+    }
+    event_handler
+        .expect("event subscription was opened")
+        .join()
+        .unwrap();
+    captured
+}
+
+fn prompt_confirmation_event(message_id: &str) -> String {
+    let event = json!({
+        "type":"message.updated",
+        "properties":{"info":{
+            "id":message_id,
+            "sessionID":"ses_poisoned_foreground",
+            "role":"user",
+            "time":{"created":1}
+        }}
+    });
+    format!("id: evt_prompt\ndata: {event}\n\n")
+}
+
+fn poisoned_terminal_events(parent_id: &str) -> String {
+    let message = json!({
+        "type":"message.updated",
+        "properties":{"info":{
+            "id":"msg_poisoned_foreground_assistant",
+            "sessionID":"ses_poisoned_foreground",
+            "role":"assistant",
+            "parentID":parent_id,
+            "time":{"created":2,"completed":3},
+            "structured":{
+                "status":"done",
+                "files":[],
+                "note":"Completed the foreground poisoned-history turn from attributed terminal event evidence while preserving the required command output, validation boundary, and persistent ref state without another history read. The foreground command now finishes successfully."
+            }
+        }}
+    });
+    let idle = json!({
+        "type":"session.idle",
+        "properties":{"sessionID":"ses_poisoned_foreground"}
+    });
+    format!("id: evt_terminal\ndata: {message}\n\nid: evt_idle\ndata: {idle}\n\n")
+}
+
+fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
+    let deadline = Instant::now() + timeout;
+    while !condition() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for fake server state"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn serve_foreground(listener: TcpListener) -> Vec<CapturedRequest> {

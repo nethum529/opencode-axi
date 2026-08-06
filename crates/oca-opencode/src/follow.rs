@@ -160,10 +160,19 @@ impl FollowTransport for OpenCodeClient {
     async fn messages(&self, session_id: &str) -> Result<Vec<FollowMessage>, FollowTransportError> {
         OpenCodeClient::messages(self, session_id)
             .await
-            .map_err(map_client_error)?
+            .map_err(map_history_error)?
             .into_iter()
             .map(adapt_message)
             .collect()
+    }
+}
+
+fn map_history_error(error: OpenCodeError) -> FollowTransportError {
+    match error {
+        OpenCodeError::Server { status: 400, body } => FollowTransportError::history_rejected(
+            format!("OpenCode rejected session history with HTTP 400: {body}"),
+        ),
+        error => map_client_error(error),
     }
 }
 
@@ -249,5 +258,23 @@ mod tests {
         assert_eq!(event.session_id.as_deref(), Some("ses_target"));
         assert!(event.payload.is_none());
         assert!(!event.known);
+    }
+
+    #[test]
+    fn history_400_is_distinct_from_stream_protocol_failures() {
+        assert!(matches!(
+            map_history_error(OpenCodeError::Server {
+                status: 400,
+                body: "stored format contains retryCount".to_owned(),
+            }),
+            FollowTransportError::HistoryRejected { .. }
+        ));
+        assert!(matches!(
+            map_client_error(OpenCodeError::Server {
+                status: 400,
+                body: "event endpoint rejected request".to_owned(),
+            }),
+            FollowTransportError::Protocol { .. }
+        ));
     }
 }

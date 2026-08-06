@@ -156,7 +156,7 @@ fn headed_background_missing_prompt_is_uncertain_and_never_spawns_attach() {
     let socket = home.path().join("unused-herdr.sock");
     let herdr = UnixListener::bind(&socket).unwrap();
     herdr.set_nonblocking(true).unwrap();
-    let (port, opencode) = spawn_unconfirmed_prompt_opencode();
+    let (port, opencode) = spawn_unconfirmed_prompt_opencode(false);
     prepare_dispatch_home(home.path(), &socket, port);
 
     let output = Command::new(env!("CARGO_BIN_EXE_oca"))
@@ -223,6 +223,200 @@ fn headed_background_missing_prompt_is_uncertain_and_never_spawns_attach() {
     assert_eq!(list["total"], 1);
     assert_eq!(list["items"][0]["ref"], reference);
     assert_eq!(list["items"][0]["state"], "prompt_uncertain");
+}
+
+#[test]
+fn headed_background_rejected_history_without_sse_evidence_stays_uncertain() {
+    let home = tempfile::tempdir().unwrap();
+    let socket = home.path().join("unused-herdr.sock");
+    let herdr = UnixListener::bind(&socket).unwrap();
+    herdr.set_nonblocking(true).unwrap();
+    let (port, opencode) = spawn_unconfirmed_prompt_opencode(true);
+    prepare_dispatch_home(home.path(), &socket, port);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args([
+            "--json",
+            "luna:h",
+            "-b",
+            "keep",
+            "the",
+            "prompt",
+            "uncertain",
+        ])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let rendered = String::from_utf8(output.stderr).unwrap();
+    let error = parse_error_envelope(rendered.trim()).expect("structured prompt error");
+    assert_eq!(error.code(), ErrorCode::PromptUncertain.as_str());
+    assert!(
+        rendered.contains("session history endpoint rejected its stored records"),
+        "history rejection must remain distinct from a missing message: {rendered}"
+    );
+    assert!(
+        rendered.contains(r#"oca m <ref> \"<resend>\""#),
+        "poisoned prompt recovery must name the explicit resend command: {rendered}"
+    );
+    assert!(matches!(
+        herdr.accept(),
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    let requests = opencode.join().unwrap();
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/session/ses_unconfirmed/message")
+            .count()
+            >= 2
+    );
+}
+
+#[test]
+fn headed_background_sse_confirms_prompt_when_history_rejects_its_stored_record() {
+    let home = tempfile::tempdir().unwrap();
+    init_repository(home.path());
+    let socket = home.path().join("fake-herdr.sock");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let herdr = spawn_herdr_until_agent_start(&socket, Arc::clone(&calls));
+    let (port, opencode, release_terminal) = spawn_poisoned_history_opencode();
+    prepare_dispatch_home(home.path(), &socket, port);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["luna:h", "-w", "-b", "survive", "poisoned", "history"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "SSE-confirmed dispatch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let acknowledgement = String::from_utf8(output.stdout).unwrap();
+    let reference = acknowledgement.split_whitespace().next().unwrap();
+    let record = ref_store(home.path()).resolve(reference).unwrap().unwrap();
+    let message_id = record.message_id.as_deref().unwrap();
+    let journal = home
+        .path()
+        .join(".oca/events")
+        .join(format!("{reference}.{message_id}.jsonl"));
+    release_terminal.store(true, Ordering::SeqCst);
+    wait_for_nonempty_file(&journal, Duration::from_secs(2));
+
+    let events = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["events", reference, "--json"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert!(events.status.success());
+    let event_page: Value = serde_json::from_slice(&events.stdout).unwrap();
+    assert!(event_page["total"].as_u64().is_some_and(|total| total > 0));
+    assert!(
+        event_page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["kind"] == "message.updated"),
+        "the detached helper must journal the terminal message event"
+    );
+
+    herdr.join().unwrap();
+    let requests = opencode.join().unwrap();
+    assert!(
+        requests
+            .iter()
+            .any(|request| { request.path == "/session/ses_poisoned/message" })
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/event")
+            .count(),
+        2,
+        "the admission stream must be followed by the detached event stream"
+    );
+    assert_eq!(calls.lock().unwrap()[3]["method"], "agent.start");
+}
+
+#[test]
+fn follow_reports_done_and_journals_terminal_events_when_history_stays_poisoned() {
+    let home = tempfile::tempdir().unwrap();
+    let socket = home.path().join("unused-herdr.sock");
+    let (port, opencode, release_terminal) = spawn_poisoned_history_opencode();
+    prepare_dispatch_home(home.path(), &socket, port);
+
+    let dispatch = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args([
+            "luna:h",
+            "--headless",
+            "-b",
+            "follow",
+            "poisoned",
+            "history",
+        ])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert!(
+        dispatch.status.success(),
+        "background dispatch failed: {}",
+        String::from_utf8_lossy(&dispatch.stderr)
+    );
+    let acknowledgement = String::from_utf8(dispatch.stdout).unwrap();
+    let reference = acknowledgement.split_whitespace().next().unwrap();
+    release_terminal.store(true, Ordering::SeqCst);
+
+    let follow = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["f", reference])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert!(
+        follow.status.success(),
+        "poisoned-history follow failed: {}",
+        String::from_utf8_lossy(&follow.stderr)
+    );
+    let rendered = String::from_utf8(follow.stdout).unwrap();
+    assert!(
+        rendered.contains("state=done"),
+        "unexpected follow output: {rendered}"
+    );
+    assert!(rendered.contains("status: done"));
+
+    let events = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["events", reference, "--json"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert!(events.status.success());
+    let page: Value = serde_json::from_slice(&events.stdout).unwrap();
+    let kinds = page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|event| event["kind"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["session.busy", "message.updated", "session.idle"]);
+
+    let requests = opencode.join().unwrap();
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request.path == "/session/ses_poisoned/message")
+            .count()
+            >= 2,
+        "admission confirmation and follow reconciliation must both exercise poisoned history"
+    );
 }
 
 #[test]
@@ -654,6 +848,40 @@ fn accept_unix_with_timeout(listener: &UnixListener) -> UnixStream {
             Err(error) => panic!("could not accept a herdr socket connection: {error}"),
         }
     }
+fn spawn_herdr_until_agent_start(
+    socket: &Path,
+    calls: Arc<Mutex<Vec<Value>>>,
+) -> thread::JoinHandle<()> {
+    let listener = UnixListener::bind(socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    thread::spawn(move || {
+        accept_discovery_probe(&listener);
+        accept_discovery_probe(&listener);
+        for index in 0..4 {
+            let mut stream = accept_unix_with_timeout(&listener);
+            let request = read_unix_request(&stream);
+            let request_id = request["id"].as_str().unwrap();
+            let result = match index {
+                0 => json!({"type":"workspace_list","workspaces":[]}),
+                1 => json!({
+                    "type":"workspace_created",
+                    "workspace":{"workspace_id":"w1","label":"oca"}
+                }),
+                2 => json!({
+                    "type":"tab_created",
+                    "tab":{"tab_id":"t1"},
+                    "root_pane":{"pane_id":"p1"}
+                }),
+                3 => json!({
+                    "type":"agent_started",
+                    "agent":{"terminal_id":"term1"}
+                }),
+                _ => unreachable!(),
+            };
+            writeln!(stream, "{}", json!({"id":request_id,"result":result})).unwrap();
+            calls.lock().unwrap().push(request);
+        }
+    })
 }
 
 fn spawn_herdr_with_attached_process(
@@ -1053,7 +1281,117 @@ fn spawn_headed_background_opencode() -> (u16, thread::JoinHandle<Vec<HttpReques
     (port, server, release_terminal)
 }
 
-fn spawn_unconfirmed_prompt_opencode() -> (u16, thread::JoinHandle<Vec<HttpRequest>>) {
+fn spawn_poisoned_history_opencode() -> (u16, thread::JoinHandle<Vec<HttpRequest>>, Arc<AtomicBool>)
+{
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let release_terminal = Arc::new(AtomicBool::new(false));
+    let server_release = Arc::clone(&release_terminal);
+    let message_id = Arc::new(Mutex::new(None::<String>));
+    let history_reads = Arc::new(AtomicUsize::new(0));
+    let server = thread::spawn(move || {
+        let started = Instant::now();
+        let mut last_request = None;
+        let mut requests = Vec::new();
+        let mut event_subscriptions = 0;
+        let mut handlers = Vec::new();
+
+        while requests.len() < 10 && started.elapsed() < Duration::from_secs(5) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if last_request
+                        .is_some_and(|last: Instant| last.elapsed() >= Duration::from_millis(750))
+                    {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("fake OpenCode accept failed: {error}"),
+            };
+            let request = read_http_request(&mut stream);
+            if request.path.starts_with("/agent?directory=") {
+                write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"[{"name":"impl"}]"#,
+                );
+            } else if request.path.starts_with("/session?directory=") {
+                write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"{"id":"ses_poisoned"}"#,
+                );
+            } else if request.path == "/event" {
+                if event_subscriptions == 0 {
+                    let message_id = Arc::clone(&message_id);
+                    let history_reads = Arc::clone(&history_reads);
+                    handlers.push(thread::spawn(move || {
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
+                        )
+                        .unwrap();
+                        stream.flush().unwrap();
+                        let deadline = Instant::now() + Duration::from_secs(2);
+                        while history_reads.load(Ordering::SeqCst) == 0 {
+                            assert!(Instant::now() < deadline, "history was never queried");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        let target = message_id.lock().unwrap().clone().unwrap();
+                        write!(stream, "{}", prompt_confirmation_sse(&target)).unwrap();
+                        stream.flush().unwrap();
+                    }));
+                } else {
+                    let parent_id = message_id.lock().unwrap().clone().unwrap();
+                    let release = Arc::clone(&server_release);
+                    handlers.push(thread::spawn(move || {
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{}",
+                            poisoned_busy_sse()
+                        )
+                        .unwrap();
+                        stream.flush().unwrap();
+                        wait_for_flag(&release, Duration::from_secs(3));
+                        write!(stream, "{}", poisoned_terminal_sse(&parent_id)).unwrap();
+                        stream.flush().unwrap();
+                    }));
+                }
+                event_subscriptions += 1;
+            } else if request.path == "/session/ses_poisoned/prompt_async" {
+                *message_id.lock().unwrap() =
+                    request.body["messageID"].as_str().map(ToOwned::to_owned);
+                write_http_response(&mut stream, "204 No Content", "text/plain", "");
+            } else if request.path == "/session/ses_poisoned/message" {
+                history_reads.fetch_add(1, Ordering::SeqCst);
+                write_http_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    "application/json",
+                    r#"{"error":"Expected OutputFormatJsonSchema, got retryCount"}"#,
+                );
+            } else {
+                panic!("unexpected OpenCode request path: {}", request.path);
+            }
+            requests.push(request);
+            last_request = Some(Instant::now());
+        }
+        for handler in handlers {
+            handler.join().unwrap();
+        }
+        requests
+    });
+    (port, server, release_terminal)
+}
+
+fn spawn_unconfirmed_prompt_opencode(
+    reject_history: bool,
+) -> (u16, thread::JoinHandle<Vec<HttpRequest>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1096,7 +1434,16 @@ fn spawn_unconfirmed_prompt_opencode() -> (u16, thread::JoinHandle<Vec<HttpReque
             } else if request.path == "/session/ses_unconfirmed/prompt_async" {
                 write_http_response(&mut stream, "204 No Content", "text/plain", "");
             } else if request.path == "/session/ses_unconfirmed/message" {
-                write_http_response(&mut stream, "200 OK", "application/json", "[]");
+                if reject_history {
+                    write_http_response(
+                        &mut stream,
+                        "400 Bad Request",
+                        "application/json",
+                        r#"{"error":"Expected OutputFormatJsonSchema, got retryCount"}"#,
+                    );
+                } else {
+                    write_http_response(&mut stream, "200 OK", "application/json", "[]");
+                }
             } else {
                 panic!("unexpected OpenCode request path: {}", request.path);
             }
@@ -1147,6 +1494,60 @@ fn terminal_sse(parent_id: &str) -> String {
         "properties": {"sessionID": "ses_headed_background"}
     });
     format!("id: evt_headed_message\ndata: {message}\n\nid: evt_headed_idle\ndata: {idle}\n\n")
+}
+
+fn prompt_confirmation_sse(message_id: &str) -> String {
+    let message = json!({
+        "id": "evt_poisoned_prompt",
+        "type": "message.updated",
+        "properties": {
+            "sessionID": "ses_poisoned",
+            "info": {
+                "id": message_id,
+                "sessionID": "ses_poisoned",
+                "role": "user",
+                "time": {"created": 1}
+            }
+        }
+    });
+    format!("id: evt_poisoned_prompt\ndata: {message}\n\n")
+}
+
+fn poisoned_terminal_sse(parent_id: &str) -> String {
+    let message = json!({
+        "id": "evt_poisoned_terminal",
+        "type": "message.updated",
+        "properties": {
+            "sessionID": "ses_poisoned",
+            "info": {
+                "id": "msg_poisoned_assistant",
+                "sessionID": "ses_poisoned",
+                "role": "assistant",
+                "parentID": parent_id,
+                "time": {"created": 2, "completed": 3},
+                "structured": {
+                    "status": "done",
+                    "files": [],
+                    "note": "The poisoned-history regression confirms the prompt from the subscribed message stream, acknowledges it, and preserves detached event flow without relying on unreadable history. The attributed idle boundary completes the turn successfully."
+                }
+            }
+        }
+    });
+    let idle = json!({
+        "id": "evt_poisoned_idle",
+        "type": "session.idle",
+        "properties": {"sessionID": "ses_poisoned"}
+    });
+    format!("id: evt_poisoned_terminal\ndata: {message}\n\nid: evt_poisoned_idle\ndata: {idle}\n\n")
+}
+
+fn poisoned_busy_sse() -> String {
+    let busy = json!({
+        "id": "evt_poisoned_busy",
+        "type": "session.busy",
+        "properties": {"sessionID": "ses_poisoned"}
+    });
+    format!("id: evt_poisoned_busy\ndata: {busy}\n\n")
 }
 
 fn busy_sse() -> String {

@@ -136,6 +136,10 @@ pub(crate) fn open_code_error(error: OpenCodeError) -> OcaError {
                 None => error,
             }
         }
+        OpenCodeError::Server { status, body } if (400..500).contains(&status) => {
+            OcaError::new(ErrorCode::ProtocolMismatch)
+                .with_error(format!("OpenCode returned HTTP {status}: {body}"))
+        }
         OpenCodeError::Server { status, body } => OcaError::new(ErrorCode::ServerUnavailable)
             .with_error(format!("OpenCode returned HTTP {status}: {body}")),
         OpenCodeError::Transport { message, .. } => {
@@ -151,7 +155,33 @@ pub(crate) fn prompt_error(error: OpenCodeError) -> OcaError {
             message,
         } => OcaError::new(ErrorCode::PromptUncertain)
             .with_error(format!("prompt response was lost: {message}"))
-            .with_help("reconcile the stored message id; never replay this prompt automatically"),
+            .with_help("Run `oca m <ref> \"<resend>\"`; oca will not replay"),
         error => open_code_error(error),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_reachable_client_error_is_protocol_mismatch_not_server_unavailable() {
+        for status in [400, 401, 404, 409, 422, 499] {
+            let error = open_code_error(OpenCodeError::Server {
+                status,
+                body: "reachable server rejected the request".to_owned(),
+            });
+            assert_eq!(
+                error.code(),
+                ErrorCode::ProtocolMismatch.as_str(),
+                "HTTP {status} must not claim the server is unavailable"
+            );
+        }
+
+        let error = open_code_error(OpenCodeError::Server {
+            status: 503,
+            body: "temporarily unavailable".to_owned(),
+        });
+        assert_eq!(error.code(), ErrorCode::ServerUnavailable.as_str());
     }
 }

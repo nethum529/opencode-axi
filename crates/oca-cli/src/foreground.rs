@@ -1,6 +1,7 @@
 //! Production adapters for the core foreground dispatch state machine.
 
 use std::{
+    collections::VecDeque,
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
@@ -14,9 +15,9 @@ use oca_core::{
 };
 use oca_display::{Acknowledgement, CompletionRecord, HerdrClient};
 use oca_opencode::{
-    CreateSessionRequest, MessageWithParts, OpenCodeClient, PromptRequest, SseError,
-    SseSourceErrorKind, Subscription, TextPart, attributed_structured_reply,
-    is_target_session_idle,
+    CreateSessionRequest, MessageWithParts, OpenCodeClient, OpenCodeError, PromptRequest, SseError,
+    SseEvent, SseSourceErrorKind, Subscription, TextPart, attributed_streamed_reply,
+    attributed_structured_reply, is_target_message_event, is_target_session_idle,
 };
 use oca_server::{ConnectOrStart, SystemRuntime};
 use oca_state::{
@@ -35,6 +36,156 @@ use crate::{
 const PROMPT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 const PROMPT_CONFIRM_INITIAL_BACKOFF: Duration = Duration::from_millis(20);
 const PROMPT_CONFIRM_MAX_BACKOFF: Duration = Duration::from_millis(200);
+
+enum PromptConfirmationCheck {
+    Stream(Result<Option<SseEvent>, SseError>),
+    History(Result<Vec<MessageWithParts>, OpenCodeError>),
+}
+
+enum PromptHistoryEvidence {
+    Missing,
+    Rejected(String),
+    Failed(String),
+    TimedOut,
+}
+
+pub(crate) struct DispatchSubscription {
+    inner: Subscription,
+    pending: VecDeque<Result<Option<SseEvent>, SseError>>,
+}
+
+impl DispatchSubscription {
+    pub(crate) fn new(inner: Subscription) -> Self {
+        Self {
+            inner,
+            pending: VecDeque::new(),
+        }
+    }
+
+    async fn next(&mut self) -> Result<Option<SseEvent>, SseError> {
+        match self.pending.pop_front() {
+            Some(result) => result,
+            None => self.inner.next().await,
+        }
+    }
+
+    /// Reads past the buffer deliberately: confirmation only ever runs before
+    /// any downstream read, so `pending` holds exactly the events this loop has
+    /// already inspected and replaying them here would re-inspect them.
+    async fn next_confirmation(&mut self) -> Result<Option<SseEvent>, SseError> {
+        self.inner.next().await
+    }
+
+    /// Queues one inspected event for the downstream consumer. Appending keeps
+    /// `pending` in arrival order, so `next` replays the stream exactly as it
+    /// arrived. The confirming event itself is deliberately not preserved: it
+    /// identifies our own user message, which no downstream consumer acts on.
+    fn preserve(&mut self, result: Result<Option<SseEvent>, SseError>) {
+        self.pending.push_back(result);
+    }
+}
+
+/// Confirms that an accepted asynchronous prompt became visible to OpenCode.
+///
+/// The already-open event stream is the primary evidence source. Session
+/// history remains the authoritative fallback, including when its stored
+/// records are poisoned and the endpoint rejects them with HTTP 400.
+pub(crate) async fn confirm_prompt_landed(
+    client: &OpenCodeClient,
+    subscription: &mut DispatchSubscription,
+    session_id: &str,
+    message_id: &str,
+    prompt_text: &str,
+) -> Result<(), OcaError> {
+    let started = tokio::time::Instant::now();
+    let mut backoff = PROMPT_CONFIRM_INITIAL_BACKOFF;
+    let expected_hash = prompt_sha256(prompt_text);
+    let mut history_evidence = PromptHistoryEvidence::Missing;
+    let mut stream_open = true;
+
+    loop {
+        let elapsed = started.elapsed();
+        let Some(remaining) = PROMPT_CONFIRM_TIMEOUT.checked_sub(elapsed) else {
+            break;
+        };
+        let attempt_timeout = remaining.min(PROMPT_CONFIRM_MAX_BACKOFF);
+        let check = tokio::time::timeout(attempt_timeout, async {
+            if stream_open {
+                tokio::select! {
+                    biased;
+                    event = subscription.next_confirmation() => {
+                        PromptConfirmationCheck::Stream(event)
+                    },
+                    history = client.messages(session_id) => {
+                        PromptConfirmationCheck::History(history)
+                    }
+                }
+            } else {
+                PromptConfirmationCheck::History(client.messages(session_id).await)
+            }
+        })
+        .await;
+        match check {
+            Ok(PromptConfirmationCheck::Stream(Ok(Some(event)))) => {
+                if is_target_message_event(&event, session_id, message_id) {
+                    return Ok(());
+                }
+                subscription.preserve(Ok(Some(event)));
+                continue;
+            }
+            Ok(PromptConfirmationCheck::Stream(result @ (Ok(None) | Err(_)))) => {
+                stream_open = false;
+                subscription.preserve(result);
+                continue;
+            }
+            Ok(PromptConfirmationCheck::History(Ok(messages))) => {
+                if user_prompt_is_visible(&messages, session_id, message_id, &expected_hash) {
+                    return Ok(());
+                }
+                history_evidence = PromptHistoryEvidence::Missing;
+            }
+            Ok(PromptConfirmationCheck::History(Err(error))) => {
+                let rendered = error.to_string();
+                history_evidence = match error {
+                    OpenCodeError::Server { status: 400, .. } => {
+                        PromptHistoryEvidence::Rejected(rendered)
+                    }
+                    _ => PromptHistoryEvidence::Failed(rendered),
+                };
+            }
+            Err(_) => history_evidence = PromptHistoryEvidence::TimedOut,
+        }
+
+        let elapsed = started.elapsed();
+        let Some(remaining) = PROMPT_CONFIRM_TIMEOUT.checked_sub(elapsed) else {
+            break;
+        };
+        tokio::time::sleep(backoff.min(remaining)).await;
+        backoff = backoff.saturating_mul(2).min(PROMPT_CONFIRM_MAX_BACKOFF);
+    }
+
+    let detail = match history_evidence {
+        PromptHistoryEvidence::Missing => {
+            "the accepted user message did not appear in session history".to_owned()
+        }
+        PromptHistoryEvidence::Rejected(error) => {
+            format!("the session history endpoint rejected its stored records: {error}")
+        }
+        PromptHistoryEvidence::Failed(error) => {
+            format!("session history could not confirm the accepted prompt: {error}")
+        }
+        PromptHistoryEvidence::TimedOut => {
+            "session history could not confirm the accepted prompt: message lookup timed out"
+                .to_owned()
+        }
+    };
+    Err(OcaError::new(ErrorCode::PromptUncertain)
+        .with_error(format!(
+            "{detail} within {} ms",
+            PROMPT_CONFIRM_TIMEOUT.as_millis()
+        ))
+        .with_help("Run `oca m <ref> \"<resend>\"`; oca will not replay"))
+}
 
 /// Executes a parsed foreground dispatch using the user's local state root.
 ///
@@ -206,67 +357,15 @@ impl ProductionBackend {
         session_id: &str,
         message_id: &str,
     ) -> Result<Option<TerminalReply>, OcaError> {
-        let messages = self
-            .client()?
-            .messages(session_id)
-            .await
-            .map_err(open_code_error)?;
+        let messages = match self.client()?.messages(session_id).await {
+            Ok(messages) => messages,
+            Err(OpenCodeError::Server { status: 400, .. }) => return Ok(None),
+            Err(error) => return Err(open_code_error(error)),
+        };
         Ok(
             attributed_structured_reply(&messages, session_id, message_id)
                 .map(|structured| TerminalReply { structured }),
         )
-    }
-
-    async fn confirm_prompt_visibility(
-        &mut self,
-        session_id: &str,
-        prompt: &DispatchPrompt,
-    ) -> Result<(), OcaError> {
-        let started = tokio::time::Instant::now();
-        let mut backoff = PROMPT_CONFIRM_INITIAL_BACKOFF;
-        let expected_hash = prompt_sha256(&prompt.text);
-        let mut last_error = None;
-
-        loop {
-            let elapsed = started.elapsed();
-            let Some(remaining) = PROMPT_CONFIRM_TIMEOUT.checked_sub(elapsed) else {
-                break;
-            };
-            let attempt_timeout = remaining.min(PROMPT_CONFIRM_MAX_BACKOFF);
-            match tokio::time::timeout(attempt_timeout, self.client()?.messages(session_id)).await {
-                Ok(Ok(messages)) => {
-                    if user_prompt_is_visible(
-                        &messages,
-                        session_id,
-                        &prompt.message_id,
-                        &expected_hash,
-                    ) {
-                        return Ok(());
-                    }
-                }
-                Ok(Err(error)) => last_error = Some(error.to_string()),
-                Err(_) => last_error = Some("message lookup timed out".to_owned()),
-            }
-
-            let elapsed = started.elapsed();
-            let Some(remaining) = PROMPT_CONFIRM_TIMEOUT.checked_sub(elapsed) else {
-                break;
-            };
-            tokio::time::sleep(backoff.min(remaining)).await;
-            backoff = backoff.saturating_mul(2).min(PROMPT_CONFIRM_MAX_BACKOFF);
-        }
-
-        let detail = last_error.map_or_else(
-            || "the accepted user message did not appear in session history".to_owned(),
-            |error| format!("session history could not confirm the accepted prompt: {error}"),
-        );
-        let error = OcaError::new(ErrorCode::PromptUncertain)
-            .with_error(format!(
-                "{detail} within {} ms",
-                PROMPT_CONFIRM_TIMEOUT.as_millis()
-            ))
-            .with_help("reconcile the stored message id; never replay this prompt automatically");
-        self.preserve_uncertain_prompt(session_id, prompt, error)
     }
 
     fn preserve_uncertain_prompt(
@@ -335,7 +434,7 @@ impl ProductionBackend {
 }
 
 impl ForegroundBackend for ProductionBackend {
-    type Subscription = Subscription;
+    type Subscription = DispatchSubscription;
     type PendingRef = PendingProductionRef;
 
     fn prepare(&mut self, request: &mut ForegroundRequest) -> Result<(), OcaError> {
@@ -444,6 +543,7 @@ impl ForegroundBackend for ProductionBackend {
         self.client()?
             .subscribe(None)
             .await
+            .map(DispatchSubscription::new)
             .map_err(open_code_error)
     }
 
@@ -510,10 +610,22 @@ impl ForegroundBackend for ProductionBackend {
 
     async fn confirm_prompt_landed(
         &mut self,
+        subscription: &mut Self::Subscription,
         session_id: &str,
         prompt: &DispatchPrompt,
     ) -> Result<(), OcaError> {
-        self.confirm_prompt_visibility(session_id, prompt).await
+        match confirm_prompt_landed(
+            self.client()?,
+            subscription,
+            session_id,
+            &prompt.message_id,
+            &prompt.text,
+        )
+        .await
+        {
+            Ok(()) => Ok(()),
+            Err(error) => self.preserve_uncertain_prompt(session_id, prompt, error),
+        }
     }
 
     fn fail_before_prompt(&mut self, error: OcaError) -> OcaError {
@@ -640,6 +752,7 @@ impl ForegroundBackend for ProductionBackend {
         session_id: &str,
         message_id: &str,
     ) -> Result<TerminalReply, OcaError> {
+        let mut streamed_reply = None;
         loop {
             let event = match subscription.next().await {
                 Ok(Some(event)) => event,
@@ -658,10 +771,16 @@ impl ForegroundBackend for ProductionBackend {
                         .with_error(format!("OpenCode event stream failed: {stream_error}")));
                 }
             };
-            if is_target_session_idle(&event, session_id)
-                && let Some(reply) = self.read_attributed_reply(session_id, message_id).await?
-            {
-                return Ok(reply);
+            if let Some(structured) = attributed_streamed_reply(&event, session_id, message_id) {
+                streamed_reply = Some(TerminalReply { structured });
+            }
+            if is_target_session_idle(&event, session_id) {
+                if let Some(reply) = streamed_reply.take() {
+                    return Ok(reply);
+                }
+                if let Some(reply) = self.read_attributed_reply(session_id, message_id).await? {
+                    return Ok(reply);
+                }
             }
         }
     }
