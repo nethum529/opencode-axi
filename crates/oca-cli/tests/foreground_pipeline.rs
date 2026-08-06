@@ -53,15 +53,22 @@ fn end_to_end_foreground_has_one_turn_one_terminal_and_one_golden_final_result()
             .iter()
             .map(|request| route(&request.path))
             .collect::<Vec<_>>(),
-        ["session", "event", "prompt_async", "messages", "messages"]
+        [
+            "agents",
+            "session",
+            "event",
+            "prompt_async",
+            "messages",
+            "messages"
+        ]
     );
 
-    let create = &trace[0].body;
+    let create = &trace[1].body;
     let permission = create["permission"].as_array().expect("permission ruleset");
     assert_eq!(permission.len(), 5);
     assert!(permission.iter().all(|rule| rule["action"] == "deny"));
 
-    let prompt = &trace[2].body;
+    let prompt = &trace[3].body;
     let message_id = prompt["messageID"].as_str().expect("caller message id");
     assert!(is_opencode_message_id(message_id));
     assert!(!message_id.starts_with("msg_oca_"));
@@ -102,11 +109,20 @@ fn end_to_end_foreground_has_one_turn_one_terminal_and_one_golden_final_result()
 fn serve_foreground(listener: TcpListener) -> Vec<CapturedRequest> {
     let mut captured = Vec::new();
     let mut message_id = None;
-    for index in 0..5 {
+    for index in 0..6 {
         let (mut stream, _) = listener.accept().expect("fake accepts request");
         let request = read_request(&mut stream);
         match index {
             0 => {
+                assert!(request.path.starts_with("/agent?directory="));
+                write_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"[{"name":"impl"}]"#,
+                );
+            }
+            1 => {
                 assert!(request.path.starts_with("/session?directory="));
                 write_response(
                     &mut stream,
@@ -115,7 +131,7 @@ fn serve_foreground(listener: TcpListener) -> Vec<CapturedRequest> {
                     r#"{"id":"ses_target"}"#,
                 );
             }
-            1 => {
+            2 => {
                 assert_eq!(request.path, "/event");
                 let event = concat!(
                     "id: evt_terminal\n",
@@ -124,16 +140,24 @@ fn serve_foreground(listener: TcpListener) -> Vec<CapturedRequest> {
                 );
                 write_response(&mut stream, "200 OK", "text/event-stream", event);
             }
-            2 => {
+            3 => {
                 assert_eq!(request.path, "/session/ses_target/prompt_async");
                 message_id = request.body["messageID"].as_str().map(ToOwned::to_owned);
                 write_response(&mut stream, "204 No Content", "text/plain", "");
             }
-            3 => {
-                assert_eq!(request.path, "/session/ses_target/message");
-                write_response(&mut stream, "200 OK", "application/json", "[]");
-            }
             4 => {
+                assert_eq!(request.path, "/session/ses_target/message");
+                let body = json!([{
+                    "info": {
+                        "id": message_id.as_deref().unwrap(),
+                        "sessionID": "ses_target",
+                        "role": "user"
+                    },
+                    "parts": [{"type":"text","text":"implement the ticket"}]
+                }]);
+                write_response(&mut stream, "200 OK", "application/json", &body.to_string());
+            }
+            5 => {
                 assert_eq!(request.path, "/session/ses_target/message");
                 let body = json!([{
                     "info": {
@@ -159,7 +183,9 @@ fn serve_foreground(listener: TcpListener) -> Vec<CapturedRequest> {
 }
 
 fn route(path: &str) -> &'static str {
-    if path.starts_with("/session?") {
+    if path.starts_with("/agent?") {
+        "agents"
+    } else if path.starts_with("/session?") {
         "session"
     } else if path == "/event" {
         "event"

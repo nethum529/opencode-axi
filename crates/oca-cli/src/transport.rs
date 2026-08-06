@@ -20,7 +20,7 @@ impl CreateSessionOperation {
 
 impl OpenCodeRequest for CreateSessionOperation {
     type Output = Session;
-    type Error = OpenCodeError;
+    type Error = CreateSessionError;
 
     fn send(
         &mut self,
@@ -28,36 +28,100 @@ impl OpenCodeRequest for CreateSessionOperation {
     ) -> impl Future<Output = Result<Self::Output, RequestFailure<Self::Error>>> + Send {
         let request = self.request.clone();
         async move {
+            let agent = request.agent.as_deref().ok_or(RequestFailure::Application(
+                CreateSessionError::MissingAgentName,
+            ))?;
+            let agents = client
+                .agents(request.directory.as_deref(), request.workspace.as_deref())
+                .await
+                .map_err(create_session_request_failure)?;
+            if !agents.iter().any(|available| available.name == agent) {
+                return Err(RequestFailure::Application(
+                    CreateSessionError::UnregisteredAgent(agent.to_owned()),
+                ));
+            }
+
             client.create_session(request).await.map_err(|error| {
                 // Even a lost create-session response precedes prompt admission. A
                 // duplicate empty session is harmless, so T14 may recover once.
                 if matches!(error, OpenCodeError::Transport { .. }) {
-                    RequestFailure::Connection(error)
+                    RequestFailure::Connection(CreateSessionError::OpenCode(error))
                 } else {
-                    RequestFailure::Application(error)
+                    RequestFailure::Application(CreateSessionError::OpenCode(error))
                 }
             })
         }
     }
 }
 
-pub(crate) fn connect_error(error: ConnectError<OpenCodeError>) -> OcaError {
+#[derive(Debug)]
+pub(crate) enum CreateSessionError {
+    OpenCode(OpenCodeError),
+    MissingAgentName,
+    UnregisteredAgent(String),
+}
+
+impl std::fmt::Display for CreateSessionError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OpenCode(error) => error.fmt(formatter),
+            Self::MissingAgentName => formatter.write_str("dispatch has no OpenCode agent name"),
+            Self::UnregisteredAgent(agent) => {
+                write!(formatter, "OpenCode agent `{agent}` is not registered")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CreateSessionError {}
+
+fn create_session_request_failure(error: OpenCodeError) -> RequestFailure<CreateSessionError> {
+    if matches!(error, OpenCodeError::Transport { .. }) {
+        RequestFailure::Connection(CreateSessionError::OpenCode(error))
+    } else {
+        RequestFailure::Application(CreateSessionError::OpenCode(error))
+    }
+}
+
+pub(crate) fn create_session_error(error: ConnectError<CreateSessionError>) -> OcaError {
     match error {
-        ConnectError::Request(error) | ConnectError::RequestMayHaveBeenTransmitted(error) => {
+        ConnectError::Request(CreateSessionError::UnregisteredAgent(agent))
+        | ConnectError::RequestMayHaveBeenTransmitted(CreateSessionError::UnregisteredAgent(
+            agent,
+        )) => OcaError::new(ErrorCode::ProtocolMismatch)
+            .with_error(format!(
+                "OpenCode agent `{agent}` is not registered for this dispatch directory"
+            ))
+            .with_help(format!(
+                "Register agent `{agent}` in OpenCode configuration and retry"
+            )),
+        ConnectError::Request(CreateSessionError::MissingAgentName)
+        | ConnectError::RequestMayHaveBeenTransmitted(CreateSessionError::MissingAgentName) => {
+            OcaError::new(ErrorCode::ProtocolMismatch)
+                .with_error("dispatch has no OpenCode agent name")
+        }
+        ConnectError::Request(CreateSessionError::OpenCode(error))
+        | ConnectError::RequestMayHaveBeenTransmitted(CreateSessionError::OpenCode(error)) => {
             open_code_error(error)
         }
-        ConnectError::Startup(diagnostics) => {
-            let detail = diagnostics
-                .into_iter()
-                .map(|diagnostic| diagnostic.to_string())
-                .collect::<Vec<_>>()
-                .join("; ");
-            OcaError::new(ErrorCode::ServerStartTimeout)
-                .with_error(format!("OpenCode could not be started: {detail}"))
-        }
-        ConnectError::State(error) => OcaError::new(ErrorCode::ServerUnavailable)
-            .with_error(format!("OpenCode discovery failed: {error}")),
+        ConnectError::Startup(diagnostics) => startup_error(diagnostics),
+        ConnectError::State(error) => discovery_error(error),
     }
+}
+
+fn startup_error(diagnostics: Vec<oca_server::StartupDiagnostic>) -> OcaError {
+    let detail = diagnostics
+        .into_iter()
+        .map(|diagnostic| diagnostic.to_string())
+        .collect::<Vec<_>>()
+        .join("; ");
+    OcaError::new(ErrorCode::ServerStartTimeout)
+        .with_error(format!("OpenCode could not be started: {detail}"))
+}
+
+fn discovery_error(error: std::io::Error) -> OcaError {
+    OcaError::new(ErrorCode::ServerUnavailable)
+        .with_error(format!("OpenCode discovery failed: {error}"))
 }
 
 pub(crate) fn open_code_error(error: OpenCodeError) -> OcaError {

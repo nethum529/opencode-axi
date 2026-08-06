@@ -33,7 +33,7 @@ use oca_opencode::{
     TextPart, is_target_session_idle,
 };
 use oca_server::{ConnectOrStart, ServerRecord};
-use oca_state::{RefRecord, RefState, RefStore, RefStorePaths};
+use oca_state::{RefPatch, RefRecord, RefState, RefStore, RefStorePaths};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -510,6 +510,9 @@ fn live_queue_runs_after_turn_and_abort_reaches_terminal_for_tab_close() {
         tab
     });
     let tab_id = tab.as_str().to_owned();
+    RefStore::with_paths(RefStorePaths::in_directory(server.home.path().join(".oca")))
+        .patch("wab0rt", RefPatch::default().with_herdr_tab(&tab_id))
+        .expect("persist live abort tab");
     assert!(
         server.herdr_tab_exists(&tab_id),
         "headed tab exists before abort"
@@ -523,15 +526,12 @@ fn live_queue_runs_after_turn_and_abort_reaches_terminal_for_tab_close() {
         LIVE_TIMEOUT,
     ));
     assert!(idle_count(&abort_events, &headed_record.session_id) >= 1);
-    runtime
-        .block_on(herdr.close_tab(&tab))
-        .expect("close abort tab at terminal state");
     assert!(
         !server.herdr_tab_exists(&tab_id),
-        "abort terminal closes tab"
+        "oca k closes the persisted abort tab"
     );
     eprintln!(
-        "LIVE controls: raw_queue_after_boundary=true oca_q_admitted=true abort_ack=true headed_tab_closed_at_terminal=true tab_id={tab_id}"
+        "LIVE controls: raw_queue_after_boundary=true oca_q_admitted=true abort_ack=true oca_k_closed_headed_tab=true tab_id={tab_id}"
     );
 }
 

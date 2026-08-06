@@ -18,7 +18,7 @@ mod generated;
 
 pub use dispatch::{attributed_structured_reply, is_target_session_idle};
 pub use facade::{
-    AbortAccepted, ControlAccepted, CreateSessionRequest, MessageId, MessageWithParts,
+    AbortAccepted, AgentInfo, ControlAccepted, CreateSessionRequest, MessageId, MessageWithParts,
     OpenCodeClient, OpenCodeError, PromptAccepted, PromptRequest, Session, SessionId, Subscription,
     TextPart,
 };
@@ -33,20 +33,32 @@ pub struct SseEvent {
     pub data: String,
 }
 
+/// Classification of a response-body source failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SseSourceErrorKind {
+    /// The server connection was lost at the transport layer.
+    Transport,
+    /// The connected server supplied a body that could not be decoded.
+    Protocol,
+}
+
 /// Errors produced while reading or framing an SSE response body.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SseError {
     /// A complete SSE line was not valid UTF-8.
     InvalidUtf8 { line: Vec<u8> },
     /// The underlying response body could not provide its next chunk.
-    Source { message: String },
+    Source {
+        message: String,
+        kind: SseSourceErrorKind,
+    },
 }
 
 impl fmt::Display for SseError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidUtf8 { .. } => formatter.write_str("SSE line is not valid UTF-8"),
-            Self::Source { message } => write!(formatter, "SSE source failed: {message}"),
+            Self::Source { message, .. } => write!(formatter, "SSE source failed: {message}"),
         }
     }
 }
@@ -58,6 +70,11 @@ pub trait SseChunkSource {
     type Error: fmt::Display;
 
     fn next_chunk(&mut self) -> impl Future<Output = Result<Option<Vec<u8>>, Self::Error>> + Send;
+
+    /// Classifies a source error without relying on its rendered message.
+    fn classify_error(_error: &Self::Error) -> SseSourceErrorKind {
+        SseSourceErrorKind::Protocol
+    }
 }
 
 /// An isolated parser for a raw SSE response body.
@@ -116,6 +133,7 @@ where
                 Err(error) => {
                     return Err(SseError::Source {
                         message: error.to_string(),
+                        kind: S::classify_error(&error),
                     });
                 }
             }
@@ -380,6 +398,10 @@ mod tests {
         ) -> impl Future<Output = Result<Option<Vec<u8>>, Self::Error>> + Send {
             std::future::ready(Err(Disconnect))
         }
+
+        fn classify_error(_error: &Self::Error) -> super::SseSourceErrorKind {
+            super::SseSourceErrorKind::Transport
+        }
     }
 
     #[test]
@@ -390,6 +412,7 @@ mod tests {
             block_on(stream.next()),
             Err(super::SseError::Source {
                 message: "connection reset".to_owned(),
+                kind: super::SseSourceErrorKind::Transport,
             })
         );
     }

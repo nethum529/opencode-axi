@@ -79,6 +79,9 @@ pub trait ForegroundBackend {
         Ok(())
     }
 
+    /// Creates the session only after verifying that the requested role names
+    /// an agent registered on the same OpenCode server. Recovery must repeat
+    /// that precheck before creating a session on a replacement server.
     async fn create_session(&mut self, request: &ForegroundRequest) -> Result<String, OcaError>;
 
     async fn subscribe(&mut self) -> Result<Self::Subscription, OcaError>;
@@ -90,6 +93,28 @@ pub trait ForegroundBackend {
         session_id: &str,
         prompt: &DispatchPrompt,
     ) -> Result<(), OcaError>;
+
+    /// Confirms that an asynchronously accepted prompt is visible in the
+    /// authoritative session before any dispatch mode can acknowledge or wait.
+    async fn confirm_prompt_landed(
+        &mut self,
+        _session_id: &str,
+        _prompt: &DispatchPrompt,
+    ) -> Result<(), OcaError> {
+        Ok(())
+    }
+
+    /// Settles local reservations after a deterministic failure before prompt
+    /// admission. This hook is deliberately not called for prompt uncertainty.
+    fn fail_before_prompt(&mut self, error: OcaError) -> OcaError {
+        error
+    }
+
+    /// Persists the transition from uncertain transmission to running after
+    /// any required prompt-visibility proof has succeeded.
+    fn mark_prompt_running(&mut self) -> Result<(), OcaError> {
+        Ok(())
+    }
 
     fn write_ref(
         &mut self,
@@ -215,11 +240,17 @@ where
         Err(error) if is_server_unreachable(&error) => {
             retried_session_creation = true;
             session_id = backend.create_session(&request).await?;
-            backend.subscribe().await?
+            match backend.subscribe().await {
+                Ok(subscription) => subscription,
+                Err(error) => return Err(backend.fail_before_prompt(error)),
+            }
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(backend.fail_before_prompt(error)),
     };
-    let message_id = backend.mint_message_id()?;
+    let message_id = match backend.mint_message_id() {
+        Ok(message_id) => message_id,
+        Err(error) => return Err(backend.fail_before_prompt(error)),
+    };
     let prompt = DispatchPrompt {
         message_id: message_id.clone(),
         model: request.model.clone(),
@@ -235,11 +266,22 @@ where
             // The transport proved that no prompt bytes were transmitted. A
             // fresh session and subscription are therefore safe exactly once.
             session_id = backend.create_session(&request).await?;
-            subscription = backend.subscribe().await?;
-            backend.prompt_async(&session_id, &prompt).await?;
+            subscription = match backend.subscribe().await {
+                Ok(subscription) => subscription,
+                Err(error) => return Err(backend.fail_before_prompt(error)),
+            };
+            if let Err(error) = backend.prompt_async(&session_id, &prompt).await {
+                if is_prompt_uncertain(&error) {
+                    return Err(error);
+                }
+                return Err(backend.fail_before_prompt(error));
+            }
         }
-        Err(error) => return Err(error),
+        Err(error) if is_prompt_uncertain(&error) => return Err(error),
+        Err(error) => return Err(backend.fail_before_prompt(error)),
     }
+    backend.confirm_prompt_landed(&session_id, &prompt).await?;
+    backend.mark_prompt_running()?;
 
     let pending = backend.write_ref(&session_id, &message_id, &request)?;
     let reference = backend.acknowledge(pending, &request.model, request.json)?;
@@ -259,6 +301,10 @@ where
 
 fn is_server_unreachable(error: &OcaError) -> bool {
     error.code() == crate::ErrorCode::ServerUnreachable.as_str()
+}
+
+fn is_prompt_uncertain(error: &OcaError) -> bool {
+    error.code() == crate::ErrorCode::PromptUncertain.as_str()
 }
 
 #[cfg(test)]
@@ -515,6 +561,20 @@ mod tests {
             Ok(())
         }
 
+        async fn confirm_prompt_landed(
+            &mut self,
+            _session_id: &str,
+            _prompt: &DispatchPrompt,
+        ) -> Result<(), OcaError> {
+            self.calls.push("confirm");
+            Ok(())
+        }
+
+        fn mark_prompt_running(&mut self) -> Result<(), OcaError> {
+            self.calls.push("running");
+            Ok(())
+        }
+
         fn write_ref(
             &mut self,
             _session_id: &str,
@@ -599,6 +659,8 @@ mod tests {
                     "subscribe",
                     "mint",
                     "prompt",
+                    "confirm",
+                    "running",
                     "write_ref",
                     "ack",
                     "spawn",

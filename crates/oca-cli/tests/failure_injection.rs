@@ -11,9 +11,13 @@ use oca_testkit::{FailureAction, FailureHttpServer, HttpResponse};
 fn pre_transmit_connection_cut_retries_session_creation_once_and_prompts_once() {
     let (home, server) = fixture([
         FailureAction::DropBeforeRequest,
+        respond(200, "application/json", br#"[{"name":"impl"}]"#),
         respond(200, "application/json", br#"{"id":"ses_recovered"}"#),
         respond(200, "text/event-stream", b""),
         respond(204, "text/plain", b""),
+        FailureAction::EchoPrompt {
+            session_id: "ses_recovered".to_owned(),
+        },
     ]);
 
     let output = run(&home, ["luna:h", "-b", "--headless", "do", "the", "work"]);
@@ -25,7 +29,17 @@ fn pre_transmit_connection_cut_retries_session_creation_once_and_prompts_once() 
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(output.stderr.is_empty());
-    assert_eq!(routes(&requests), ["session", "event", "prompt_async"]);
+    assert_eq!(
+        routes(&requests),
+        [
+            "agents",
+            "agents",
+            "session",
+            "event",
+            "prompt_async",
+            "messages"
+        ]
+    );
     assert_eq!(
         routes(&requests)
             .iter()
@@ -37,6 +51,52 @@ fn pre_transmit_connection_cut_retries_session_creation_once_and_prompts_once() 
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].session_id, "ses_recovered");
     assert_eq!(records[0].last_state, Some(RefState::Running));
+}
+
+#[test]
+fn headless_background_missing_prompt_is_uncertain_instead_of_running() {
+    let (home, server) = missing_prompt_fixture("ses_headless_missing");
+
+    let output = run(
+        &home,
+        [
+            "--json",
+            "luna:h",
+            "-b",
+            "--headless",
+            "do",
+            "not",
+            "strand",
+            "running",
+        ],
+    );
+    let requests = server.join().expect("failure server thread");
+
+    assert_uncertain_missing_prompt(&home, &output, &requests, "ses_headless_missing");
+}
+
+#[test]
+fn foreground_missing_prompt_is_uncertain_before_terminal_wait() {
+    let (home, server) = missing_prompt_fixture("ses_foreground_missing");
+
+    let output = run(
+        &home,
+        [
+            "--json",
+            "luna:h",
+            "--headless",
+            "do",
+            "not",
+            "wait",
+            "for",
+            "a",
+            "missing",
+            "prompt",
+        ],
+    );
+    let requests = server.join().expect("failure server thread");
+
+    assert_uncertain_missing_prompt(&home, &output, &requests, "ses_foreground_missing");
 }
 
 #[test]
@@ -61,7 +121,10 @@ fn post_transmit_pre_response_cut_never_replays_and_persists_unknown_ref() {
     let error = parsed_error(&output);
     assert_eq!(error.code(), ErrorCode::PromptUncertain.as_str());
     assert!(error.reference().is_some());
-    assert_eq!(routes(&requests), ["session", "event", "prompt_async"]);
+    assert_eq!(
+        routes(&requests),
+        ["agents", "session", "event", "prompt_async"]
+    );
     assert_eq!(
         routes(&requests)
             .iter()
@@ -123,7 +186,7 @@ fn fake_500_after_worktree_prepare_leaves_no_ref_intent_branch_or_worktree() {
     let requests = server.join().expect("failure server thread");
 
     assert!(!output.status.success());
-    assert_eq!(routes(&requests), ["session"]);
+    assert_eq!(routes(&requests), ["agents", "session"]);
     assert!(stored_refs(&home).is_empty());
     assert!(intent_json_files(home.path()).is_empty());
     assert!(!git_branches(home.path()).contains("oca/"));
@@ -134,6 +197,112 @@ fn fake_500_after_worktree_prepare_leaves_no_ref_intent_branch_or_worktree() {
                 .next()
                 .is_none()
     );
+}
+
+#[test]
+fn deterministic_pre_prompt_failures_clean_worktree_refs_and_list_state() {
+    for (actions, expected_routes) in [
+        (
+            vec![
+                respond(200, "application/json", br#"{"id":"ses_subscribe_500"}"#),
+                respond(
+                    500,
+                    "application/json",
+                    br#"{"error":"subscribe rejected"}"#,
+                ),
+            ],
+            vec!["agents", "session", "event"],
+        ),
+        (
+            vec![
+                respond(200, "application/json", br#"{"id":"ses_prompt_429"}"#),
+                respond(200, "text/event-stream", b""),
+                FailureAction::Respond(HttpResponse::new(
+                    429,
+                    [("content-type", "application/json"), ("retry-after", "1")],
+                    [br#"{"error":"prompt rejected"}"#.to_vec()],
+                )),
+            ],
+            vec!["agents", "session", "event", "prompt_async"],
+        ),
+    ] {
+        let (home, server) = fixture(actions);
+        init_repository(home.path());
+
+        let output = run(
+            &home,
+            [
+                "--json",
+                "luna:h",
+                "-w",
+                "-b",
+                "--headless",
+                "fail",
+                "before",
+                "prompt",
+            ],
+        );
+        let requests = server.join().expect("failure server thread");
+
+        assert!(!output.status.success());
+        assert_eq!(routes(&requests), expected_routes);
+        assert!(stored_refs(&home).is_empty());
+        assert!(intent_json_files(home.path()).is_empty());
+        assert!(!git_branches(home.path()).contains("oca/"));
+
+        let listed = run(&home, ["ls", "--all", "--json"]);
+        assert!(listed.status.success());
+        let list: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+        assert_eq!(list["total"], 0);
+    }
+}
+
+#[test]
+fn subscribe_recovery_rechecks_agent_before_replacement_session() {
+    let (home, server) = fixture([
+        respond(200, "application/json", br#"{"id":"ses_before_cut"}"#),
+        FailureAction::DropAfterRequest,
+        respond(200, "application/json", br#"[{"name":"impl"}]"#),
+        respond(200, "application/json", br#"{"id":"ses_after_cut"}"#),
+        respond(200, "text/event-stream", b""),
+        respond(204, "text/plain", b""),
+        FailureAction::EchoPrompt {
+            session_id: "ses_after_cut".to_owned(),
+        },
+    ]);
+
+    let output = run(
+        &home,
+        [
+            "luna:h",
+            "-b",
+            "--headless",
+            "recover",
+            "subscription",
+            "safely",
+        ],
+    );
+    let requests = server.join().expect("failure server thread");
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        routes(&requests),
+        [
+            "agents",
+            "session",
+            "event",
+            "agents",
+            "session",
+            "event",
+            "prompt_async",
+            "messages"
+        ]
+    );
+    assert_eq!(stored_refs(&home)[0].session_id, "ses_after_cut");
 }
 
 #[test]
@@ -211,7 +380,7 @@ fn killed_session_created_phase_is_queried_without_a_prompt() {
     assert!(listed.status.success());
     let list: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(list["items"][0]["state"], "session_created");
-    assert_eq!(routes(&requests), ["session", "messages"]);
+    assert_eq!(routes(&requests), ["agents", "session", "messages"]);
     assert!(!routes(&requests).contains(&"prompt_async"));
 }
 
@@ -225,6 +394,9 @@ fn killed_running_phase_persists_production_intent_before_ref_materialization() 
         ),
         respond(200, "text/event-stream", b""),
         respond(204, "text/plain", b""),
+        FailureAction::EchoPrompt {
+            session_id: "ses_running_before_crash".to_owned(),
+        },
     ]);
 
     let killed = Command::new(env!("CARGO_BIN_EXE_oca"))
@@ -236,7 +408,10 @@ fn killed_running_phase_persists_production_intent_before_ref_materialization() 
         .unwrap();
     let requests = server.join().expect("failure server thread");
     assert_eq!(killed.status.code(), Some(86));
-    assert_eq!(routes(&requests), ["session", "event", "prompt_async"]);
+    assert_eq!(
+        routes(&requests),
+        ["agents", "session", "event", "prompt_async", "messages"]
+    );
 
     let intent_files = intent_json_files(home.path());
     assert_eq!(intent_files.len(), 1);
@@ -270,18 +445,30 @@ fn mid_sse_cut_keeps_the_admitted_prompt_exactly_once() {
             [b": connected\n\n".to_vec()],
         )),
         respond(204, "text/plain", b""),
+        FailureAction::EchoPrompt {
+            session_id: "ses_stream_cut".to_owned(),
+        },
+        respond(200, "application/json", b"[]"),
         respond(200, "application/json", b"[]"),
     ]);
 
     let output = run(&home, ["--json", "luna:h", "--headless", "stream", "once"]);
     let requests = server.join().expect("failure server thread");
 
-    assert_eq!(output.status.code(), Some(exit::SERVER_UNREACHABLE));
+    assert_eq!(output.status.code(), Some(exit::FAILURE));
     let error = parsed_error(&output);
-    assert_eq!(error.code(), ErrorCode::ServerUnreachable.as_str());
+    assert_eq!(error.code(), ErrorCode::ProtocolMismatch.as_str());
     assert_eq!(
         routes(&requests),
-        ["session", "event", "prompt_async", "messages"]
+        [
+            "agents",
+            "session",
+            "event",
+            "prompt_async",
+            "messages",
+            "messages",
+            "messages"
+        ]
     );
     assert_eq!(
         routes(&requests)
@@ -293,6 +480,13 @@ fn mid_sse_cut_keeps_the_admitted_prompt_exactly_once() {
     let records = stored_refs(&home);
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].last_state, Some(RefState::Running));
+
+    let listed = run(&home, ["ls", "--all", "--json"]);
+    assert!(listed.status.success());
+    let list: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(list["total"], 1);
+    assert_eq!(list["items"][0]["ref"], records[0].id);
+    assert_eq!(list["items"][0]["state"], "running");
 }
 
 #[test]
@@ -305,7 +499,7 @@ fn every_429_is_terminal_rate_limited_with_retry_metadata_and_no_replay() {
     let output = run(&home, ["--json", "luna:h", "-b", "--headless", "limited"]);
     let requests = server.join().expect("failure server thread");
     assert_rate_limit(&output, Some(2_000));
-    assert_eq!(routes(&requests), ["session"]);
+    assert_eq!(routes(&requests), ["agents", "session"]);
     assert!(stored_refs(&home).is_empty());
 
     let (home, server) = fixture([
@@ -323,7 +517,10 @@ fn every_429_is_terminal_rate_limited_with_retry_metadata_and_no_replay() {
     let output = run(&home, ["--json", "luna:h", "-b", "--headless", "limited"]);
     let requests = server.join().expect("failure server thread");
     assert_rate_limit(&output, Some(1_750));
-    assert_eq!(routes(&requests), ["session", "event", "prompt_async"]);
+    assert_eq!(
+        routes(&requests),
+        ["agents", "session", "event", "prompt_async"]
+    );
     assert_eq!(
         routes(&requests)
             .iter()
@@ -333,7 +530,7 @@ fn every_429_is_terminal_rate_limited_with_retry_metadata_and_no_replay() {
     );
     assert!(stored_refs(&home).is_empty());
 
-    let (home, server) = fixture([FailureAction::Respond(HttpResponse::new(
+    let (home, server) = fixture_without_agents([FailureAction::Respond(HttpResponse::new(
         429,
         [("content-type", "application/json"), ("retry-after", "4")],
         [br#"{"error":"follow limited"}"#.to_vec()],
@@ -366,7 +563,87 @@ fn every_429_is_terminal_rate_limited_with_retry_metadata_and_no_replay() {
     assert_eq!(routes(&requests), ["event"]);
 }
 
+#[test]
+fn unregistered_dispatch_agent_fails_before_prompt_and_leaves_list_in_agreement() {
+    let (home, server) = fixture_with_agents("build", []);
+    init_repository(home.path());
+
+    let output = run(
+        &home,
+        [
+            "--json",
+            "luna:h",
+            "-w",
+            "-b",
+            "--headless",
+            "agent",
+            "must",
+            "exist",
+        ],
+    );
+    let requests = server.join().expect("failure server thread");
+
+    assert_eq!(output.status.code(), Some(exit::FAILURE));
+    assert!(output.stdout.is_empty());
+    let error = parsed_error(&output);
+    assert_eq!(error.code(), ErrorCode::ProtocolMismatch.as_str());
+    assert!(error.error().contains("`impl`"));
+    assert!(error.error().contains("dispatch directory"));
+    assert!(error.help().contains("OpenCode configuration"));
+    assert_eq!(routes(&requests), ["agents"]);
+    assert!(!routes(&requests).contains(&"prompt_async"));
+    assert!(stored_refs(&home).is_empty());
+    assert!(intent_json_files(home.path()).is_empty());
+    assert!(!git_branches(home.path()).contains("oca/"));
+    assert!(
+        !home.path().join(".config/opencode/opencode.jsonc").exists(),
+        "oca must never register agents by mutating OpenCode configuration"
+    );
+
+    let listed = run(&home, ["ls", "--all", "--json"]);
+    assert!(listed.status.success());
+    let list: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(list["total"], 0);
+}
+
 fn fixture(
+    actions: impl IntoIterator<Item = FailureAction>,
+) -> (
+    tempfile::TempDir,
+    thread::JoinHandle<Vec<oca_testkit::HttpRequest>>,
+) {
+    fixture_with_agents("impl", actions)
+}
+
+fn fixture_with_agents(
+    agent: &str,
+    actions: impl IntoIterator<Item = FailureAction>,
+) -> (
+    tempfile::TempDir,
+    thread::JoinHandle<Vec<oca_testkit::HttpRequest>>,
+) {
+    let agent_body = format!(r#"[{{"name":"{agent}"}}]"#);
+    let actions = std::iter::once(respond(200, "application/json", agent_body.as_bytes()))
+        .chain(actions)
+        .collect::<Vec<_>>();
+    let server = FailureHttpServer::bind("127.0.0.1:0", actions).expect("failure server binds");
+    let port = server.local_addr().expect("failure server address").port();
+    let home = tempfile::tempdir().expect("temporary home");
+    let state = home.path().join(".oca");
+    std::fs::create_dir(&state).expect("state directory");
+    std::fs::write(state.join("config.toml"), "").expect("default config");
+    ConnectOrStart::new(&state, port, [], std::time::Duration::from_secs(1))
+        .write_record(&ServerRecord::new(
+            port,
+            installed_opencode_version(),
+            environment_hash_for(home.path()),
+        ))
+        .expect("server record");
+    let server = thread::spawn(move || server.serve().expect("failure script completes"));
+    (home, server)
+}
+
+fn fixture_without_agents(
     actions: impl IntoIterator<Item = FailureAction>,
 ) -> (
     tempfile::TempDir,
@@ -387,6 +664,74 @@ fn fixture(
         .expect("server record");
     let server = thread::spawn(move || server.serve().expect("failure script completes"));
     (home, server)
+}
+
+fn missing_prompt_fixture(
+    session_id: &str,
+) -> (
+    tempfile::TempDir,
+    thread::JoinHandle<Vec<oca_testkit::HttpRequest>>,
+) {
+    let session = format!(r#"{{"id":"{session_id}"}}"#);
+    let actions = [
+        respond(200, "application/json", session.as_bytes()),
+        respond(200, "text/event-stream", b""),
+        respond(204, "text/plain", b""),
+    ]
+    .into_iter()
+    .chain(std::iter::repeat_with(|| respond(200, "application/json", b"[]")).take(13));
+    fixture(actions)
+}
+
+fn assert_uncertain_missing_prompt(
+    home: &tempfile::TempDir,
+    output: &std::process::Output,
+    requests: &[oca_testkit::HttpRequest],
+    session_id: &str,
+) {
+    assert_eq!(output.status.code(), Some(exit::FAILURE));
+    assert!(output.stdout.is_empty());
+    let error = parsed_error(output);
+    assert_eq!(error.code(), ErrorCode::PromptUncertain.as_str());
+    let reference = error.reference().expect("uncertain ref is surfaced");
+    assert_eq!(
+        routes(requests)[..4],
+        ["agents", "session", "event", "prompt_async"]
+    );
+    assert!(
+        routes(requests)[4..]
+            .iter()
+            .all(|route| *route == "messages")
+    );
+    assert_eq!(
+        routes(requests)
+            .iter()
+            .filter(|route| **route == "prompt_async")
+            .count(),
+        1,
+        "confirmation must never replay a missing prompt"
+    );
+
+    let records = stored_refs(home);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].id, reference);
+    assert_eq!(records[0].session_id, session_id);
+    assert_eq!(records[0].last_state, Some(RefState::Unknown));
+
+    let intents = intent_json_files(home.path());
+    assert_eq!(intents.len(), 1);
+    let intent: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&intents[0]).unwrap()).unwrap();
+    assert_eq!(intent["phase"], "prompt_uncertain");
+    assert_eq!(intent["ref"], reference);
+    assert_eq!(intent["session_id"], session_id);
+
+    let listed = run(home, ["ls", "--all", "--json"]);
+    assert!(listed.status.success());
+    let list: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(list["total"], 1);
+    assert_eq!(list["items"][0]["ref"], reference);
+    assert_eq!(list["items"][0]["state"], "prompt_uncertain");
 }
 
 fn respond(status: u16, content_type: &str, body: &[u8]) -> FailureAction {
@@ -491,7 +836,9 @@ fn routes(requests: &[oca_testkit::HttpRequest]) -> Vec<&'static str> {
                 .path
                 .split_once('?')
                 .map_or(request.path.as_str(), |pair| pair.0);
-            if path == "/session" {
+            if path == "/agent" {
+                "agents"
+            } else if path == "/session" {
                 "session"
             } else if path == "/event" {
                 "event"

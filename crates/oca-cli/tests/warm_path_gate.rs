@@ -19,14 +19,18 @@ use std::{
 };
 
 use oca_state::{RefRecord, RefState, RefStore, RefStorePaths};
-use serde_json::json;
+use serde_json::{Value, json};
 
 const WARMUP_INVOCATIONS: usize = 10;
 const MEASURED_INVOCATIONS: usize = 100;
-const WARM_P95_LIMIT: Duration = Duration::from_millis(10);
+// Issue #60 adds two synchronous admission proofs: the directory-scoped agent
+// precheck and the authoritative prompt-history confirmation. Keep a hard
+// process-to-ack ceiling for that safer five-request prefix without pretending
+// it still has the latency profile of the previous three-request path.
+const WARM_P95_LIMIT: Duration = Duration::from_millis(25);
 
 #[test]
-fn warm_subprocess_ack_p95_is_under_ten_milliseconds() {
+fn warm_safe_admission_p95_is_under_twenty_five_milliseconds() {
     let fixture = WarmFixture::new();
 
     for _ in 0..WARMUP_INVOCATIONS {
@@ -53,7 +57,7 @@ fn warm_subprocess_ack_p95_is_under_ten_milliseconds() {
     );
     assert!(
         p95 < WARM_P95_LIMIT,
-        "warm dispatch exceeded the hard 10 ms ack gate: p50={:.3} ms, p95={:.3} ms, samples_ms={:?}",
+        "warm dispatch exceeded the hard 25 ms safe-admission gate: p50={:.3} ms, p95={:.3} ms, samples_ms={:?}",
         milliseconds(median),
         milliseconds(p95),
         elapsed
@@ -76,6 +80,43 @@ fn warm_ack_has_no_forbidden_network_process_or_herdr_operation() {
         "the warm path must not start git, OpenCode probes, interpreters, or SDK commands"
     );
     fixture.assert_no_herdr_call();
+}
+
+#[test]
+fn live_but_garbling_event_stream_is_a_protocol_mismatch() {
+    let fixture = WarmFixture::with_stream_failure(StreamFailure::MalformedChunk);
+    let mut command = fixture.command(["luna:h", "--headless", "garbled", "stream"]);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+    let mut child = command.spawn().expect("garbling subprocess starts");
+    let mut stdout = BufReader::new(child.stdout.take().expect("child stdout is piped"));
+    let mut acknowledgement = String::new();
+    stdout
+        .read_line(&mut acknowledgement)
+        .expect("acknowledgement reads");
+    assert!(acknowledgement.starts_with('w'));
+    fixture.server.acknowledge();
+
+    let status = child.wait().expect("garbling subprocess exits");
+    let mut stderr = Vec::new();
+    child
+        .stderr
+        .take()
+        .expect("child stderr is piped")
+        .read_to_end(&mut stderr)
+        .expect("child stderr reads");
+    fixture.server.barrier();
+
+    let stderr = String::from_utf8(stderr).unwrap();
+    assert_eq!(status.code(), Some(1), "unexpected stderr: {stderr}");
+    assert!(
+        stderr.contains("protocol_mismatch"),
+        "unexpected stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("SSE source failed: error decoding response body"),
+        "the live response-body decode failure must be preserved: {stderr}"
+    );
 }
 
 #[test]
@@ -196,6 +237,7 @@ fn warm_prefix_sources_reject_forbidden_operation_families() {
             "backend.create_session(",
             "backend.subscribe(",
             "backend.prompt_async(",
+            "backend.confirm_prompt_landed(",
             "backend.write_ref(",
             "backend.acknowledge(",
             "backend.spawn_attach(",
@@ -270,11 +312,15 @@ struct WarmFixture {
 
 impl WarmFixture {
     fn new() -> Self {
+        Self::with_stream_failure(StreamFailure::DropReconciliation)
+    }
+
+    fn with_stream_failure(stream_failure: StreamFailure) -> Self {
         let home = tempfile::tempdir().expect("temporary home");
         let repo = tempfile::tempdir().expect("temporary repository");
         fs::create_dir(repo.path().join(".git")).expect("repository marker");
 
-        let server = FakeServer::start();
+        let server = FakeServer::start(stream_failure);
         let state = home.path().join(".oca");
         fs::create_dir(&state).expect("state directory");
         fs::write(
@@ -368,17 +414,20 @@ impl WarmFixture {
                 .iter()
                 .map(|path| route(path))
                 .collect::<Vec<_>>(),
-            ["session.create", "event.subscribe", "session.prompt_async"],
+            [
+                "agent.list",
+                "session.create",
+                "event.subscribe",
+                "session.prompt_async",
+                "session.messages"
+            ],
             "the warm path made a forbidden request before acknowledgement"
         );
         assert!(
             sample.pre_ack_requests.iter().all(|path| {
-                !path.contains("health")
-                    && !path.contains("status")
-                    && !path.ends_with("/message")
-                    && path != "/doc"
+                !path.contains("health") && !path.contains("status") && path != "/doc"
             }),
-            "health, status, documentation, and full-history reads are forbidden before ack: {:?}",
+            "health, status, and documentation reads are forbidden before ack: {:?}",
             sample.pre_ack_requests
         );
     }
@@ -447,6 +496,7 @@ fn finish_after_ack(child: &mut Child) {
         "unexpected post-ack failure: {}",
         String::from_utf8_lossy(&stderr)
     );
+    assert_eq!(status.code(), Some(5));
 }
 
 fn install_process_spies(directory: &Path) {
@@ -482,15 +532,34 @@ struct ServerState {
 struct CurrentDispatch {
     awaiting_ack: bool,
     pre_ack_requests: Vec<String>,
+    session_id: String,
+    message_id: Option<String>,
+    prompt_text: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamFailure {
+    DropReconciliation,
+    MalformedChunk,
+}
+
+enum ServerResponse {
+    Normal {
+        status: &'static str,
+        content_type: &'static str,
+        body: String,
+    },
+    Drop,
+    MalformedChunk,
 }
 
 impl FakeServer {
-    fn start() -> Self {
+    fn start(stream_failure: StreamFailure) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").expect("warm fake server binds");
         let port = listener.local_addr().expect("fake server address").port();
         let shared = Arc::new((Mutex::new(ServerState::default()), Condvar::new()));
         let server_shared = Arc::clone(&shared);
-        let worker = thread::spawn(move || serve(listener, &server_shared));
+        let worker = thread::spawn(move || serve(listener, &server_shared, stream_failure));
         Self {
             port,
             shared,
@@ -561,7 +630,11 @@ impl Drop for FakeServer {
     }
 }
 
-fn serve(listener: TcpListener, shared: &Arc<(Mutex<ServerState>, Condvar)>) {
+fn serve(
+    listener: TcpListener,
+    shared: &Arc<(Mutex<ServerState>, Condvar)>,
+    stream_failure: StreamFailure,
+) {
     loop {
         let (mut stream, _) = listener.accept().expect("fake server accepts");
         {
@@ -570,9 +643,10 @@ fn serve(listener: TcpListener, shared: &Arc<(Mutex<ServerState>, Condvar)>) {
                 return;
             }
         }
-        let Some(path) = read_request_path(&mut stream) else {
+        let Some(request) = read_request(&mut stream) else {
             continue;
         };
+        let path = request.path;
         if path == "/__warm_test_barrier" {
             write_response(&mut stream, "204 No Content", "text/plain", "");
             let (lock, ready) = &**shared;
@@ -581,22 +655,39 @@ fn serve(listener: TcpListener, shared: &Arc<(Mutex<ServerState>, Condvar)>) {
             continue;
         }
 
-        let (response_status, response_type, response_body, wait_for_ack) = {
+        let (response, wait_for_ack) = {
             let (lock, _) = &**shared;
             let mut state = lock.lock().expect("server state locks");
             state.requests.push(path.clone());
 
-            if path.starts_with("/session?") {
-                state.next_session += 1;
-                let session_id = format!("ses_warm_{}", state.next_session);
+            if path.starts_with("/agent?") {
                 state.current = Some(CurrentDispatch {
                     awaiting_ack: true,
                     pre_ack_requests: vec![path.clone()],
+                    session_id: String::new(),
+                    message_id: None,
+                    prompt_text: None,
                 });
                 (
-                    "200 OK",
-                    "application/json",
-                    format!(r#"{{"id":"{session_id}"}}"#),
+                    ServerResponse::Normal {
+                        status: "200 OK",
+                        content_type: "application/json",
+                        body: r#"[{"name":"impl"}]"#.to_owned(),
+                    },
+                    false,
+                )
+            } else if path.starts_with("/session?") {
+                state.next_session += 1;
+                let session_id = format!("ses_warm_{}", state.next_session);
+                let current = state.current.as_mut().expect("agent probe starts dispatch");
+                current.pre_ack_requests.push(path.clone());
+                current.session_id.clone_from(&session_id);
+                (
+                    ServerResponse::Normal {
+                        status: "200 OK",
+                        content_type: "application/json",
+                        body: format!(r#"{{"id":"{session_id}"}}"#),
+                    },
                     false,
                 )
             } else {
@@ -615,17 +706,90 @@ fn serve(listener: TcpListener, shared: &Arc<(Mutex<ServerState>, Condvar)>) {
                 }
 
                 if path == "/event" {
-                    ("200 OK", "text/event-stream", String::new(), false)
+                    let response = match stream_failure {
+                        StreamFailure::DropReconciliation => ServerResponse::Normal {
+                            status: "200 OK",
+                            content_type: "text/event-stream",
+                            body: String::new(),
+                        },
+                        StreamFailure::MalformedChunk => ServerResponse::MalformedChunk,
+                    };
+                    (response, false)
                 } else if path.ends_with("/prompt_async") {
-                    ("204 No Content", "text/plain", String::new(), true)
+                    let current = state.current.as_mut().expect("active dispatch");
+                    current.message_id = request.body["messageID"].as_str().map(ToOwned::to_owned);
+                    current.prompt_text = request.body["parts"][0]["text"]
+                        .as_str()
+                        .map(ToOwned::to_owned);
+                    (
+                        ServerResponse::Normal {
+                            status: "204 No Content",
+                            content_type: "text/plain",
+                            body: String::new(),
+                        },
+                        false,
+                    )
                 } else if path.ends_with("/message") {
-                    ("200 OK", "application/json", "[]".to_owned(), false)
+                    let current = state.current.as_ref().expect("active dispatch");
+                    if current.awaiting_ack {
+                        let body = json!([{
+                            "info": {
+                                "id": current.message_id.as_deref().unwrap(),
+                                "sessionID": current.session_id,
+                                "role": "user"
+                            },
+                            "parts": [{
+                                "type": "text",
+                                "text": current.prompt_text.as_deref().unwrap()
+                            }]
+                        }])
+                        .to_string();
+                        (
+                            ServerResponse::Normal {
+                                status: "200 OK",
+                                content_type: "application/json",
+                                body,
+                            },
+                            true,
+                        )
+                    } else {
+                        let response = match stream_failure {
+                            StreamFailure::DropReconciliation => ServerResponse::Drop,
+                            StreamFailure::MalformedChunk => ServerResponse::Normal {
+                                status: "200 OK",
+                                content_type: "application/json",
+                                body: "[]".to_owned(),
+                            },
+                        };
+                        (response, false)
+                    }
                 } else {
-                    ("200 OK", "application/json", "{}".to_owned(), false)
+                    (
+                        ServerResponse::Normal {
+                            status: "200 OK",
+                            content_type: "application/json",
+                            body: "{}".to_owned(),
+                        },
+                        false,
+                    )
                 }
             }
         };
-        write_response(&mut stream, response_status, response_type, &response_body);
+        match response {
+            ServerResponse::Normal {
+                status,
+                content_type,
+                body,
+            } => write_response(&mut stream, status, content_type, &body),
+            ServerResponse::Drop => {}
+            ServerResponse::MalformedChunk => {
+                stream
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\nnot-a-chunk\r\n",
+                    )
+                    .expect("malformed SSE response writes");
+            }
+        }
 
         if wait_for_ack {
             let (lock, ready) = &**shared;
@@ -645,16 +809,40 @@ fn serve(listener: TcpListener, shared: &Arc<(Mutex<ServerState>, Condvar)>) {
     }
 }
 
-fn read_request_path(stream: &mut TcpStream) -> Option<String> {
+struct FakeRequest {
+    path: String,
+    body: Value,
+}
+
+fn read_request(stream: &mut TcpStream) -> Option<FakeRequest> {
     let mut reader = BufReader::new(stream.try_clone().expect("request stream clones"));
     let mut request_line = String::new();
     reader
         .read_line(&mut request_line)
         .expect("request line reads");
-    request_line
+    let path = request_line
         .split_whitespace()
         .nth(1)
-        .map(ToOwned::to_owned)
+        .map(ToOwned::to_owned)?;
+    let mut content_length = 0;
+    loop {
+        let mut line = String::new();
+        reader.read_line(&mut line).expect("request header reads");
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
+        if let Some(value) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+            content_length = value.trim().parse().expect("content length");
+        }
+    }
+    let mut bytes = vec![0; content_length];
+    reader.read_exact(&mut bytes).expect("request body reads");
+    let body = if bytes.is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(&bytes).expect("request JSON")
+    };
+    Some(FakeRequest { path, body })
 }
 
 fn write_response(stream: &mut TcpStream, status: &str, content_type: &str, body: &str) {
@@ -667,14 +855,16 @@ fn write_response(stream: &mut TcpStream, status: &str, content_type: &str, body
 }
 
 fn route(path: &str) -> &'static str {
-    if path.starts_with("/session?") {
+    if path.starts_with("/agent?") {
+        "agent.list"
+    } else if path.starts_with("/session?") {
         "session.create"
     } else if path == "/event" {
         "event.subscribe"
     } else if path.ends_with("/prompt_async") {
         "session.prompt_async"
     } else if path.ends_with("/message") {
-        "messages"
+        "session.messages"
     } else if path.contains("health") {
         "health"
     } else if path.contains("status") {

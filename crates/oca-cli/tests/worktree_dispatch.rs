@@ -101,12 +101,22 @@ fn worktree_rate_limit_creates_no_commit() {
 
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("code: rate_limited"));
-    let record = only_stored_ref(home.path());
-    let worktree = PathBuf::from(record["worktree"].as_str().unwrap());
-    assert!(record.get("commit").is_none());
+    let refs: Vec<Value> =
+        serde_json::from_slice(&std::fs::read(home.path().join(".oca/refs.json")).unwrap())
+            .unwrap();
+    assert!(
+        refs.is_empty(),
+        "rejected prompt must discard its reserved ref"
+    );
     assert_eq!(
-        git_output(&worktree, ["rev-list", "--count", "HEAD"]).trim(),
+        git_output(repository.path(), ["rev-list", "--count", "HEAD"]).trim(),
         "1"
+    );
+    assert!(
+        git_output(repository.path(), ["branch", "--list", "oca/*"])
+            .trim()
+            .is_empty(),
+        "rejected prompt must clean its reserved branch and worktree"
     );
 }
 
@@ -286,8 +296,9 @@ enum ReviewReply {
 fn serve_partial_then_review(listener: TcpListener, review: ReviewReply) {
     let mut worktree = None;
     let mut first_message = None;
+    let mut first_prompt = None;
     let mut second_message = None;
-    for index in 0..8 {
+    for index in 0..9 {
         let (mut stream, _) = listener.accept().expect("fake accepts request");
         let request = read_request(&mut stream);
         match index {
@@ -302,22 +313,38 @@ fn serve_partial_then_review(listener: TcpListener, review: ReviewReply) {
                     &mut stream,
                     "200 OK",
                     "application/json",
-                    r#"{"id":"ses_worktree"}"#,
+                    r#"[{"name":"impl"}]"#,
                 );
             }
             1 => write_response(
                 &mut stream,
                 "200 OK",
+                "application/json",
+                r#"{"id":"ses_worktree"}"#,
+            ),
+            2 => write_response(
+                &mut stream,
+                "200 OK",
                 "text/event-stream",
                 "id: evt_one\nevent: session.idle\ndata: {\"sessionID\":\"ses_worktree\"}\n\n",
             ),
-            2 => {
+            3 => {
                 first_message = request.body["messageID"].as_str().map(ToOwned::to_owned);
+                first_prompt = request.body["parts"][0]["text"]
+                    .as_str()
+                    .map(ToOwned::to_owned);
                 std::fs::write(worktree.as_ref().unwrap().join("first.txt"), "partial\n").unwrap();
                 write_response(&mut stream, "204 No Content", "text/plain", "");
             }
-            3 => write_response(&mut stream, "200 OK", "application/json", "[]"),
             4 => {
+                let body = user_reply(
+                    "ses_worktree",
+                    first_message.as_deref().unwrap(),
+                    first_prompt.as_deref().unwrap(),
+                );
+                write_response(&mut stream, "200 OK", "application/json", &body.to_string());
+            }
+            5 => {
                 let body = assistant_reply(
                     first_message.as_deref().unwrap(),
                     "partial",
@@ -325,13 +352,13 @@ fn serve_partial_then_review(listener: TcpListener, review: ReviewReply) {
                 );
                 write_response(&mut stream, "200 OK", "application/json", &body.to_string());
             }
-            5 => {
+            6 => {
                 second_message = request.body["messageID"].as_str().map(ToOwned::to_owned);
                 std::fs::write(worktree.as_ref().unwrap().join("second.txt"), "review\n").unwrap();
                 write_response(&mut stream, "204 No Content", "text/plain", "");
             }
-            6 => write_response(&mut stream, "200 OK", "text/event-stream", ""),
-            7 => {
+            7 => write_response(&mut stream, "200 OK", "text/event-stream", ""),
+            8 => {
                 let note = match review {
                     ReviewReply::Valid => {
                         "Applied every review finding in the existing worktree without changing the original task identity or commit message source. Verified the second checkpoint is complete and independently reviewable. WORKER-SUPPLIED"
@@ -347,7 +374,7 @@ fn serve_partial_then_review(listener: TcpListener, review: ReviewReply) {
 }
 
 fn serve_rate_limit(listener: TcpListener) {
-    for index in 0..3 {
+    for index in 0..4 {
         let (mut stream, _) = listener.accept().expect("fake accepts request");
         let request = read_request(&mut stream);
         match index {
@@ -358,11 +385,17 @@ fn serve_rate_limit(listener: TcpListener) {
                     &mut stream,
                     "200 OK",
                     "application/json",
-                    r#"{"id":"ses_limited"}"#,
+                    r#"[{"name":"impl"}]"#,
                 );
             }
-            1 => write_response(&mut stream, "200 OK", "text/event-stream", ""),
-            2 => write_response(
+            1 => write_response(
+                &mut stream,
+                "200 OK",
+                "application/json",
+                r#"{"id":"ses_limited"}"#,
+            ),
+            2 => write_response(&mut stream, "200 OK", "text/event-stream", ""),
+            3 => write_response(
                 &mut stream,
                 "429 Too Many Requests",
                 "text/plain",
@@ -375,7 +408,8 @@ fn serve_rate_limit(listener: TcpListener) {
 
 fn serve_completed_worktree(listener: TcpListener) {
     let mut message_id = None;
-    for index in 0..4 {
+    let mut prompt_text = None;
+    for index in 0..6 {
         let (mut stream, _) = listener.accept().expect("fake accepts request");
         let request = read_request(&mut stream);
         match index {
@@ -387,15 +421,32 @@ fn serve_completed_worktree(listener: TcpListener) {
                     &mut stream,
                     "200 OK",
                     "application/json",
-                    r#"{"id":"ses_recovery"}"#,
+                    r#"[{"name":"impl"}]"#,
                 );
             }
-            1 => write_response(&mut stream, "200 OK", "text/event-stream", ""),
-            2 => {
+            1 => write_response(
+                &mut stream,
+                "200 OK",
+                "application/json",
+                r#"{"id":"ses_recovery"}"#,
+            ),
+            2 => write_response(&mut stream, "200 OK", "text/event-stream", ""),
+            3 => {
                 message_id = request.body["messageID"].as_str().map(ToOwned::to_owned);
+                prompt_text = request.body["parts"][0]["text"]
+                    .as_str()
+                    .map(ToOwned::to_owned);
                 write_response(&mut stream, "204 No Content", "text/plain", "");
             }
-            3 => {
+            4 => {
+                let body = user_reply(
+                    "ses_recovery",
+                    message_id.as_deref().unwrap(),
+                    prompt_text.as_deref().unwrap(),
+                );
+                write_response(&mut stream, "200 OK", "application/json", &body.to_string());
+            }
+            5 => {
                 let body = json!([{
                     "info": {
                         "id":"msg_assistant_recovery",
@@ -421,7 +472,8 @@ fn serve_completed_worktree(listener: TcpListener) {
 fn serve_invalid_reply(listener: TcpListener, invalid: InvalidReply) {
     let mut worktree = None;
     let mut message_id = None;
-    for index in 0..5 {
+    let mut prompt_text = None;
+    for index in 0..6 {
         let (mut stream, _) = listener.accept().expect("fake accepts request");
         let request = read_request(&mut stream);
         match index {
@@ -433,17 +485,26 @@ fn serve_invalid_reply(listener: TcpListener, invalid: InvalidReply) {
                     &mut stream,
                     "200 OK",
                     "application/json",
-                    r#"{"id":"ses_invalid"}"#,
+                    r#"[{"name":"impl"}]"#,
                 );
             }
             1 => write_response(
                 &mut stream,
                 "200 OK",
+                "application/json",
+                r#"{"id":"ses_invalid"}"#,
+            ),
+            2 => write_response(
+                &mut stream,
+                "200 OK",
                 "text/event-stream",
                 "id: evt_invalid\nevent: session.idle\ndata: {\"sessionID\":\"ses_invalid\"}\n\n",
             ),
-            2 => {
+            3 => {
                 message_id = request.body["messageID"].as_str().map(ToOwned::to_owned);
+                prompt_text = request.body["parts"][0]["text"]
+                    .as_str()
+                    .map(ToOwned::to_owned);
                 std::fs::write(
                     worktree.as_ref().unwrap().join("worker.txt"),
                     "worker bytes\n",
@@ -451,8 +512,15 @@ fn serve_invalid_reply(listener: TcpListener, invalid: InvalidReply) {
                 .unwrap();
                 write_response(&mut stream, "204 No Content", "text/plain", "");
             }
-            3 => write_response(&mut stream, "200 OK", "application/json", "[]"),
             4 => {
+                let body = user_reply(
+                    "ses_invalid",
+                    message_id.as_deref().unwrap(),
+                    prompt_text.as_deref().unwrap(),
+                );
+                write_response(&mut stream, "200 OK", "application/json", &body.to_string());
+            }
+            5 => {
                 let structured = match invalid {
                     InvalidReply::Structural => json!({
                         "status":"done", "files":[], "note":"This structurally invalid report deliberately carries an unexpected field after the worker writes its output. The client must reject it before staging or committing any byte.", "unexpected":true
@@ -489,6 +557,17 @@ fn assistant_reply(parent: &str, status: &str, note: &str) -> Value {
             "structured":{"status":status,"files":[],"note":note}
         },
         "parts":[]
+    }])
+}
+
+fn user_reply(session_id: &str, message_id: &str, text: &str) -> Value {
+    json!([{
+        "info": {
+            "id": message_id,
+            "sessionID": session_id,
+            "role": "user"
+        },
+        "parts": [{"type":"text","text":text}]
     }])
 }
 

@@ -2,7 +2,7 @@
 
 use std::{path::Path, time::Duration};
 
-use oca_core::{DisplayMode, FollowOutcome, FollowTarget, follow_until_terminal};
+use oca_core::{DisplayMode, FollowOutcome, FollowTarget, RefId, follow_until_terminal};
 use oca_display::{HerdrClient, TmuxClient};
 use oca_opencode::OpenCodeClient;
 use oca_server::ConnectOrStart;
@@ -40,6 +40,8 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
     let message_id = record
         .message_id
         .ok_or_else(|| format!("ref `{}` has no attributed message id", command.reference))?;
+    let reference = RefId::new(record.id)
+        .map_err(|error| format!("ref `{}` is invalid: {error}", command.reference))?;
     let mode = match record.display.as_deref() {
         Some("herdr") => DisplayMode::Herdr,
         Some("tmux") => DisplayMode::Tmux,
@@ -60,11 +62,32 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
 
     match mode {
         DisplayMode::Herdr => {
-            run_herdr_attach(command, home, &config, &refs, &base_url, message_id).await
+            let turn = AttachTurn {
+                state_directory: &state_directory,
+                reference: &reference,
+                base_url: &base_url,
+                message_id: &message_id,
+            };
+            run_herdr_attach(command, home, &config, &refs, turn).await
         }
-        DisplayMode::Tmux => run_tmux_attach(command, &base_url, message_id).await,
+        DisplayMode::Tmux => {
+            let turn = AttachTurn {
+                state_directory: &state_directory,
+                reference: &reference,
+                base_url: &base_url,
+                message_id: &message_id,
+            };
+            run_tmux_attach(command, turn).await
+        }
         DisplayMode::Headless => Ok(()),
     }
+}
+
+struct AttachTurn<'a> {
+    state_directory: &'a Path,
+    reference: &'a RefId,
+    base_url: &'a Url,
+    message_id: &'a str,
 }
 
 async fn run_herdr_attach(
@@ -72,8 +95,7 @@ async fn run_herdr_attach(
     home: &Path,
     config: &OcaConfig,
     refs: &RefStore,
-    base_url: &Url,
-    message_id: String,
+    turn: AttachTurn<'_>,
 ) -> Result<(), String> {
     let configured_socket =
         (!config.herdr.socket.is_empty()).then(|| Path::new(config.herdr.socket.as_str()));
@@ -100,6 +122,8 @@ async fn run_herdr_attach(
                 &tab,
                 vec![
                     "opencode".to_owned(),
+                    "attach".to_owned(),
+                    turn.base_url.to_string(),
                     "--session".to_owned(),
                     command.session_id.clone(),
                 ],
@@ -112,15 +136,18 @@ async fn run_herdr_attach(
         )
         .map_err(|error| format!("could not record herdr tab: {error}"))?;
 
+        let mut journal =
+            EventJournal::create(turn.state_directory, turn.reference, turn.message_id)
+                .map_err(|error| format!("could not create event journal: {error}"))?;
         let target = FollowTarget {
             session_id: command.session_id.clone(),
-            message_id,
+            message_id: turn.message_id.to_owned(),
         };
         follow_until_terminal::<_, EventJournal>(
-            &OpenCodeClient::new(base_url.clone()),
+            &OpenCodeClient::new(turn.base_url.clone()),
             &target,
             None,
-            None,
+            Some(&mut journal),
         )
         .await
         .map_err(|error| format!("could not follow worker terminal state: {error}"))
@@ -142,27 +169,29 @@ async fn run_herdr_attach(
     }
 }
 
-async fn run_tmux_attach(
-    command: &AttachCommand,
-    base_url: &Url,
-    message_id: String,
-) -> Result<(), String> {
+async fn run_tmux_attach(command: &AttachCommand, turn: AttachTurn<'_>) -> Result<(), String> {
     let tmux = TmuxClient::default();
     let window = tmux
         .new_window(&command.reference, &command.session_id, &command.cwd)
         .map_err(|error| error.to_string())?;
-    let target = FollowTarget {
-        session_id: command.session_id.clone(),
-        message_id,
-    };
-    let follow_result = follow_until_terminal::<_, EventJournal>(
-        &OpenCodeClient::new(base_url.clone()),
-        &target,
-        None,
-        None,
-    )
-    .await
-    .map_err(|error| format!("could not follow worker terminal state: {error}"));
+    let follow_result = async {
+        let mut journal =
+            EventJournal::create(turn.state_directory, turn.reference, turn.message_id)
+                .map_err(|error| format!("could not create event journal: {error}"))?;
+        let target = FollowTarget {
+            session_id: command.session_id.clone(),
+            message_id: turn.message_id.to_owned(),
+        };
+        follow_until_terminal::<_, EventJournal>(
+            &OpenCodeClient::new(turn.base_url.clone()),
+            &target,
+            None,
+            Some(&mut journal),
+        )
+        .await
+        .map_err(|error| format!("could not follow worker terminal state: {error}"))
+    }
+    .await;
 
     match follow_result {
         Ok(FollowOutcome::Terminal(_)) => tmux

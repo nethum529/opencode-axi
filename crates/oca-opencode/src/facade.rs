@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{error::Error as _, fmt, io};
 
 use oca_core::{PermissionProfile, ResolvedModel};
 use reqwest::{Method, StatusCode, header};
@@ -7,7 +7,8 @@ use serde_json::{Map, Value, json};
 use url::Url;
 
 use crate::{
-    RateLimit, SseChunkSource, SseError, SseEvent, SseStream, TransmissionStage, generated,
+    RateLimit, SseChunkSource, SseError, SseEvent, SseSourceErrorKind, SseStream,
+    TransmissionStage, generated,
 };
 
 /// A session identifier assigned by `OpenCode`.
@@ -67,6 +68,12 @@ pub struct MessageWithParts {
     pub parts: Vec<Value>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+/// One registered OpenCode agent returned by the instance-scoped agent list.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
+pub struct AgentInfo {
+    pub name: String,
 }
 
 /// The acknowledgement returned by an accepted asynchronous prompt.
@@ -154,6 +161,39 @@ impl SseChunkSource for ResponseChunks {
                 .map(|chunk| chunk.map(|bytes| bytes.to_vec()))
         }
     }
+
+    fn classify_error(error: &Self::Error) -> SseSourceErrorKind {
+        if is_transport_loss(error) {
+            SseSourceErrorKind::Transport
+        } else {
+            SseSourceErrorKind::Protocol
+        }
+    }
+}
+
+fn is_transport_loss(error: &reqwest::Error) -> bool {
+    if error.is_connect() || error.is_timeout() {
+        return true;
+    }
+
+    let mut source = error.source();
+    while let Some(cause) = source {
+        if let Some(error) = cause.downcast_ref::<io::Error>()
+            && matches!(
+                error.kind(),
+                io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::TimedOut
+            )
+        {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 
 use std::future::Future;
@@ -202,6 +242,27 @@ impl OpenCodeClient {
             request.directory.as_deref(),
             request.workspace.as_deref(),
             Some(Value::Object(body)),
+            StatusCode::OK,
+        )
+        .await
+    }
+
+    /// Lists the agents registered for one OpenCode directory/workspace scope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when OpenCode rejects the request or its response is malformed.
+    pub async fn agents(
+        &self,
+        directory: Option<&str>,
+        workspace: Option<&str>,
+    ) -> Result<Vec<AgentInfo>, OpenCodeError> {
+        self.json(
+            Method::GET,
+            "agent",
+            directory,
+            workspace,
+            None,
             StatusCode::OK,
         )
         .await

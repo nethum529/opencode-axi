@@ -14,8 +14,9 @@ use oca_core::{
 };
 use oca_display::{Acknowledgement, CompletionRecord, HerdrClient};
 use oca_opencode::{
-    CreateSessionRequest, OpenCodeClient, PromptRequest, Subscription, TextPart,
-    attributed_structured_reply, is_target_session_idle,
+    CreateSessionRequest, MessageWithParts, OpenCodeClient, PromptRequest, SseError,
+    SseSourceErrorKind, Subscription, TextPart, attributed_structured_reply,
+    is_target_session_idle,
 };
 use oca_server::{ConnectOrStart, SystemRuntime};
 use oca_state::{
@@ -27,9 +28,13 @@ use crate::{
     DispatchCommand,
     crash_recovery::{RESERVED_SESSION_ID, intent_failpoint, persist_intent, prompt_sha256},
     scope::Scope,
-    transport::{CreateSessionOperation, connect_error, open_code_error, prompt_error},
+    transport::{CreateSessionOperation, create_session_error, open_code_error, prompt_error},
     worktree_dispatch::{WorktreeDispatch, finalize_turn},
 };
+
+const PROMPT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
+const PROMPT_CONFIRM_INITIAL_BACKOFF: Duration = Duration::from_millis(20);
+const PROMPT_CONFIRM_MAX_BACKOFF: Duration = Duration::from_millis(200);
 
 /// Executes a parsed foreground dispatch using the user's local state root.
 ///
@@ -211,6 +216,122 @@ impl ProductionBackend {
                 .map(|structured| TerminalReply { structured }),
         )
     }
+
+    async fn confirm_prompt_visibility(
+        &mut self,
+        session_id: &str,
+        prompt: &DispatchPrompt,
+    ) -> Result<(), OcaError> {
+        let started = tokio::time::Instant::now();
+        let mut backoff = PROMPT_CONFIRM_INITIAL_BACKOFF;
+        let expected_hash = prompt_sha256(&prompt.text);
+        let mut last_error = None;
+
+        loop {
+            let elapsed = started.elapsed();
+            let Some(remaining) = PROMPT_CONFIRM_TIMEOUT.checked_sub(elapsed) else {
+                break;
+            };
+            let attempt_timeout = remaining.min(PROMPT_CONFIRM_MAX_BACKOFF);
+            match tokio::time::timeout(attempt_timeout, self.client()?.messages(session_id)).await {
+                Ok(Ok(messages)) => {
+                    if user_prompt_is_visible(
+                        &messages,
+                        session_id,
+                        &prompt.message_id,
+                        &expected_hash,
+                    ) {
+                        return Ok(());
+                    }
+                }
+                Ok(Err(error)) => last_error = Some(error.to_string()),
+                Err(_) => last_error = Some("message lookup timed out".to_owned()),
+            }
+
+            let elapsed = started.elapsed();
+            let Some(remaining) = PROMPT_CONFIRM_TIMEOUT.checked_sub(elapsed) else {
+                break;
+            };
+            tokio::time::sleep(backoff.min(remaining)).await;
+            backoff = backoff.saturating_mul(2).min(PROMPT_CONFIRM_MAX_BACKOFF);
+        }
+
+        let detail = last_error.map_or_else(
+            || "the accepted user message did not appear in session history".to_owned(),
+            |error| format!("session history could not confirm the accepted prompt: {error}"),
+        );
+        let error = OcaError::new(ErrorCode::PromptUncertain)
+            .with_error(format!(
+                "{detail} within {} ms",
+                PROMPT_CONFIRM_TIMEOUT.as_millis()
+            ))
+            .with_help("reconcile the stored message id; never replay this prompt automatically");
+        self.preserve_uncertain_prompt(session_id, prompt, error)
+    }
+
+    fn preserve_uncertain_prompt(
+        &mut self,
+        session_id: &str,
+        prompt: &DispatchPrompt,
+        error: OcaError,
+    ) -> Result<(), OcaError> {
+        {
+            let intent = self.intent_mut()?;
+            intent.set_phase(IntentPhase::PromptUncertain);
+        }
+        let intent = self.intent.as_ref().expect("intent set during prepare");
+        persist_intent(&self.intents, intent)?;
+
+        let reference = self.reference()?.to_owned();
+        if self.worktree.is_some() {
+            self.refs
+                .patch(
+                    &reference,
+                    oca_state::RefPatch::default()
+                        .with_session_id(session_id)
+                        .with_message_id(&prompt.message_id)
+                        .with_last_state(RefState::Unknown),
+                )
+                .map_err(|state| state_error("could not mark uncertain prompt ref", state))?;
+        } else {
+            let pending = self
+                .refs
+                .allocate_reserved(
+                    &reference,
+                    NewRef::for_session(session_id)
+                        .with_message_id(&prompt.message_id)
+                        .with_control_metadata(
+                            &prompt.model.alias,
+                            &prompt.model.effort,
+                            &prompt.role,
+                            self.dispatch_cwd
+                                .as_deref()
+                                .unwrap_or_else(|| Path::new("."))
+                                .display()
+                                .to_string(),
+                            RefState::Unknown,
+                        )
+                        .with_repo(&self.scope.repo)
+                        .with_spawner_tag(&self.scope.spawner_tag)
+                        .with_display(request_display(self.intent.as_ref())),
+                )
+                .map_err(|state| state_error("could not preserve uncertain prompt ref", state))?;
+            drop(pending);
+        }
+        Err(error.with_ref(reference))
+    }
+
+    fn cleanup_pre_prompt_failure(&self, error: OcaError) -> OcaError {
+        let Ok(reference) = self.reference().map(str::to_owned) else {
+            return error;
+        };
+        if let Some(worktree) = &self.worktree {
+            let _ = worktree.cleanup(&reference);
+        }
+        let _ = self.intents.remove(&reference);
+        let _ = self.refs.discard_unacknowledged(&reference);
+        error.with_ref(reference)
+    }
 }
 
 impl ForegroundBackend for ProductionBackend {
@@ -260,6 +381,7 @@ impl ForegroundBackend for ProductionBackend {
             let reference = self.reference.as_deref().expect("set above");
             let intent = self.intent.as_mut().expect("set above");
             worktree.prepare(&self.refs, request, reference, &self.intents, intent)?;
+            persist_intent(&self.intents, intent)?;
         }
         Ok(())
     }
@@ -283,10 +405,6 @@ impl ForegroundBackend for ProductionBackend {
             )]),
             ..CreateSessionRequest::default()
         });
-        if self.worktree.is_some() {
-            let intent = self.intent.as_ref().expect("intent set during prepare");
-            persist_intent(&self.intents, intent)?;
-        }
         let session = match self
             .manager
             .connect_or_start(&self.runtime, &mut operation)
@@ -294,14 +412,7 @@ impl ForegroundBackend for ProductionBackend {
         {
             Ok(session) => session,
             Err(error) => {
-                let error = connect_error(error);
-                let reference = self.reference()?.to_owned();
-                if let Some(worktree) = &self.worktree {
-                    let _ = worktree.cleanup(&reference);
-                }
-                let _ = self.intents.remove(&reference);
-                let _ = self.refs.discard_unacknowledged(&reference);
-                return Err(error.with_ref(reference));
+                return Err(self.cleanup_pre_prompt_failure(create_session_error(error)));
             }
         };
         let record = self
@@ -384,66 +495,36 @@ impl ForegroundBackend for ProductionBackend {
             )
             .await;
         match result {
-            Ok(_) => {
-                let intent = self.intent_mut()?;
-                intent.set_phase(IntentPhase::Running);
-                let intent = self.intent.as_ref().expect("intent set during prepare");
-                persist_intent(&self.intents, intent)
-            }
+            Ok(_) => Ok(()),
             Err(error) => {
                 let error = prompt_error(error);
                 if error.code() == ErrorCode::PromptUncertain.as_str() {
-                    let reference = self.reference()?.to_owned();
-                    if self.worktree.is_some() {
-                        self.refs
-                            .patch(
-                                &reference,
-                                oca_state::RefPatch::default()
-                                    .with_session_id(session_id)
-                                    .with_message_id(&prompt.message_id)
-                                    .with_last_state(RefState::Unknown),
-                            )
-                            .map_err(|state| {
-                                state_error("could not mark uncertain prompt ref", state)
-                            })?;
-                    } else {
-                        let pending = self
-                            .refs
-                            .allocate_reserved(
-                                &reference,
-                                NewRef::for_session(session_id)
-                                    .with_message_id(&prompt.message_id)
-                                    .with_control_metadata(
-                                        &prompt.model.alias,
-                                        &prompt.model.effort,
-                                        &prompt.role,
-                                        self.dispatch_cwd
-                                            .as_deref()
-                                            .unwrap_or_else(|| Path::new("."))
-                                            .display()
-                                            .to_string(),
-                                        RefState::Unknown,
-                                    )
-                                    .with_repo(&self.scope.repo)
-                                    .with_spawner_tag(&self.scope.spawner_tag)
-                                    .with_display(request_display(self.intent.as_ref())),
-                            )
-                            .map_err(|state| {
-                                state_error("could not preserve uncertain prompt ref", state)
-                            })?;
-                        drop(pending);
-                    }
-                    Err(error.with_ref(reference))
+                    self.preserve_uncertain_prompt(session_id, prompt, error)
                 } else {
                     let reference = self.reference()?.to_owned();
-                    if self.worktree.is_none() {
-                        let _ = self.intents.remove(&reference);
-                        let _ = self.refs.discard_unacknowledged(&reference);
-                    }
                     Err(error.with_ref(reference))
                 }
             }
         }
+    }
+
+    async fn confirm_prompt_landed(
+        &mut self,
+        session_id: &str,
+        prompt: &DispatchPrompt,
+    ) -> Result<(), OcaError> {
+        self.confirm_prompt_visibility(session_id, prompt).await
+    }
+
+    fn fail_before_prompt(&mut self, error: OcaError) -> OcaError {
+        self.cleanup_pre_prompt_failure(error)
+    }
+
+    fn mark_prompt_running(&mut self) -> Result<(), OcaError> {
+        let intent = self.intent_mut()?;
+        intent.set_phase(IntentPhase::Running);
+        let intent = self.intent.as_ref().expect("intent set during prepare");
+        persist_intent(&self.intents, intent)
     }
 
     fn write_ref(
@@ -560,17 +641,23 @@ impl ForegroundBackend for ProductionBackend {
         message_id: &str,
     ) -> Result<TerminalReply, OcaError> {
         loop {
-            let event = subscription
-                .next()
-                .await
-                .map_err(|error| {
-                    OcaError::new(ErrorCode::ServerUnreachable)
-                        .with_error(format!("OpenCode event stream failed: {error}"))
-                })?
-                .ok_or_else(|| {
-                    OcaError::new(ErrorCode::ServerUnreachable)
-                        .with_error("OpenCode event stream closed before a terminal event")
-                })?;
+            let event = match subscription.next().await {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    if let Some(reply) = self.read_attributed_reply(session_id, message_id).await? {
+                        return Ok(reply);
+                    }
+                    return Err(OcaError::new(ErrorCode::ProtocolMismatch)
+                        .with_error("OpenCode event stream closed before a terminal event"));
+                }
+                Err(stream_error) => {
+                    if let Some(reply) = self.read_attributed_reply(session_id, message_id).await? {
+                        return Ok(reply);
+                    }
+                    return Err(OcaError::new(sse_failure_code(&stream_error))
+                        .with_error(format!("OpenCode event stream failed: {stream_error}")));
+                }
+            };
             if is_target_session_idle(&event, session_id)
                 && let Some(reply) = self.read_attributed_reply(session_id, message_id).await?
             {
@@ -617,6 +704,50 @@ impl ForegroundBackend for ProductionBackend {
     }
 }
 
+/// Maps one event-stream failure onto its truthful public code: a lost
+/// connection is an unreachable server, while a connected server that supplies
+/// an undecodable body is a protocol mismatch.
+fn sse_failure_code(error: &SseError) -> ErrorCode {
+    match error {
+        SseError::Source {
+            kind: SseSourceErrorKind::Transport,
+            ..
+        } => ErrorCode::ServerUnreachable,
+        SseError::Source {
+            kind: SseSourceErrorKind::Protocol,
+            ..
+        }
+        | SseError::InvalidUtf8 { .. } => ErrorCode::ProtocolMismatch,
+    }
+}
+
+fn user_prompt_is_visible(
+    messages: &[MessageWithParts],
+    session_id: &str,
+    message_id: &str,
+    expected_hash: &str,
+) -> bool {
+    messages.iter().any(|message| {
+        message.info.get("role").and_then(serde_json::Value::as_str) == Some("user")
+            && message
+                .info
+                .get("sessionID")
+                .and_then(serde_json::Value::as_str)
+                == Some(session_id)
+            && message.info.get("id").and_then(serde_json::Value::as_str) == Some(message_id)
+            && prompt_sha256(&message_text(message)) == expected_hash
+    })
+}
+
+fn message_text(message: &MessageWithParts) -> String {
+    message
+        .parts
+        .iter()
+        .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 fn print_ack(reference: &str, model: &ResolvedModel, json: bool) -> io::Result<()> {
     let document = Acknowledgement::from_resolved(reference, "running", model);
     let rendered = if json {
@@ -646,4 +777,33 @@ fn request_display(intent: Option<&Intent>) -> &str {
 
 fn server_state_error(context: &str, error: io::Error) -> OcaError {
     state_error(context, error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_lost_connection_and_an_undecodable_body_get_different_codes() {
+        assert_eq!(
+            sse_failure_code(&SseError::Source {
+                message: "connection reset".to_owned(),
+                kind: SseSourceErrorKind::Transport,
+            }),
+            ErrorCode::ServerUnreachable,
+            "a server that went away must not be reported as a protocol mismatch"
+        );
+        assert_eq!(
+            sse_failure_code(&SseError::Source {
+                message: "error decoding response body".to_owned(),
+                kind: SseSourceErrorKind::Protocol,
+            }),
+            ErrorCode::ProtocolMismatch,
+            "a reachable server that garbles its body must not be reported unreachable"
+        );
+        assert_eq!(
+            sse_failure_code(&SseError::InvalidUtf8 { line: Vec::new() }),
+            ErrorCode::ProtocolMismatch
+        );
+    }
 }

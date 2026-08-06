@@ -116,6 +116,20 @@ mod tests {
             Ok(())
         }
 
+        async fn confirm_prompt_landed(
+            &mut self,
+            _session_id: &str,
+            _prompt: &DispatchPrompt,
+        ) -> Result<(), OcaError> {
+            self.calls.push("confirm");
+            Ok(())
+        }
+
+        fn mark_prompt_running(&mut self) -> Result<(), OcaError> {
+            self.calls.push("running");
+            Ok(())
+        }
+
         fn write_ref(
             &mut self,
             _session_id: &str,
@@ -193,6 +207,8 @@ mod tests {
                 "subscribe",
                 "mint",
                 "prompt",
+                "confirm",
+                "running",
                 "write_ref",
                 "ack",
                 "spawn"
