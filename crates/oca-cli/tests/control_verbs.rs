@@ -1,6 +1,7 @@
 use std::{
-    io::{Read, Write},
+    io::{BufRead, Read, Write},
     net::{TcpListener, TcpStream},
+    os::unix::net::{UnixListener, UnixStream},
     process::{Command, Output},
     sync::mpsc,
     thread,
@@ -193,6 +194,151 @@ fn abort_posts_once_and_marks_the_ref_aborted_without_display_work() {
 }
 
 #[test]
+fn abort_closes_the_persisted_herdr_tab() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
+    let port = listener.local_addr().expect("fake server address").port();
+    let server = thread::spawn(move || serve_prompt(listener, "200 OK", "true"));
+    let home = prepared_home(port, RefState::Running, "high");
+    let socket = configure_herdr(home.path(), Duration::from_millis(100));
+    ref_store(home.path())
+        .patch("w4f2a1", RefPatch::default().with_herdr_tab("persisted-t1"))
+        .expect("record herdr tab");
+    let herdr = thread::spawn(move || {
+        let listener = UnixListener::bind(socket).expect("fake herdr binds");
+        let (mut stream, _) = accept_unix_before(&listener, Duration::from_secs(1));
+        let request = read_unix_request(&stream);
+        let request_id = request["id"].as_str().expect("herdr request id");
+        writeln!(
+            stream,
+            "{}",
+            serde_json::json!({"id":request_id,"result":{"type":"ok"}})
+        )
+        .expect("fake herdr responds");
+        request
+    });
+    wait_for_path(&home.path().join("herdr.sock"), Duration::from_secs(1));
+
+    let output = run_oca(home.path(), ["k", "w4f2a1"]);
+    let request = herdr.join().expect("fake herdr completes");
+    server.join().expect("fake server completes");
+
+    assert_success(&output);
+    assert_eq!(request["method"], "tab.close");
+    assert_eq!(request["params"]["tab_id"], "persisted-t1");
+    assert_eq!(
+        stored_record(home.path()).last_state,
+        Some(RefState::Aborted)
+    );
+}
+
+#[test]
+fn abort_is_idempotent_when_the_herdr_tab_or_server_is_already_gone() {
+    for server_gone in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
+        let port = listener.local_addr().expect("fake server address").port();
+        let server = thread::spawn(move || serve_prompt(listener, "200 OK", "true"));
+        let home = prepared_home(port, RefState::Running, "high");
+        let socket = configure_herdr(home.path(), Duration::from_millis(100));
+        ref_store(home.path())
+            .patch("w4f2a1", RefPatch::default().with_herdr_tab("closed-t1"))
+            .expect("record closed herdr tab");
+
+        let herdr = (!server_gone).then(|| {
+            thread::spawn(move || {
+                let listener = UnixListener::bind(socket).expect("fake herdr binds");
+                let (mut stream, _) = accept_unix_before(&listener, Duration::from_secs(1));
+                let request = read_unix_request(&stream);
+                let request_id = request["id"].as_str().expect("herdr request id");
+                writeln!(
+                    stream,
+                    "{}",
+                    serde_json::json!({
+                        "id":request_id,
+                        "error":{"code":"tab_not_found","message":"tab is already closed"}
+                    })
+                )
+                .expect("fake herdr rejects stale tab");
+            })
+        });
+        if herdr.is_some() {
+            wait_for_path(&home.path().join("herdr.sock"), Duration::from_secs(1));
+        }
+
+        let output = run_oca(home.path(), ["k", "w4f2a1"]);
+        server.join().expect("fake server completes");
+        if let Some(herdr) = herdr {
+            herdr.join().expect("fake herdr completes");
+        }
+
+        assert_success(&output);
+        assert_eq!(
+            stored_record(home.path()).last_state,
+            Some(RefState::Aborted)
+        );
+    }
+}
+
+#[test]
+fn abort_never_contacts_herdr_for_headless_or_tmux_refs() {
+    for display in ["headless", "tmux"] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
+        let port = listener.local_addr().expect("fake server address").port();
+        let server = thread::spawn(move || serve_prompt(listener, "200 OK", "true"));
+        let home = prepared_home(port, RefState::Running, "high");
+        let socket = configure_herdr(home.path(), Duration::from_millis(100));
+        let herdr = UnixListener::bind(socket).expect("fake herdr binds");
+        herdr
+            .set_nonblocking(true)
+            .expect("fake herdr is nonblocking");
+        let mut patch = RefPatch::default().with_herdr_tab("stale-t1");
+        patch.display = Some(display.to_owned());
+        ref_store(home.path())
+            .patch("w4f2a1", patch)
+            .expect("record non-herdr display");
+
+        let output = run_oca(home.path(), ["k", "w4f2a1"]);
+        server.join().expect("fake server completes");
+
+        assert_success(&output);
+        assert!(
+            matches!(herdr.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "{display} abort must not contact herdr"
+        );
+    }
+}
+
+#[test]
+fn aborts_herdr_cleanup_wait_is_bounded_by_the_configured_timeout() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
+    let port = listener.local_addr().expect("fake server address").port();
+    let server = thread::spawn(move || serve_prompt(listener, "200 OK", "true"));
+    let home = prepared_home(port, RefState::Running, "high");
+    let socket = configure_herdr(home.path(), Duration::from_millis(30));
+    ref_store(home.path())
+        .patch("w4f2a1", RefPatch::default().with_herdr_tab("hung-t1"))
+        .expect("record herdr tab");
+    let herdr = thread::spawn(move || {
+        let listener = UnixListener::bind(socket).expect("fake herdr binds");
+        let (stream, _) = accept_unix_before(&listener, Duration::from_secs(1));
+        let _request = read_unix_request(&stream);
+        thread::sleep(Duration::from_millis(100));
+    });
+    wait_for_path(&home.path().join("herdr.sock"), Duration::from_secs(1));
+
+    let started = Instant::now();
+    let output = run_oca(home.path(), ["k", "w4f2a1"]);
+    let elapsed = started.elapsed();
+    server.join().expect("fake server completes");
+    herdr.join().expect("fake herdr completes");
+
+    assert_success(&output);
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "abort exceeded its configured herdr deadline: {elapsed:?}"
+    );
+}
+
+#[test]
 fn concurrent_messages_are_serialized_and_never_create_parallel_turns() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
     let port = listener.local_addr().expect("fake server address").port();
@@ -290,6 +436,62 @@ fn stored_record(home: &std::path::Path) -> RefRecord {
         .resolve("w4f2a1")
         .expect("read ref")
         .expect("stored ref")
+}
+
+fn configure_herdr(home: &std::path::Path, timeout: Duration) -> std::path::PathBuf {
+    let socket = home.join("herdr.sock");
+    std::fs::write(
+        home.join(".oca/config.toml"),
+        format!(
+            "[herdr]\nsocket = {:?}\ntimeout_ms = {}\n",
+            socket.display().to_string(),
+            timeout.as_millis()
+        ),
+    )
+    .expect("herdr config");
+    socket
+}
+
+fn wait_for_path(path: &std::path::Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !path.exists() {
+        assert!(Instant::now() < deadline, "timed out waiting for {path:?}");
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn accept_unix_before(
+    listener: &UnixListener,
+    timeout: Duration,
+) -> (UnixStream, std::os::unix::net::SocketAddr) {
+    listener
+        .set_nonblocking(true)
+        .expect("fake herdr is nonblocking");
+    let deadline = Instant::now() + timeout;
+    loop {
+        match listener.accept() {
+            Ok(connection) => return connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for herdr call"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("fake herdr accept failed: {error}"),
+        }
+    }
+}
+
+fn read_unix_request(stream: &UnixStream) -> Value {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("fake herdr read timeout");
+    let mut line = String::new();
+    std::io::BufReader::new(stream.try_clone().expect("clone fake herdr stream"))
+        .read_line(&mut line)
+        .expect("read herdr request");
+    serde_json::from_str(&line).expect("herdr request JSON")
 }
 
 fn run_oca<const N: usize>(home: &std::path::Path, arguments: [&str; N]) -> Output {

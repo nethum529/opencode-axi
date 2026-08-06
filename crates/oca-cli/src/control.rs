@@ -9,7 +9,7 @@ use oca_core::{
     ErrorCode, MessageIdGenerator, OcaError, RANDOM_SUFFIX_WIDTH, ReplyContract, ResolvedModel,
     WorkerPolicy, resolve_model,
 };
-use oca_display::Acknowledgement;
+use oca_display::{Acknowledgement, HerdrClient};
 use oca_opencode::{OpenCodeClient, PromptRequest, TextPart};
 use oca_server::ConnectOrStart;
 use oca_state::{
@@ -166,7 +166,7 @@ pub async fn execute_queue(
     ))
 }
 
-/// Aborts a worker session without performing any display/tab operation.
+/// Aborts a worker session and tears down its persisted herdr attachment.
 ///
 /// # Errors
 ///
@@ -198,6 +198,7 @@ pub async fn execute_abort(
             RefPatch::default().with_last_state(RefState::Aborted),
         )
         .map_err(|error| state_error(&command.reference, "could not update ref", error))?;
+    close_herdr_tab(home, &config, &record).await;
 
     Ok(accepted_output(
         &command.reference,
@@ -205,6 +206,28 @@ pub async fn execute_abort(
         &context.model,
         command.json,
     ))
+}
+
+async fn close_herdr_tab(home: &Path, config: &OcaConfig, record: &RefRecord) {
+    if record.display.as_deref() != Some("herdr") {
+        return;
+    }
+    let Some(tab_id) = record.herdr_tab.as_deref() else {
+        return;
+    };
+    let configured_socket =
+        (!config.herdr.socket.is_empty()).then(|| Path::new(config.herdr.socket.as_str()));
+    let Some(herdr) = HerdrClient::discover_from(
+        home,
+        configured_socket,
+        std::time::Duration::from_millis(config.herdr.timeout_ms),
+    ) else {
+        return;
+    };
+
+    // Display teardown is best effort: abort already succeeded, and a stale
+    // tab ID or a stopped herdr means the desired end state already holds.
+    let _ = herdr.close_tab_id(tab_id).await;
 }
 
 struct ControlContext {

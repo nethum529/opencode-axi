@@ -5,8 +5,12 @@ use std::{
     os::unix::fs::PermissionsExt,
     os::unix::net::{UnixListener, UnixStream},
     path::{Path, PathBuf},
-    process::Command,
-    sync::{Arc, Mutex, mpsc},
+    process::{Child, Command},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -79,6 +83,86 @@ fn headed_attach_records_and_closes_the_tab_after_terminal_state() {
     let record = ref_store(home.path()).resolve("wabc12").unwrap().unwrap();
     assert_eq!(record.display.as_deref(), Some("herdr"));
     assert_eq!(record.herdr_tab.as_deref(), Some("t1"));
+}
+
+#[test]
+fn background_spawn_then_kill_closes_the_tab_and_exits_its_tui_process() {
+    let home = tempfile::tempdir().unwrap();
+    let socket = home.path().join("fake-herdr.sock");
+    let tab_closed = Arc::new(AtomicBool::new(false));
+    let fake_opencode = fake_attached_opencode(home.path());
+    let herdr = spawn_herdr_with_attached_process(&socket, fake_opencode, Arc::clone(&tab_closed));
+    let (port, opencode) = spawn_background_abort_opencode(Arc::clone(&tab_closed));
+    prepare_dispatch_home(home.path(), &socket, port);
+    fs::write(
+        home.path().join(".oca/config.toml"),
+        format!(
+            "[herdr]\nsocket = {}\ntimeout_ms = 100\nclose_on_done = false\n",
+            serde_json::to_string(&socket.display().to_string()).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let background = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["luna:h", "-b", "keep", "running", "until", "killed"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert!(
+        background.status.success(),
+        "background dispatch failed: {}",
+        String::from_utf8_lossy(&background.stderr)
+    );
+    let reference = String::from_utf8(background.stdout)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned();
+    wait_for_ref_tab(home.path(), &reference, Duration::from_secs(2));
+
+    let started = Instant::now();
+    let killed = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["k", &reference])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        killed.status.success(),
+        "kill failed: {}",
+        String::from_utf8_lossy(&killed.stderr)
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "kill exceeded its bounded display cleanup wait: {elapsed:?}"
+    );
+
+    let calls = herdr.join().expect("fake herdr completes");
+    opencode.join().expect("fake OpenCode completes");
+    assert!(tab_closed.load(Ordering::SeqCst));
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "workspace.list",
+            "workspace.create",
+            "tab.create",
+            "agent.start",
+            "tab.close"
+        ]
+    );
+    assert_eq!(calls[4]["params"]["tab_id"], "spawned-t1");
+    assert_eq!(
+        fs::read_to_string(home.path().join("attached-opencode-args"))
+            .unwrap()
+            .trim(),
+        "--session ses_target"
+    );
 }
 
 #[test]
@@ -316,6 +400,247 @@ fn spawn_herdr_lifecycle(socket: &Path, calls: Arc<Mutex<Vec<Value>>>) -> thread
             calls.lock().unwrap().push(request);
         }
     })
+}
+
+fn spawn_herdr_with_attached_process(
+    socket: &Path,
+    fake_opencode: PathBuf,
+    tab_closed: Arc<AtomicBool>,
+) -> thread::JoinHandle<Vec<Value>> {
+    let listener = UnixListener::bind(socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    thread::spawn(move || {
+        let mut calls = Vec::new();
+        let mut attached = None;
+        for index in 0..5 {
+            let (mut stream, _) = accept_unix_before(&listener, Duration::from_secs(3));
+            let request = read_unix_request(&stream);
+            let request_id = request["id"].as_str().unwrap();
+            let result = match index {
+                0 => json!({"type":"workspace_list","workspaces":[]}),
+                1 => json!({
+                    "type":"workspace_created",
+                    "workspace":{"workspace_id":"spawned-w1","label":"oca"}
+                }),
+                2 => json!({
+                    "type":"tab_created",
+                    "tab":{"tab_id":"spawned-t1"},
+                    "root_pane":{"pane_id":"spawned-p1"}
+                }),
+                3 => {
+                    let args = request["params"]["args"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|argument| argument.as_str().unwrap())
+                        .collect::<Vec<_>>();
+                    let mut child = Command::new(&fake_opencode).args(args).spawn().unwrap();
+                    assert!(
+                        child.try_wait().unwrap().is_none(),
+                        "attached TUI exited early"
+                    );
+                    attached = Some(AttachedProcess(child));
+                    json!({
+                        "type":"agent_started",
+                        "agent":{"terminal_id":"spawned-term1"}
+                    })
+                }
+                4 => {
+                    let child = &mut attached.as_mut().expect("agent.start spawned a TUI").0;
+                    assert!(
+                        child.try_wait().unwrap().is_none(),
+                        "attached TUI exited before kill"
+                    );
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    assert!(
+                        child.try_wait().unwrap().is_some(),
+                        "attached TUI was not reaped"
+                    );
+                    tab_closed.store(true, Ordering::SeqCst);
+                    json!({"type":"ok"})
+                }
+                _ => unreachable!(),
+            };
+            writeln!(stream, "{}", json!({"id":request_id,"result":result})).unwrap();
+            calls.push(request);
+        }
+        calls
+    })
+}
+
+struct AttachedProcess(Child);
+
+impl Drop for AttachedProcess {
+    fn drop(&mut self) {
+        if self.0.try_wait().ok().flatten().is_none() {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+}
+
+fn fake_attached_opencode(directory: &Path) -> PathBuf {
+    let executable = directory.join("attached-opencode");
+    fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\nexec sleep 30\n",
+            directory.join("attached-opencode-args").display()
+        ),
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&executable).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&executable, permissions).unwrap();
+    executable
+}
+
+fn spawn_background_abort_opencode(tab_closed: Arc<AtomicBool>) -> (u16, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let server = thread::spawn(move || {
+        let event_count = Arc::new(AtomicUsize::new(0));
+        let message_id = Arc::new(Mutex::new(None::<String>));
+        let mut handlers = Vec::new();
+        for _ in 0..6 {
+            let (mut stream, _) = accept_tcp_before(&listener, Duration::from_secs(3));
+            let event_count = Arc::clone(&event_count);
+            let message_id = Arc::clone(&message_id);
+            let tab_closed = Arc::clone(&tab_closed);
+            handlers.push(thread::spawn(move || {
+                let request = read_http_request(&mut stream);
+                if request.path.starts_with("/session?") {
+                    write_http_response(
+                        &mut stream,
+                        "200 OK",
+                        "application/json",
+                        r#"{"id":"ses_target"}"#,
+                    );
+                } else if request.path == "/event" {
+                    let index = event_count.fetch_add(1, Ordering::SeqCst);
+                    if index == 0 {
+                        write_http_response(&mut stream, "200 OK", "text/event-stream", "");
+                    } else {
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
+                        )
+                        .unwrap();
+                        stream.flush().unwrap();
+                        wait_for_flag(&tab_closed, Duration::from_secs(2));
+                        let parent_id = message_id.lock().unwrap().clone().unwrap();
+                        write!(stream, "{}", terminal_sse(&parent_id)).unwrap();
+                    }
+                } else if request.path == "/session/ses_target/prompt_async" {
+                    *message_id.lock().unwrap() =
+                        request.body["messageID"].as_str().map(ToOwned::to_owned);
+                    write_http_response(&mut stream, "204 No Content", "text/plain", "");
+                } else if request.path == "/session/ses_target/message" {
+                    write_http_response(&mut stream, "200 OK", "application/json", "[]");
+                } else if request.path == "/session/ses_target/abort" {
+                    write_http_response(&mut stream, "200 OK", "application/json", "true");
+                } else {
+                    panic!("unexpected OpenCode request: {}", request.path);
+                }
+            }));
+        }
+        for handler in handlers {
+            handler.join().unwrap();
+        }
+    });
+    (port, server)
+}
+
+fn terminal_sse(parent_id: &str) -> String {
+    let message = json!({
+        "id":"evt_message",
+        "type":"message.updated",
+        "properties":{
+            "sessionID":"ses_target",
+            "info":{
+                "id":"msg_assistant",
+                "sessionID":"ses_target",
+                "role":"assistant",
+                "parentID":parent_id,
+                "time":{"created":1,"completed":2},
+                "structured":{"status":"done"}
+            }
+        }
+    });
+    let idle = json!({
+        "id":"evt_idle",
+        "type":"session.idle",
+        "properties":{"sessionID":"ses_target"}
+    });
+    format!("id: evt_message\ndata: {message}\n\nid: evt_idle\ndata: {idle}\n\n")
+}
+
+fn accept_unix_before(
+    listener: &UnixListener,
+    timeout: Duration,
+) -> (UnixStream, std::os::unix::net::SocketAddr) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match listener.accept() {
+            Ok(connection) => return connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for herdr call"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("fake herdr accept failed: {error}"),
+        }
+    }
+}
+
+fn accept_tcp_before(
+    listener: &TcpListener,
+    timeout: Duration,
+) -> (TcpStream, std::net::SocketAddr) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match listener.accept() {
+            Ok(connection) => return connection,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out waiting for OpenCode call"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("fake OpenCode accept failed: {error}"),
+        }
+    }
+}
+
+fn wait_for_ref_tab(home: &Path, reference: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if ref_store(home)
+            .resolve(reference)
+            .unwrap()
+            .is_some_and(|record| record.herdr_tab.as_deref() == Some("spawned-t1"))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for attached tab"
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+fn wait_for_flag(flag: &AtomicBool, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    while !flag.load(Ordering::SeqCst) {
+        assert!(Instant::now() < deadline, "timed out waiting for tab close");
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn read_unix_request(stream: &UnixStream) -> Value {

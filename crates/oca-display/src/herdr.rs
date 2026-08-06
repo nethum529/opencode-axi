@@ -216,9 +216,16 @@ impl HerdrClient {
     ///
     /// Returns a typed transport, timeout, server, or envelope error.
     pub async fn close_tab(&self, tab: &TabId) -> Result<(), HerdrError> {
-        let _: OkResult = self
-            .call("tab.close", json!({ "tab_id": tab.as_str() }))
-            .await?;
+        self.close_tab_id(tab.as_str()).await
+    }
+
+    /// Closes one herdr tab by its persisted protocol identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed transport, timeout, server, or envelope error.
+    pub async fn close_tab_id(&self, tab_id: &str) -> Result<(), HerdrError> {
+        let _: OkResult = self.call("tab.close", json!({ "tab_id": tab_id })).await?;
         Ok(())
     }
 
