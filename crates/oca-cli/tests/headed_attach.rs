@@ -16,6 +16,101 @@ use oca_state::{RefRecord, RefState, RefStore, RefStorePaths};
 use serde_json::{Value, json};
 
 #[test]
+fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_events_flow() {
+    let home = tempfile::tempdir().unwrap();
+    init_repository(home.path());
+    let socket = home.path().join("fake-herdr.sock");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let herdr = spawn_herdr_lifecycle(&socket, Arc::clone(&calls));
+    let (port, opencode) = spawn_headed_background_opencode();
+    prepare_dispatch_home(home.path(), &socket, port);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args([
+            "luna:h",
+            "-w",
+            "-b",
+            "land",
+            "the",
+            "headed",
+            "background",
+            "prompt",
+        ])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "background dispatch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let acknowledgement = String::from_utf8(output.stdout).unwrap();
+    let reference = acknowledgement
+        .split_whitespace()
+        .next()
+        .expect("background acknowledgement ref");
+
+    herdr.join().unwrap();
+    let requests = opencode.join().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| request.path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            requests[0].path.as_str(),
+            "/event",
+            "/session/ses_headed_background/prompt_async",
+            "/session/ses_headed_background/message",
+            "/event",
+            "/session/ses_headed_background/message",
+        ],
+        "headed background admission must confirm the user message before spawning the helper"
+    );
+    assert!(requests[0].path.starts_with("/session?directory="));
+    let message_id = requests[2].body["messageID"]
+        .as_str()
+        .expect("prompt carries a caller message id");
+    assert_eq!(requests[3].body, Value::Null);
+    assert_eq!(requests[5].body, Value::Null);
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "workspace.list",
+            "workspace.create",
+            "tab.create",
+            "agent.start",
+            "tab.close",
+        ],
+        "tab.close proves the detached helper consumed the attributed terminal events"
+    );
+    assert_eq!(
+        calls[3]["params"]["args"],
+        json!([
+            "attach",
+            format!("http://127.0.0.1:{port}"),
+            "--session",
+            "ses_headed_background"
+        ])
+    );
+
+    let record = ref_store(home.path()).resolve(reference).unwrap().unwrap();
+    assert_eq!(record.session_id, "ses_headed_background");
+    assert_eq!(record.message_id.as_deref(), Some(message_id));
+    assert_eq!(record.last_state, Some(RefState::Running));
+    assert_eq!(record.display.as_deref(), Some("herdr"));
+    assert_eq!(record.herdr_tab.as_deref(), Some("t1"));
+}
+
+#[test]
 fn headed_attach_records_and_closes_the_tab_after_terminal_state() {
     let home = tempfile::tempdir().unwrap();
     let socket = home.path().join("fake-herdr.sock");
@@ -349,6 +444,112 @@ fn spawn_attach_opencode() -> (u16, thread::JoinHandle<()>) {
     (port, server)
 }
 
+fn spawn_headed_background_opencode() -> (u16, thread::JoinHandle<Vec<HttpRequest>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let started = Instant::now();
+        let mut last_request = None;
+        let mut requests = Vec::new();
+        let mut message_id = None;
+        let mut prompt_text = None;
+        let mut event_subscriptions = 0;
+
+        while requests.len() < 6 && started.elapsed() < Duration::from_secs(5) {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if last_request
+                        .is_some_and(|last: Instant| last.elapsed() >= Duration::from_millis(750))
+                    {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("fake OpenCode accept failed: {error}"),
+            };
+            let request = read_http_request(&mut stream);
+            if request.path.starts_with("/session?directory=") {
+                write_http_response(
+                    &mut stream,
+                    "200 OK",
+                    "application/json",
+                    r#"{"id":"ses_headed_background"}"#,
+                );
+            } else if request.path == "/event" {
+                let body = if event_subscriptions == 0 {
+                    String::new()
+                } else {
+                    terminal_sse(message_id.as_deref().expect("prompt precedes attach"))
+                };
+                event_subscriptions += 1;
+                write_http_response(&mut stream, "200 OK", "text/event-stream", &body);
+            } else if request.path == "/session/ses_headed_background/prompt_async" {
+                message_id = request.body["messageID"].as_str().map(ToOwned::to_owned);
+                prompt_text = request.body["parts"][0]["text"]
+                    .as_str()
+                    .map(ToOwned::to_owned);
+                write_http_response(&mut stream, "204 No Content", "text/plain", "");
+            } else if request.path == "/session/ses_headed_background/message" {
+                let body = user_messages(
+                    message_id.as_deref().expect("prompt precedes messages"),
+                    prompt_text.as_deref().expect("prompt text was captured"),
+                );
+                write_http_response(&mut stream, "200 OK", "application/json", &body);
+            } else {
+                panic!("unexpected OpenCode request path: {}", request.path);
+            }
+            requests.push(request);
+            last_request = Some(Instant::now());
+        }
+        requests
+    });
+    (port, server)
+}
+
+fn user_messages(message_id: &str, prompt_text: &str) -> String {
+    json!([{
+        "info": {
+            "id": message_id,
+            "sessionID": "ses_headed_background",
+            "role": "user",
+            "time": {"created": 1}
+        },
+        "parts": [{"type": "text", "text": prompt_text}]
+    }])
+    .to_string()
+}
+
+fn terminal_sse(parent_id: &str) -> String {
+    let message = json!({
+        "id": "evt_headed_message",
+        "type": "message.updated",
+        "properties": {
+            "sessionID": "ses_headed_background",
+            "info": {
+                "id": "msg_headed_assistant",
+                "sessionID": "ses_headed_background",
+                "role": "assistant",
+                "parentID": parent_id,
+                "time": {"created": 2, "completed": 3},
+                "structured": {
+                    "status": "done",
+                    "files": [],
+                    "note": "The headed background prompt landed in the authoritative server session, emitted an attributed terminal event, and completed through the detached production attach helper."
+                }
+            }
+        }
+    });
+    let idle = json!({
+        "id": "evt_headed_idle",
+        "type": "session.idle",
+        "properties": {"sessionID": "ses_headed_background"}
+    });
+    format!("id: evt_headed_message\ndata: {message}\n\nid: evt_headed_idle\ndata: {idle}\n\n")
+}
+
 fn spawn_foreground_opencode() -> (u16, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -510,6 +711,43 @@ fn prepare_dispatch_home(home: &Path, socket: &Path, port: u16) {
             environment_hash_for(home),
         ))
         .unwrap();
+}
+
+fn init_repository(path: &Path) {
+    for arguments in [
+        ["init", "--quiet"].as_slice(),
+        ["config", "user.name", "oca test"].as_slice(),
+        ["config", "user.email", "oca@example.test"].as_slice(),
+    ] {
+        assert!(
+            Command::new("git")
+                .arg("-C")
+                .arg(path)
+                .args(arguments)
+                .status()
+                .unwrap()
+                .success()
+        );
+    }
+    fs::write(path.join("README.md"), "base\n").unwrap();
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["add", "README.md"])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .arg("-C")
+            .arg(path)
+            .args(["commit", "--quiet", "-m", "base"])
+            .status()
+            .unwrap()
+            .success()
+    );
 }
 
 fn installed_opencode_version() -> String {
