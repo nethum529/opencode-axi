@@ -196,10 +196,13 @@ pub trait EventJournalWriter {
     fn append(&mut self, event: &OcaEvent) -> Result<(), String>;
 }
 
+const MIN_RECONNECT_DELAY: Duration = Duration::from_millis(10);
+
 /// Reconnection limits for a stream that is not making progress.
 ///
-/// Receiving an event resets both limits. A successful subscription alone does
-/// not reset them unless an explicit follow timeout is governing the operation.
+/// Receiving an event resets both limits. With an explicit follow timeout, a
+/// successful subscription also resets them. Without one, exhaustion starts a
+/// fresh reconnect cycle instead of imposing a hidden deadline on the park.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FollowPolicy {
     pub max_reconnect_attempts: usize,
@@ -431,13 +434,18 @@ where
                 if reconnect_attempts >= policy.max_reconnect_attempts
                     || reconnect_since.elapsed() >= policy.max_reconnect_elapsed
                 {
-                    return Ok(FollowOutcome::ServerUnreachable);
+                    if has_explicit_timeout && connection_failed.load(Ordering::Relaxed) {
+                        return Ok(FollowOutcome::ServerUnreachable);
+                    }
+                    reconnect_started = Some(tokio::time::Instant::now());
+                    reconnect_attempts = 0;
                 }
 
-                let delay = reconnect_delay(policy, reconnect_attempts, reconnect_since.elapsed());
-                if !delay.is_zero() {
-                    tokio::time::sleep(delay).await;
-                }
+                let reconnect_elapsed = reconnect_started
+                    .expect("reconnect cycle is initialized")
+                    .elapsed();
+                let delay = reconnect_delay(policy, reconnect_attempts, reconnect_elapsed);
+                tokio::time::sleep(delay).await;
                 reconnect_attempts += 1;
                 match transport.subscribe(last_event_id.as_deref()).await {
                     Ok(reconnected) => {
@@ -463,7 +471,9 @@ fn reconnect_delay(policy: FollowPolicy, attempt: usize, elapsed: Duration) -> D
     let exponent = u32::try_from(attempt).unwrap_or(u32::MAX).min(31);
     let multiplier = 1_u32.checked_shl(exponent).unwrap_or(u32::MAX);
     let delay = policy.initial_backoff.saturating_mul(multiplier);
-    delay.min(policy.max_reconnect_elapsed.saturating_sub(elapsed))
+    delay
+        .min(policy.max_reconnect_elapsed.saturating_sub(elapsed))
+        .max(MIN_RECONNECT_DELAY)
 }
 
 fn protocol_error(error: FollowTransportError) -> FollowError {
@@ -942,7 +952,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconnect_is_capped_at_five_attempts() {
+    async fn explicit_follow_reconnect_is_capped_at_five_attempts() {
         let mut subscriptions = VecDeque::from([subscription([Ok(None)])]);
         subscriptions.extend((0..5).map(|_| {
             Err(FollowTransportError::unreachable(
@@ -963,7 +973,7 @@ mod tests {
         let outcome = follow_until_terminal_with_policy(
             &transport,
             &target(),
-            None,
+            Some(Duration::from_secs(1)),
             None::<&mut Journal>,
             policy,
         )
@@ -1030,12 +1040,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn successful_empty_resubscriptions_exhaust_budget_without_explicit_timeout() {
+    async fn successful_empty_resubscriptions_park_without_explicit_timeout() {
         let transport = AlwaysEmptyTransport::new(None);
-        let started = std::time::Instant::now();
 
         let outcome = tokio::time::timeout(
-            Duration::from_millis(500),
+            Duration::from_millis(90),
             follow_until_terminal_with_policy(
                 &transport,
                 &target(),
@@ -1048,17 +1057,34 @@ mod tests {
                 },
             ),
         )
-        .await
-        .expect("successful empty resubscriptions must have a finite budget")
-        .unwrap();
+        .await;
 
-        assert_eq!(outcome, FollowOutcome::ServerUnreachable);
-        assert!(started.elapsed() < Duration::from_millis(500));
-        assert_eq!(
-            transport.subscriptions.load(AtomicOrdering::Relaxed),
-            4,
-            "the initial subscription and three successful resubscriptions exhaust the budget"
+        assert!(
+            outcome.is_err(),
+            "a reconnect budget must not terminate a no-deadline park"
         );
+        let subscriptions = transport.subscriptions.load(AtomicOrdering::Relaxed);
+        assert!(subscriptions > 4, "the park must reconnect past one budget");
+        assert!(
+            subscriptions <= 10,
+            "the reconnect floor must bound work during the park; got {subscriptions} subscriptions"
+        );
+    }
+
+    #[test]
+    fn reconnect_delay_has_a_floor_after_a_zero_elapsed_budget() {
+        let delay = reconnect_delay(
+            FollowPolicy {
+                max_reconnect_attempts: 0,
+                max_reconnect_elapsed: Duration::ZERO,
+                initial_backoff: Duration::ZERO,
+            },
+            usize::MAX,
+            Duration::from_secs(1),
+        );
+
+        assert_eq!(delay, MIN_RECONNECT_DELAY);
+        assert!(!delay.is_zero());
     }
 
     #[tokio::test]

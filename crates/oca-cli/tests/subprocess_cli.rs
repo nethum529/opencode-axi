@@ -143,6 +143,29 @@ fn follow_exit_codes_are_frozen_at_the_real_process_boundary() {
     );
 }
 
+#[test]
+fn reachable_idle_follow_waits_for_t_before_exit_four() {
+    let fixture = FollowFixture::reachable_idle();
+    let started = std::time::Instant::now();
+    let output = run_oca_in_home(fixture.home.path(), &["f", "w4f2a1", "-t", "1"]);
+    let elapsed = started.elapsed();
+    fixture
+        .server
+        .join()
+        .expect("fake server thread must finish");
+
+    assert_eq!(output.status.code(), Some(exit::FOLLOW_TIMEOUT));
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "oca wake ref=w4f2a1 state=timeout\n"
+    );
+    assert!(
+        elapsed >= std::time::Duration::from_millis(900),
+        "follow returned before its requested one-second deadline: {elapsed:?}"
+    );
+}
+
 struct FollowFixture {
     home: tempfile::TempDir,
     server: thread::JoinHandle<()>,
@@ -156,6 +179,32 @@ impl FollowFixture {
 
     fn disconnected() -> Self {
         Self::with_sse(Vec::new())
+    }
+
+    fn reachable_idle() -> Self {
+        let empty_messages = || RecordedExchange {
+            request: HttpRequest::new("GET", "/session/ses_target/message", no_headers(), []),
+            response: HttpResponse::new(
+                200,
+                [("content-type", "application/json")],
+                [b"[]".to_vec()],
+            ),
+        };
+        let recording = Recording {
+            exchanges: vec![
+                RecordedExchange {
+                    request: HttpRequest::new("GET", "/event", no_headers(), []),
+                    response: HttpResponse::new(
+                        200,
+                        [("content-type", "text/event-stream")],
+                        Vec::<Vec<u8>>::new(),
+                    ),
+                },
+                empty_messages(),
+                empty_messages(),
+            ],
+        };
+        Self::with_recording(recording, 3)
     }
 
     fn with_sse(chunks: Vec<Vec<u8>>) -> Self {
@@ -184,13 +233,18 @@ impl FollowFixture {
                 },
             ],
         };
+        Self::with_recording(recording, 2)
+    }
+
+    fn with_recording(recording: Recording, request_count: usize) -> Self {
         let replay = ReplayServer::pinned(recording).expect("pinned fake server surface");
         let mut server = ReplayHttpServer::bind("127.0.0.1:0", replay).expect("bind fake server");
         let port = server.local_addr().unwrap().port();
         let home = prepared_home(port);
         let server = thread::spawn(move || {
-            server.serve_one().expect("serve event subscription");
-            server.serve_one().expect("serve one-shot reconciliation");
+            for _ in 0..request_count {
+                server.serve_one().expect("serve follow request");
+            }
         });
         Self { home, server }
     }
