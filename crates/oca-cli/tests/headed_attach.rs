@@ -27,7 +27,7 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
     let socket = home.path().join("fake-herdr.sock");
     let calls = Arc::new(Mutex::new(Vec::new()));
     let herdr = spawn_herdr_lifecycle(&socket, Arc::clone(&calls));
-    let (port, opencode) = spawn_headed_background_opencode();
+    let (port, opencode, release_terminal) = spawn_headed_background_opencode();
     prepare_dispatch_home(home.path(), &socket, port);
 
     let output = Command::new(env!("CARGO_BIN_EXE_oca"))
@@ -58,6 +58,35 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
         .next()
         .expect("background acknowledgement ref");
 
+    let record = ref_store(home.path()).resolve(reference).unwrap().unwrap();
+    let message_id = record
+        .message_id
+        .as_deref()
+        .expect("admitted background ref carries its message id");
+    let journal = home
+        .path()
+        .join(".oca/events")
+        .join(format!("{reference}.{message_id}.jsonl"));
+    wait_for_nonempty_file(&journal, Duration::from_secs(2));
+
+    let events = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["events", reference, "--json"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert!(
+        events.status.success(),
+        "mid-run event read failed: {}",
+        String::from_utf8_lossy(&events.stderr)
+    );
+    let event_page: Value = serde_json::from_slice(&events.stdout).unwrap();
+    assert_eq!(event_page["total"], 1);
+    assert_eq!(event_page["events"][0]["kind"], "session.busy");
+
+    // Prove the journal is readable while the detached helper still owns the
+    // live stream; only now may the fake worker emit its terminal boundary.
+    release_terminal.store(true, Ordering::SeqCst);
     herdr.join().unwrap();
     let requests = opencode.join().unwrap();
     assert_eq!(
@@ -78,9 +107,10 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
     );
     assert!(requests[0].path.starts_with("/agent?directory="));
     assert!(requests[1].path.starts_with("/session?directory="));
-    let message_id = requests[3].body["messageID"]
+    let dispatched_message_id = requests[3].body["messageID"]
         .as_str()
         .expect("prompt carries a caller message id");
+    assert_eq!(dispatched_message_id, message_id);
     assert_eq!(requests[4].body, Value::Null);
     assert_eq!(requests[6].body, Value::Null);
 
@@ -109,12 +139,15 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
         ])
     );
 
-    let record = ref_store(home.path()).resolve(reference).unwrap().unwrap();
-    assert_eq!(record.session_id, "ses_headed_background");
-    assert_eq!(record.message_id.as_deref(), Some(message_id));
-    assert_eq!(record.last_state, Some(RefState::Running));
-    assert_eq!(record.display.as_deref(), Some("herdr"));
-    assert_eq!(record.herdr_tab.as_deref(), Some("t1"));
+    let final_record = ref_store(home.path()).resolve(reference).unwrap().unwrap();
+    assert_eq!(final_record.session_id, "ses_headed_background");
+    assert_eq!(
+        final_record.message_id.as_deref(),
+        Some(dispatched_message_id)
+    );
+    assert_eq!(final_record.last_state, Some(RefState::Running));
+    assert_eq!(final_record.display.as_deref(), Some("herdr"));
+    assert_eq!(final_record.herdr_tab.as_deref(), Some("t1"));
 }
 
 #[test]
@@ -875,17 +908,21 @@ fn spawn_attach_opencode() -> (u16, thread::JoinHandle<()>) {
     (port, server)
 }
 
-fn spawn_headed_background_opencode() -> (u16, thread::JoinHandle<Vec<HttpRequest>>) {
+fn spawn_headed_background_opencode() -> (u16, thread::JoinHandle<Vec<HttpRequest>>, Arc<AtomicBool>)
+{
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let port = listener.local_addr().unwrap().port();
+    let release_terminal = Arc::new(AtomicBool::new(false));
+    let server_release = Arc::clone(&release_terminal);
     let server = thread::spawn(move || {
         let started = Instant::now();
         let mut last_request = None;
         let mut requests = Vec::new();
-        let mut message_id = None;
-        let mut prompt_text = None;
+        let mut message_id = None::<String>;
+        let mut prompt_text = None::<String>;
         let mut event_subscriptions = 0;
+        let mut event_handler = None;
 
         while requests.len() < 7 && started.elapsed() < Duration::from_secs(5) {
             let (mut stream, _) = match listener.accept() {
@@ -917,13 +954,28 @@ fn spawn_headed_background_opencode() -> (u16, thread::JoinHandle<Vec<HttpReques
                     r#"{"id":"ses_headed_background"}"#,
                 );
             } else if request.path == "/event" {
-                let body = if event_subscriptions == 0 {
-                    String::new()
+                if event_subscriptions == 0 {
+                    write_http_response(&mut stream, "200 OK", "text/event-stream", "");
                 } else {
-                    terminal_sse(message_id.as_deref().expect("prompt precedes attach"))
-                };
+                    let parent_id = message_id
+                        .as_deref()
+                        .expect("prompt precedes attach")
+                        .to_owned();
+                    let release = Arc::clone(&server_release);
+                    event_handler = Some(thread::spawn(move || {
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n{}",
+                            busy_sse()
+                        )
+                        .unwrap();
+                        stream.flush().unwrap();
+                        wait_for_flag(&release, Duration::from_secs(3));
+                        write!(stream, "{}", terminal_sse(&parent_id)).unwrap();
+                        stream.flush().unwrap();
+                    }));
+                }
                 event_subscriptions += 1;
-                write_http_response(&mut stream, "200 OK", "text/event-stream", &body);
             } else if request.path == "/session/ses_headed_background/prompt_async" {
                 message_id = request.body["messageID"].as_str().map(ToOwned::to_owned);
                 prompt_text = request.body["parts"][0]["text"]
@@ -943,9 +995,12 @@ fn spawn_headed_background_opencode() -> (u16, thread::JoinHandle<Vec<HttpReques
             requests.push(request);
             last_request = Some(Instant::now());
         }
+        if let Some(handler) = event_handler {
+            handler.join().unwrap();
+        }
         requests
     });
-    (port, server)
+    (port, server, release_terminal)
 }
 
 fn spawn_unconfirmed_prompt_opencode() -> (u16, thread::JoinHandle<Vec<HttpRequest>>) {
@@ -1042,6 +1097,30 @@ fn terminal_sse(parent_id: &str) -> String {
         "properties": {"sessionID": "ses_headed_background"}
     });
     format!("id: evt_headed_message\ndata: {message}\n\nid: evt_headed_idle\ndata: {idle}\n\n")
+}
+
+fn busy_sse() -> String {
+    let busy = json!({
+        "id": "evt_headed_busy",
+        "type": "session.busy",
+        "properties": {"sessionID": "ses_headed_background"}
+    });
+    format!("id: evt_headed_busy\ndata: {busy}\n\n")
+}
+
+fn wait_for_nonempty_file(path: &Path, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if fs::metadata(path).is_ok_and(|metadata| metadata.len() > 0) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for non-empty journal {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn spawn_foreground_opencode() -> (u16, thread::JoinHandle<()>) {
