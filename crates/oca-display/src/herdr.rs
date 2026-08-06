@@ -15,6 +15,8 @@ use tokio::{
     net::UnixStream,
 };
 
+use crate::probe::socket_accepts_connections;
+
 const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -87,7 +89,7 @@ impl HerdrClient {
     ///
     /// `HERDR_SOCKET_PATH` wins, followed by `XDG_CONFIG_HOME`, then
     /// `$HOME/.config/herdr/herdr.sock`. A candidate is returned only when it
-    /// already exists, so discovery never starts herdr.
+    /// accepts a bounded connection probe, so discovery never starts herdr.
     #[must_use]
     pub fn discover() -> Option<Self> {
         let home = env::var_os("HOME").map(PathBuf::from)?;
@@ -98,6 +100,8 @@ impl HerdrClient {
     ///
     /// The configured path has highest priority. This form keeps `oca` tests
     /// and alternate state roots independent of the ambient home directory.
+    /// The resolved candidate must pass the bounded liveness probe, so a stale
+    /// socket file reads as no herdr at all.
     #[must_use]
     pub fn discover_from(
         home: &Path,
@@ -114,7 +118,7 @@ impl HerdrClient {
                     .map(|root| root.join("herdr/herdr.sock"))
             })
             .unwrap_or_else(|| home.join(".config/herdr/herdr.sock"));
-        socket_path.exists().then_some(Self {
+        socket_accepts_connections(&socket_path).then_some(Self {
             socket_path,
             timeout,
         })

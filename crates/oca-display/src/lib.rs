@@ -1,5 +1,6 @@
 mod herdr;
 mod output;
+mod probe;
 mod tmux;
 
 pub use herdr::{AgentId, HerdrClient, HerdrError, TabId, WorkspaceId};
