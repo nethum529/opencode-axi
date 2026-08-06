@@ -129,11 +129,13 @@ fn plain_ls_surfaces_only_out_of_scope_running_refs_without_turn_evidence() {
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
     let page: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(page["total"], 2);
+    assert_eq!(page["total"], 3);
     assert_eq!(page["items"][0]["ref"], "w00004");
     assert_eq!(page["items"][0]["state"], "blocked");
     assert_eq!(page["items"][1]["ref"], "w00001");
     assert_eq!(page["items"][1]["state"], "running");
+    assert_eq!(page["items"][2]["ref"], "w00003");
+    assert_eq!(page["items"][2]["state"], "running");
 }
 
 #[test]

@@ -5,8 +5,8 @@ use std::{cmp::Ordering, collections::HashMap, fs, path::Path, time::Duration};
 use oca_core::{ErrorCode, OcaError, RefId};
 use oca_display::{ListDocument, ListItem};
 use oca_state::{
-    EventJournal, IntentPhase, IntentStore, JournalError, OcaConfig, RefListFilter, RefRecord,
-    RefState, RefStore, RefStorePaths, prune_expired_journals,
+    EventJournal, JournalError, OcaConfig, RefListFilter, RefRecord, RefState, RefStore,
+    RefStorePaths, prune_expired_journals,
 };
 
 use crate::{
@@ -202,9 +202,7 @@ fn is_attention_record(
 /// Returns whether local state proves that this ref's current turn progressed.
 ///
 /// This mirrors worker-health's `NO_TURN_EVIDENCE` check: a non-empty
-/// per-message journal is evidence. An intent at or beyond `running` is also
-/// evidence because that phase is persisted only after prompt admission has
-/// been confirmed.
+/// per-message journal is the only evidence.
 fn has_turn_evidence(home: &Path, record: &RefRecord) -> bool {
     let state_directory = home.join(".oca");
     let journal_evidence = record.message_id.as_deref().is_some_and(|message_id| {
@@ -216,12 +214,9 @@ fn has_turn_evidence(home: &Path, record: &RefRecord) -> bool {
         };
         fs::metadata(journal.path()).is_ok_and(|metadata| metadata.is_file() && metadata.len() > 0)
     });
-    let intent_evidence = IntentStore::in_directory(state_directory)
-        .read(&record.id)
-        .ok()
-        .flatten()
-        .is_some_and(|intent| intent.phase >= IntentPhase::Running);
-    journal_evidence || intent_evidence
+    // A live out-of-scope worker may briefly surface before its first journal
+    // event; that is the safe direction for an operator-facing listing.
+    journal_evidence
 }
 
 fn runtime_error(detail: impl std::fmt::Display) -> OcaError {
