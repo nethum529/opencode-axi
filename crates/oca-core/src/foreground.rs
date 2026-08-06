@@ -94,10 +94,12 @@ pub trait ForegroundBackend {
         prompt: &DispatchPrompt,
     ) -> Result<(), OcaError>;
 
-    /// Confirms that an asynchronously accepted prompt is visible in the
-    /// authoritative session before any dispatch mode can acknowledge or wait.
+    /// Confirms an asynchronously accepted prompt from the already-open event
+    /// subscription, with the authoritative session read available as a
+    /// fallback, before any dispatch mode can acknowledge or wait.
     async fn confirm_prompt_landed(
         &mut self,
+        _subscription: &mut Self::Subscription,
         _session_id: &str,
         _prompt: &DispatchPrompt,
     ) -> Result<(), OcaError> {
@@ -280,7 +282,8 @@ where
         Err(error) if is_prompt_uncertain(&error) => return Err(error),
         Err(error) => return Err(backend.fail_before_prompt(error)),
     }
-    backend.confirm_prompt_landed(&session_id, &prompt).await?;
+    let confirmation = backend.confirm_prompt_landed(&mut subscription, &session_id, &prompt);
+    confirmation.await?;
     backend.mark_prompt_running()?;
 
     let pending = backend.write_ref(&session_id, &message_id, &request)?;
@@ -563,6 +566,7 @@ mod tests {
 
         async fn confirm_prompt_landed(
             &mut self,
+            _subscription: &mut Self::Subscription,
             _session_id: &str,
             _prompt: &DispatchPrompt,
         ) -> Result<(), OcaError> {

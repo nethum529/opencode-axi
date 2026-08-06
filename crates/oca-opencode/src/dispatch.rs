@@ -46,11 +46,46 @@ pub fn is_target_session_idle(event: &SseEvent, session_id: &str) -> bool {
         == Some(session_id)
 }
 
+/// Recognizes a streamed message projection carrying the caller-minted user
+/// message ID. Both whole-message and part updates are accepted because either
+/// proves that the server stored and began publishing the target prompt.
+#[must_use]
+pub fn is_target_message_event(event: &SseEvent, session_id: &str, message_id: &str) -> bool {
+    let Ok(payload) = serde_json::from_str::<Value>(&event.data) else {
+        return false;
+    };
+    let payload_type = payload.get("type").and_then(Value::as_str);
+    let event_type = payload_type.or(event.event.as_deref());
+    if !matches!(event_type, Some("message.updated" | "message.part.updated")) {
+        return false;
+    }
+
+    let properties = payload
+        .get("properties")
+        .or_else(|| payload.get("data"))
+        .unwrap_or(&payload);
+    let projection = if event_type == Some("message.updated") {
+        properties.get("info").unwrap_or(properties)
+    } else {
+        properties.get("part").unwrap_or(properties)
+    };
+
+    projection.get("sessionID").and_then(Value::as_str) == Some(session_id)
+        && projection
+            .get(if event_type == Some("message.updated") {
+                "id"
+            } else {
+                "messageID"
+            })
+            .and_then(Value::as_str)
+            == Some(message_id)
+}
+
 #[cfg(test)]
 mod tests {
     use serde_json::{Map, json};
 
-    use super::{attributed_structured_reply, is_target_session_idle};
+    use super::{attributed_structured_reply, is_target_message_event, is_target_session_idle};
     use crate::{MessageWithParts, SseEvent};
 
     #[test]
@@ -96,6 +131,35 @@ mod tests {
         ] {
             assert!(is_target_session_idle(&event, "ses_target"));
             assert!(!is_target_session_idle(&event, "ses_other"));
+        }
+    }
+
+    #[test]
+    fn message_filter_accepts_only_the_target_message_projection() {
+        for event in [
+            SseEvent {
+                id: Some("evt_message".to_owned()),
+                event: None,
+                data: json!({
+                    "type":"message.updated",
+                    "properties":{"info":{
+                        "id":"msg_target", "sessionID":"ses_target", "role":"user"
+                    }}
+                })
+                .to_string(),
+            },
+            SseEvent {
+                id: Some("evt_part".to_owned()),
+                event: Some("message.part.updated".to_owned()),
+                data: json!({"part":{
+                    "id":"prt_target", "messageID":"msg_target", "sessionID":"ses_target"
+                }})
+                .to_string(),
+            },
+        ] {
+            assert!(is_target_message_event(&event, "ses_target", "msg_target"));
+            assert!(!is_target_message_event(&event, "ses_other", "msg_target"));
+            assert!(!is_target_message_event(&event, "ses_target", "msg_other"));
         }
     }
 

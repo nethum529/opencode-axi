@@ -1,6 +1,7 @@
 //! Production adapters for the core foreground dispatch state machine.
 
 use std::{
+    collections::VecDeque,
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
@@ -14,9 +15,9 @@ use oca_core::{
 };
 use oca_display::{Acknowledgement, CompletionRecord, HerdrClient};
 use oca_opencode::{
-    CreateSessionRequest, MessageWithParts, OpenCodeClient, PromptRequest, SseError,
-    SseSourceErrorKind, Subscription, TextPart, attributed_structured_reply,
-    is_target_session_idle,
+    CreateSessionRequest, MessageWithParts, OpenCodeClient, OpenCodeError, PromptRequest, SseError,
+    SseEvent, SseSourceErrorKind, Subscription, TextPart, attributed_structured_reply,
+    is_target_message_event, is_target_session_idle,
 };
 use oca_server::{ConnectOrStart, SystemRuntime};
 use oca_state::{
@@ -35,6 +36,47 @@ use crate::{
 const PROMPT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(2);
 const PROMPT_CONFIRM_INITIAL_BACKOFF: Duration = Duration::from_millis(20);
 const PROMPT_CONFIRM_MAX_BACKOFF: Duration = Duration::from_millis(200);
+
+enum PromptConfirmationCheck {
+    Stream(Result<Option<SseEvent>, SseError>),
+    History(Result<Vec<MessageWithParts>, OpenCodeError>),
+}
+
+enum PromptHistoryEvidence {
+    Missing,
+    Rejected(String),
+    Failed(String),
+    TimedOut,
+}
+
+pub(crate) struct DispatchSubscription {
+    inner: Subscription,
+    pending: VecDeque<Result<Option<SseEvent>, SseError>>,
+}
+
+impl DispatchSubscription {
+    fn new(inner: Subscription) -> Self {
+        Self {
+            inner,
+            pending: VecDeque::new(),
+        }
+    }
+
+    async fn next(&mut self) -> Result<Option<SseEvent>, SseError> {
+        match self.pending.pop_front() {
+            Some(result) => result,
+            None => self.inner.next().await,
+        }
+    }
+
+    async fn next_confirmation(&mut self) -> Result<Option<SseEvent>, SseError> {
+        self.inner.next().await
+    }
+
+    fn preserve(&mut self, result: Result<Option<SseEvent>, SseError>) {
+        self.pending.push_back(result);
+    }
+}
 
 /// Executes a parsed foreground dispatch using the user's local state root.
 ///
@@ -219,13 +261,15 @@ impl ProductionBackend {
 
     async fn confirm_prompt_visibility(
         &mut self,
+        subscription: &mut DispatchSubscription,
         session_id: &str,
         prompt: &DispatchPrompt,
     ) -> Result<(), OcaError> {
         let started = tokio::time::Instant::now();
         let mut backoff = PROMPT_CONFIRM_INITIAL_BACKOFF;
         let expected_hash = prompt_sha256(&prompt.text);
-        let mut last_error = None;
+        let mut history_evidence = PromptHistoryEvidence::Missing;
+        let mut stream_open = true;
 
         loop {
             let elapsed = started.elapsed();
@@ -233,8 +277,37 @@ impl ProductionBackend {
                 break;
             };
             let attempt_timeout = remaining.min(PROMPT_CONFIRM_MAX_BACKOFF);
-            match tokio::time::timeout(attempt_timeout, self.client()?.messages(session_id)).await {
-                Ok(Ok(messages)) => {
+            let client = self.client()?;
+            let check = tokio::time::timeout(attempt_timeout, async {
+                if stream_open {
+                    tokio::select! {
+                        biased;
+                        event = subscription.next_confirmation() => {
+                            PromptConfirmationCheck::Stream(event)
+                        },
+                        history = client.messages(session_id) => {
+                            PromptConfirmationCheck::History(history)
+                        }
+                    }
+                } else {
+                    PromptConfirmationCheck::History(client.messages(session_id).await)
+                }
+            })
+            .await;
+            match check {
+                Ok(PromptConfirmationCheck::Stream(Ok(Some(event)))) => {
+                    if is_target_message_event(&event, session_id, &prompt.message_id) {
+                        return Ok(());
+                    }
+                    subscription.preserve(Ok(Some(event)));
+                    continue;
+                }
+                Ok(PromptConfirmationCheck::Stream(result @ (Ok(None) | Err(_)))) => {
+                    stream_open = false;
+                    subscription.preserve(result);
+                    continue;
+                }
+                Ok(PromptConfirmationCheck::History(Ok(messages))) => {
                     if user_prompt_is_visible(
                         &messages,
                         session_id,
@@ -243,9 +316,18 @@ impl ProductionBackend {
                     ) {
                         return Ok(());
                     }
+                    history_evidence = PromptHistoryEvidence::Missing;
                 }
-                Ok(Err(error)) => last_error = Some(error.to_string()),
-                Err(_) => last_error = Some("message lookup timed out".to_owned()),
+                Ok(PromptConfirmationCheck::History(Err(error))) => {
+                    let rendered = error.to_string();
+                    history_evidence = match error {
+                        OpenCodeError::Server { status: 400, .. } => {
+                            PromptHistoryEvidence::Rejected(rendered)
+                        }
+                        _ => PromptHistoryEvidence::Failed(rendered),
+                    };
+                }
+                Err(_) => history_evidence = PromptHistoryEvidence::TimedOut,
             }
 
             let elapsed = started.elapsed();
@@ -256,10 +338,21 @@ impl ProductionBackend {
             backoff = backoff.saturating_mul(2).min(PROMPT_CONFIRM_MAX_BACKOFF);
         }
 
-        let detail = last_error.map_or_else(
-            || "the accepted user message did not appear in session history".to_owned(),
-            |error| format!("session history could not confirm the accepted prompt: {error}"),
-        );
+        let detail = match history_evidence {
+            PromptHistoryEvidence::Missing => {
+                "the accepted user message did not appear in session history".to_owned()
+            }
+            PromptHistoryEvidence::Rejected(error) => {
+                format!("the session history endpoint rejected its stored records: {error}")
+            }
+            PromptHistoryEvidence::Failed(error) => {
+                format!("session history could not confirm the accepted prompt: {error}")
+            }
+            PromptHistoryEvidence::TimedOut => {
+                "session history could not confirm the accepted prompt: message lookup timed out"
+                    .to_owned()
+            }
+        };
         let error = OcaError::new(ErrorCode::PromptUncertain)
             .with_error(format!(
                 "{detail} within {} ms",
@@ -335,7 +428,7 @@ impl ProductionBackend {
 }
 
 impl ForegroundBackend for ProductionBackend {
-    type Subscription = Subscription;
+    type Subscription = DispatchSubscription;
     type PendingRef = PendingProductionRef;
 
     fn prepare(&mut self, request: &mut ForegroundRequest) -> Result<(), OcaError> {
@@ -444,6 +537,7 @@ impl ForegroundBackend for ProductionBackend {
         self.client()?
             .subscribe(None)
             .await
+            .map(DispatchSubscription::new)
             .map_err(open_code_error)
     }
 
@@ -510,10 +604,12 @@ impl ForegroundBackend for ProductionBackend {
 
     async fn confirm_prompt_landed(
         &mut self,
+        subscription: &mut Self::Subscription,
         session_id: &str,
         prompt: &DispatchPrompt,
     ) -> Result<(), OcaError> {
-        self.confirm_prompt_visibility(session_id, prompt).await
+        self.confirm_prompt_visibility(subscription, session_id, prompt)
+            .await
     }
 
     fn fail_before_prompt(&mut self, error: OcaError) -> OcaError {
