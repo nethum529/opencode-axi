@@ -1071,6 +1071,30 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_zero_backoff_park_is_bounded_by_the_reconnect_floor() {
+        let transport = AlwaysEmptyTransport::new(None);
+
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(90),
+            follow_until_terminal_with_policy(
+                &transport,
+                &target(),
+                None,
+                None::<&mut Journal>,
+                test_policy(),
+            ),
+        )
+        .await;
+
+        assert!(outcome.is_err(), "a zero-backoff park must not terminate");
+        let subscriptions = transport.subscriptions.load(AtomicOrdering::Relaxed);
+        assert!(
+            subscriptions <= 20,
+            "without a reconnect floor a zero-backoff park busy-spins; got {subscriptions} subscriptions in 90ms"
+        );
+    }
+
     #[test]
     fn reconnect_delay_has_a_floor_after_a_zero_elapsed_budget() {
         let delay = reconnect_delay(
