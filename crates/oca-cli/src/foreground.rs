@@ -69,10 +69,17 @@ impl DispatchSubscription {
         }
     }
 
+    /// Reads past the buffer deliberately: confirmation only ever runs before
+    /// any downstream read, so `pending` holds exactly the events this loop has
+    /// already inspected and replaying them here would re-inspect them.
     async fn next_confirmation(&mut self) -> Result<Option<SseEvent>, SseError> {
         self.inner.next().await
     }
 
+    /// Queues one inspected event for the downstream consumer. Appending keeps
+    /// `pending` in arrival order, so `next` replays the stream exactly as it
+    /// arrived. The confirming event itself is deliberately not preserved: it
+    /// identifies our own user message, which no downstream consumer acts on.
     fn preserve(&mut self, result: Result<Option<SseEvent>, SseError>) {
         self.pending.push_back(result);
     }
