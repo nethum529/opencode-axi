@@ -88,11 +88,6 @@ mod tests {
         type Subscription = Subscription;
         type PendingRef = String;
 
-        async fn ensure_agent(&mut self, _request: &BackgroundRequest) -> Result<(), OcaError> {
-            self.calls.push("agent");
-            Ok(())
-        }
-
         async fn create_session(
             &mut self,
             _request: &BackgroundRequest,
@@ -117,7 +112,7 @@ mod tests {
             _prompt: &DispatchPrompt,
         ) -> Result<(), OcaError> {
             self.calls.push("prompt");
-            assert_eq!(self.calls[1..3], ["create", "subscribe"]);
+            assert_eq!(self.calls[..2], ["create", "subscribe"]);
             Ok(())
         }
 
@@ -208,7 +203,6 @@ mod tests {
         assert_eq!(
             backend.calls,
             [
-                "agent",
                 "create",
                 "subscribe",
                 "mint",

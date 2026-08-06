@@ -193,7 +193,6 @@ fn warm_prefix_sources_reject_forbidden_operation_families() {
         dispatch_prefix,
         &[
             "backend.prepare(",
-            "backend.ensure_agent(",
             "backend.create_session(",
             "backend.subscribe(",
             "backend.prompt_async(",

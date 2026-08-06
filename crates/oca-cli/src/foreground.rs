@@ -1,7 +1,6 @@
 //! Production adapters for the core foreground dispatch state machine.
 
 use std::{
-    collections::HashSet,
     io::{self, Write},
     path::{Path, PathBuf},
     process::{Command as ProcessCommand, Stdio},
@@ -28,9 +27,7 @@ use crate::{
     DispatchCommand,
     crash_recovery::{RESERVED_SESSION_ID, intent_failpoint, persist_intent, prompt_sha256},
     scope::Scope,
-    transport::{
-        CreateSessionOperation, ListAgentsOperation, connect_error, open_code_error, prompt_error,
-    },
+    transport::{CreateSessionOperation, create_session_error, open_code_error, prompt_error},
     worktree_dispatch::{WorktreeDispatch, finalize_turn},
 };
 
@@ -150,7 +147,6 @@ pub(crate) struct ProductionBackend {
     scope: Scope,
     worktree: Option<WorktreeDispatch>,
     dispatch_cwd: Option<PathBuf>,
-    available_agents: Option<HashSet<String>>,
 }
 
 pub(crate) enum PendingProductionRef {
@@ -180,7 +176,6 @@ impl ProductionBackend {
             scope,
             worktree,
             dispatch_cwd: None,
-            available_agents: None,
         }
     }
 
@@ -390,37 +385,6 @@ impl ForegroundBackend for ProductionBackend {
         Ok(())
     }
 
-    async fn ensure_agent(&mut self, request: &ForegroundRequest) -> Result<(), OcaError> {
-        if self.available_agents.is_none() {
-            let mut operation = ListAgentsOperation::new(request.cwd.display().to_string());
-            let agents = self
-                .manager
-                .connect_or_start(&self.runtime, &mut operation)
-                .await
-                .map_err(connect_error)
-                .map_err(|error| self.cleanup_pre_prompt_failure(error))?;
-            self.available_agents = Some(agents.into_iter().map(|agent| agent.name).collect());
-        }
-
-        let agent = request.role.as_str();
-        if self
-            .available_agents
-            .as_ref()
-            .is_some_and(|agents| agents.contains(agent))
-        {
-            return Ok(());
-        }
-
-        let error = OcaError::new(ErrorCode::ProtocolMismatch)
-            .with_error(format!(
-                "OpenCode agent `{agent}` is not registered in ~/.config/opencode/opencode.jsonc"
-            ))
-            .with_help(format!(
-                "Register agent `{agent}` in ~/.config/opencode/opencode.jsonc and retry"
-            ));
-        Err(self.cleanup_pre_prompt_failure(error))
-    }
-
     async fn create_session(&mut self, request: &ForegroundRequest) -> Result<String, OcaError> {
         let permission =
             serde_json::to_value(request.policy.permission_profile()).map_err(|error| {
@@ -447,7 +411,7 @@ impl ForegroundBackend for ProductionBackend {
         {
             Ok(session) => session,
             Err(error) => {
-                return Err(self.cleanup_pre_prompt_failure(connect_error(error)));
+                return Err(self.cleanup_pre_prompt_failure(create_session_error(error)));
             }
         };
         let record = self
@@ -537,10 +501,6 @@ impl ForegroundBackend for ProductionBackend {
                     self.preserve_uncertain_prompt(session_id, prompt, error)
                 } else {
                     let reference = self.reference()?.to_owned();
-                    if self.worktree.is_none() {
-                        let _ = self.intents.remove(&reference);
-                        let _ = self.refs.discard_unacknowledged(&reference);
-                    }
                     Err(error.with_ref(reference))
                 }
             }
@@ -553,6 +513,10 @@ impl ForegroundBackend for ProductionBackend {
         prompt: &DispatchPrompt,
     ) -> Result<(), OcaError> {
         self.confirm_prompt_visibility(session_id, prompt).await
+    }
+
+    fn fail_before_prompt(&mut self, error: OcaError) -> OcaError {
+        self.cleanup_pre_prompt_failure(error)
     }
 
     fn mark_prompt_running(&mut self) -> Result<(), OcaError> {
