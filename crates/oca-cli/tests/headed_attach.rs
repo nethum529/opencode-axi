@@ -26,7 +26,7 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
     init_repository(home.path());
     let socket = home.path().join("fake-herdr.sock");
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let herdr = spawn_herdr_lifecycle(&socket, Arc::clone(&calls));
+    let herdr = spawn_herdr_lifecycle(&socket, 2, Arc::clone(&calls));
     let (port, opencode, release_terminal) = spawn_headed_background_opencode();
     prepare_dispatch_home(home.path(), &socket, port);
 
@@ -178,6 +178,7 @@ fn headed_background_missing_prompt_is_uncertain_and_never_spawns_attach() {
     assert_eq!(error.code(), ErrorCode::PromptUncertain.as_str());
     let reference = error.reference().expect("uncertain ref is surfaced");
 
+    accept_discovery_probe(&herdr);
     assert!(matches!(
         herdr.accept(),
         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
@@ -229,7 +230,7 @@ fn headed_attach_records_and_closes_the_tab_after_terminal_state() {
     let home = tempfile::tempdir().unwrap();
     let socket = home.path().join("fake-herdr.sock");
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let herdr = spawn_herdr_lifecycle(&socket, Arc::clone(&calls));
+    let herdr = spawn_herdr_lifecycle(&socket, 1, Arc::clone(&calls));
     let (port, opencode) = spawn_attach_opencode();
     prepare_attach_home(home.path(), &socket, port, "herdr");
 
@@ -584,10 +585,16 @@ fn a_malformed_herdr_envelope_never_fails_the_dispatch() {
     herdr.join().unwrap();
 }
 
-fn spawn_herdr_lifecycle(socket: &Path, calls: Arc<Mutex<Vec<Value>>>) -> thread::JoinHandle<()> {
+fn spawn_herdr_lifecycle(
+    socket: &Path,
+    discovery_probe_count: usize,
+    calls: Arc<Mutex<Vec<Value>>>,
+) -> thread::JoinHandle<()> {
     let listener = UnixListener::bind(socket).unwrap();
     thread::spawn(move || {
-        accept_discovery_probe(&listener);
+        for _ in 0..discovery_probe_count {
+            accept_discovery_probe(&listener);
+        }
         for index in 0..5 {
             let mut stream = accept_unix_with_timeout(&listener);
             let request = read_unix_request(&stream);
@@ -645,6 +652,10 @@ fn accept_unix_with_timeout(listener: &UnixListener) -> UnixStream {
                 thread::sleep(Duration::from_millis(5));
             }
             Err(error) => panic!("could not accept a herdr socket connection: {error}"),
+        }
+    }
+}
+
 fn spawn_herdr_with_attached_process(
     socket: &Path,
     fake_opencode: PathBuf,
@@ -655,7 +666,12 @@ fn spawn_herdr_with_attached_process(
     thread::spawn(move || {
         let mut calls = Vec::new();
         let mut attached = None;
+        accept_discovery_probe(&listener);
+        accept_discovery_probe(&listener);
         for index in 0..5 {
+            if index == 4 {
+                accept_discovery_probe(&listener);
+            }
             let (mut stream, _) = accept_unix_before(&listener, Duration::from_secs(3));
             let request = read_unix_request(&stream);
             let request_id = request["id"].as_str().unwrap();

@@ -205,6 +205,7 @@ fn abort_closes_the_persisted_herdr_tab() {
         .expect("record herdr tab");
     let herdr = thread::spawn(move || {
         let listener = UnixListener::bind(socket).expect("fake herdr binds");
+        accept_discovery_probe(&listener);
         let (mut stream, _) = accept_unix_before(&listener, Duration::from_secs(1));
         let request = read_unix_request(&stream);
         let request_id = request["id"].as_str().expect("herdr request id");
@@ -246,6 +247,7 @@ fn abort_is_idempotent_when_the_herdr_tab_or_server_is_already_gone() {
         let herdr = (!server_gone).then(|| {
             thread::spawn(move || {
                 let listener = UnixListener::bind(socket).expect("fake herdr binds");
+                accept_discovery_probe(&listener);
                 let (mut stream, _) = accept_unix_before(&listener, Duration::from_secs(1));
                 let request = read_unix_request(&stream);
                 let request_id = request["id"].as_str().expect("herdr request id");
@@ -319,6 +321,7 @@ fn aborts_herdr_cleanup_wait_is_bounded_by_the_configured_timeout() {
         .expect("record herdr tab");
     let herdr = thread::spawn(move || {
         let listener = UnixListener::bind(socket).expect("fake herdr binds");
+        accept_discovery_probe(&listener);
         let (stream, _) = accept_unix_before(&listener, Duration::from_secs(1));
         let _request = read_unix_request(&stream);
         thread::sleep(Duration::from_millis(100));
@@ -481,6 +484,19 @@ fn accept_unix_before(
             Err(error) => panic!("fake herdr accept failed: {error}"),
         }
     }
+}
+
+fn accept_discovery_probe(listener: &UnixListener) {
+    let (mut stream, _) = accept_unix_before(listener, Duration::from_secs(1));
+    stream
+        .set_read_timeout(Some(Duration::from_secs(1)))
+        .expect("fake herdr probe read timeout");
+    let mut byte = [0];
+    assert_eq!(
+        stream.read(&mut byte).expect("read herdr discovery probe"),
+        0,
+        "herdr discovery probe must not send a protocol request"
+    );
 }
 
 fn read_unix_request(stream: &UnixStream) -> Value {
