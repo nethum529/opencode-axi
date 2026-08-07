@@ -8,7 +8,12 @@ use serde_json::json;
 pub(crate) const HISTORY_UNREADABLE_EVENT: &str = "oca.history.unreadable";
 
 const COMPOSER_GUARD: &str = "DO NOT TYPE: composer unbound";
-const HISTORY_LABEL_WARNING: &str = "HISTORY UNREADABLE: retryCount poisoning";
+const HISTORY_LABEL_WARNING: &str = "HISTORY UNREADABLE";
+const RETRY_POISONING_LABEL_SUFFIX: &str = ": retryCount poisoning";
+
+/// Only the schema rejection behind the upstream poisoning answers with 400. Any
+/// other status is a different failure and must not be attributed to it.
+const RETRY_POISONING_STATUS: u16 = 400;
 
 /// Result of the explicit history read made at a user-visible attach/follow boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,19 +30,28 @@ pub(crate) enum HistoryProbe {
 }
 
 impl HistoryProbe {
-    pub(crate) const fn is_unreadable(&self) -> bool {
-        matches!(self, Self::Unreadable { .. } | Self::RateLimited { .. })
+    pub(crate) fn warning(&self) -> Option<String> {
+        let status = self.status()?;
+        Some(format!(
+            "OpenCode session history is unreadable (HTTP {status}); {}, so the attached TUI can render an empty conversation",
+            cause(status)
+        ))
     }
 
-    pub(crate) fn warning(&self) -> Option<String> {
-        let status = match self {
-            Self::Unreadable { status } => *status,
-            Self::RateLimited { .. } => 429,
-            Self::Readable | Self::Indeterminate => return None,
-        };
-        Some(format!(
-            "OpenCode session history is unreadable (HTTP {status}); known upstream retryCount-in-format poisoning can make the attached TUI appear empty"
-        ))
+    const fn status(&self) -> Option<u16> {
+        match self {
+            Self::Unreadable { status } => Some(*status),
+            Self::RateLimited { .. } => Some(429),
+            Self::Readable | Self::Indeterminate => None,
+        }
+    }
+}
+
+fn cause(status: u16) -> &'static str {
+    if status == RETRY_POISONING_STATUS {
+        "known upstream retryCount-in-format poisoning rejects the stored messages"
+    } else {
+        "the server refused the history read"
     }
 }
 
@@ -62,10 +76,8 @@ pub(crate) fn journal_history_diagnostic<J: EventJournalWriter>(
     session_id: &str,
     probe: &HistoryProbe,
 ) -> Result<(), String> {
-    let status = match probe {
-        HistoryProbe::Unreadable { status } => *status,
-        HistoryProbe::RateLimited { .. } => 429,
-        HistoryProbe::Readable | HistoryProbe::Indeterminate => return Ok(()),
+    let Some(status) = probe.status() else {
+        return Ok(());
     };
     journal.append(&OcaEvent {
         id: None,
@@ -75,7 +87,7 @@ pub(crate) fn journal_history_diagnostic<J: EventJournalWriter>(
         payload: Some(json!({
             "status": status,
             "condition": "session history unreadable",
-            "cause": "known upstream retryCount-in-format poisoning",
+            "cause": cause(status),
             "effect": "attached TUI may render an empty conversation",
         })),
         message: None,
@@ -103,9 +115,12 @@ pub(crate) fn tab_label(
         },
     );
     let mut label = format!("{reference} | {agent} | {model} | {variant} | {COMPOSER_GUARD}");
-    if probe.is_unreadable() {
+    if let Some(status) = probe.status() {
         label.push_str(" | ");
         label.push_str(HISTORY_LABEL_WARNING);
+        if status == RETRY_POISONING_STATUS {
+            label.push_str(RETRY_POISONING_LABEL_SUFFIX);
+        }
     }
     label
 }
@@ -141,6 +156,22 @@ mod tests {
         );
 
         assert!(label.contains("HISTORY UNREADABLE: retryCount poisoning"));
+    }
+
+    #[test]
+    fn a_history_failure_other_than_the_schema_rejection_is_not_blamed_on_retry_count() {
+        let probe = HistoryProbe::Unreadable { status: 503 };
+        let label = tab_label(
+            "wabc12",
+            &record("flash", "high", "impl"),
+            &OcaConfig::default(),
+            &probe,
+        );
+
+        assert!(label.ends_with("| HISTORY UNREADABLE"));
+        let warning = probe.warning().expect("a rejected read warns");
+        assert!(warning.contains("(HTTP 503)"));
+        assert!(!warning.contains("retryCount"));
     }
 
     fn record(alias: &str, effort: &str, role: &str) -> RefRecord {
