@@ -621,6 +621,47 @@ fn terminal_rename_remains_visible_when_close_on_done_is_false() {
 }
 
 #[test]
+fn a_failed_terminal_rename_still_closes_the_tab_it_could_not_mark() {
+    let home = tempfile::tempdir().unwrap();
+    let socket = home.path().join("fake-herdr.sock");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let herdr = spawn_herdr_lifecycle_with_rename(&socket, 1, true, false, Arc::clone(&calls));
+    let (port, opencode) = spawn_attach_opencode(false);
+    prepare_attach_home(home.path(), &socket, port, "herdr");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["__attach", "wabc12", "ses_target", "/worker", "sayHi"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "display stays best effort: a marker failure cannot fail the helper"
+    );
+    herdr.join().unwrap();
+    opencode.join().unwrap();
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "workspace.list",
+            "workspace.create",
+            "tab.create",
+            "agent.start",
+            "agent.rename",
+            "tab.close"
+        ],
+        "a marker oca could not publish must never strand the tab it was closing"
+    );
+}
+
+#[test]
 fn a_follow_failure_keeps_the_persisted_tab_open_for_an_explicit_kill() {
     let home = tempfile::tempdir().unwrap();
     let socket = home.path().join("fake-herdr.sock");
@@ -990,6 +1031,16 @@ fn spawn_herdr_lifecycle(
     close_on_done: bool,
     calls: Arc<Mutex<Vec<Value>>>,
 ) -> thread::JoinHandle<()> {
+    spawn_herdr_lifecycle_with_rename(socket, discovery_probe_count, close_on_done, true, calls)
+}
+
+fn spawn_herdr_lifecycle_with_rename(
+    socket: &Path,
+    discovery_probe_count: usize,
+    close_on_done: bool,
+    rename_succeeds: bool,
+    calls: Arc<Mutex<Vec<Value>>>,
+) -> thread::JoinHandle<()> {
     let listener = UnixListener::bind(socket).unwrap();
     thread::spawn(move || {
         for _ in 0..discovery_probe_count {
@@ -1015,6 +1066,9 @@ fn spawn_herdr_lifecycle(
                     "type":"agent_started",
                     "agent":{"terminal_id":"term1"}
                 }),
+                // An unparseable result is the envelope failure the client
+                // reports for a rename herdr could not apply.
+                4 if !rename_succeeds => json!({}),
                 4 | 5 => json!({"type":"ok"}),
                 _ => unreachable!(),
             };
