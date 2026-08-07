@@ -1,0 +1,18 @@
+[
+  {
+    "info": {
+      "id": "msg_assistant",
+      "sessionID": "ses_target",
+      "role": "assistant",
+      "parentID": "msg_this_dispatch",
+      "time": { "created": 10, "completed": 20 },
+      "finish": "stop"
+    },
+    "parts": [
+      {
+        "type": "text",
+        "text": "The requested work is complete and the deterministic checks pass. Nothing remains for a later turn.\n\n```json\n{\"status\":\"partial\",\"files\":[\"src/follow.rs\"],\"note\":\"The requested classifier work is implemented and its deterministic checks pass. One unrelated verification gate remains outside this fixture, so the worker truthfully reports a partial terminal state.\"}\n```"
+      }
+    ]
+  }
+]

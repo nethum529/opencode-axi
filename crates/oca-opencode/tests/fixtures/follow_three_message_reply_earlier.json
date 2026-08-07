@@ -29,7 +29,7 @@
       { "type": "reasoning", "text": "Report the completed work." },
       {
         "type": "text",
-        "text": "{\"status\":\"done\",\"files\":[\"src/follow.rs\"],\"note\":\"The classifier now walks every attributed assistant message in the completed turn and selects the newest valid structured worker reply before finalization. Deterministic fixtures cover both successful multi-step decoding and truthful rejection when no status reply exists.\"}"
+        "text": "I updated the turn classifier and added deterministic coverage for the attributed chain. The final verification passes.\n\n```json\n{\"status\":\"done\",\"files\":[\"src/follow.rs\"],\"note\":\"The classifier now walks every attributed assistant message in the completed turn and selects the newest valid fenced worker reply before finalization. Deterministic fixtures cover both successful multi-step decoding and truthful rejection when no status reply exists.\"}\n```"
       },
       { "type": "tool", "tool": "bash" },
       { "type": "step-finish", "reason": "tool-calls" }
@@ -63,7 +63,7 @@
     "parts": [
       {
         "type": "text",
-        "text": "{\"status\":\"blocked\",\"files\":[\"src/other.rs\"],\"note\":\"This reply belongs to a different dispatch in the same session and must never be attributed to this turn.\"}"
+        "text": "Another dispatch finished.\n```json\n{\"status\":\"blocked\",\"files\":[\"src/other.rs\"],\"note\":\"This reply belongs to a different dispatch in the same session and must never be attributed to this turn.\"}\n```"
       }
     ]
   }

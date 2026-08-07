@@ -22,6 +22,7 @@ pub struct OcaConfig {
     pub schema_version: u32,
     pub models: BTreeMap<String, ModelConfig>,
     pub roles: BTreeMap<String, RoleConfig>,
+    pub dispatch: DispatchConfig,
     pub herdr: HerdrConfig,
     pub publish: PublishConfig,
     pub server: ServerConfig,
@@ -36,6 +37,7 @@ impl Default for OcaConfig {
             schema_version: 1,
             models: default_models(),
             roles: default_roles(),
+            dispatch: DispatchConfig::default(),
             herdr: HerdrConfig::default(),
             publish: PublishConfig::default(),
             server: ServerConfig::default(),
@@ -163,6 +165,7 @@ impl OcaConfig {
                 }
             }
         }
+        collect_table_diagnostics(&document, "dispatch", &["transport"], &mut diagnostics);
         collect_table_diagnostics(
             &document,
             "herdr",
@@ -269,6 +272,21 @@ impl OcaConfig {
             base: self.publish.base.clone(),
         }
     }
+}
+
+/// Controls how a worker's reply contract is carried over the OpenCode prompt boundary.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum DispatchTransport {
+    #[default]
+    Text,
+    Schema,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct DispatchConfig {
+    pub transport: DispatchTransport,
 }
 
 /// Lazily loads configuration once for the lifetime of this loader.
@@ -623,9 +641,25 @@ mod tests {
         assert!(config.models.contains_key("flash"));
         assert!(config.roles.contains_key("impl"));
         assert!(config.roles.contains_key("review"));
+        assert_eq!(config.dispatch.transport, super::DispatchTransport::Text);
         assert!(config.herdr.close_on_done);
         assert!(!config.publish.push);
         assert!(!config.publish.pr);
+    }
+
+    #[test]
+    fn dispatch_transport_defaults_to_text_and_accepts_schema_escape_hatch() {
+        let default = OcaConfig::from_toml_str("").expect("empty config is valid");
+        assert_eq!(default.dispatch.transport, super::DispatchTransport::Text);
+
+        let schema = OcaConfig::from_toml_str(
+            r#"
+[dispatch]
+transport = "schema"
+"#,
+        )
+        .expect("schema transport is valid");
+        assert_eq!(schema.dispatch.transport, super::DispatchTransport::Schema);
     }
 
     #[test]

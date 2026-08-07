@@ -248,6 +248,7 @@ mod tests {
             prompt: "do the work".to_owned(),
             role: "impl".to_owned(),
             contract: ReplyContract::Impl,
+            schema_transport: false,
             policy: WorkerPolicy::restricted([cwd.clone()]),
             cwd,
             display: DisplayMode::Headless,

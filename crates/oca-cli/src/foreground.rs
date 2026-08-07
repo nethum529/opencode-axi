@@ -21,8 +21,8 @@ use oca_opencode::{
 };
 use oca_server::{ConnectOrStart, SystemRuntime};
 use oca_state::{
-    Intent, IntentOperation, IntentPhase, IntentRequest, IntentStore, NewRef, OcaConfig,
-    PendingRefAllocation, RefState, RefStore, RefStorePaths,
+    DispatchTransport, Intent, IntentOperation, IntentPhase, IntentRequest, IntentStore, NewRef,
+    OcaConfig, PendingRefAllocation, RefState, RefStore, RefStorePaths,
 };
 
 use crate::{
@@ -278,6 +278,7 @@ pub(crate) fn prepare_dispatch(
         prompt: command.prompt,
         role: command.role,
         contract,
+        schema_transport: config.dispatch.transport == DispatchTransport::Schema,
         policy,
         cwd,
         display,
@@ -363,10 +364,11 @@ impl ProductionBackend {
             Err(OpenCodeError::Server { status: 400, .. }) => return Ok(None),
             Err(error) => return Err(open_code_error(error)),
         };
-        Ok(
-            attributed_structured_reply(&messages, session_id, message_id)
-                .map(|structured| TerminalReply { structured }),
-        )
+        attributed_structured_reply(&messages, session_id, message_id)
+            .map(|reply| reply.map(|structured| TerminalReply { structured }))
+            .map_err(|error| {
+                OcaError::new(ErrorCode::ProtocolMismatch).with_error(error.to_string())
+            })
     }
 
     fn preserve_uncertain_prompt(
@@ -603,7 +605,7 @@ impl ForegroundBackend for ProductionBackend {
                     parts: vec![TextPart {
                         text: prompt.text.clone(),
                     }],
-                    output_schema: Some(prompt.output_schema.clone()),
+                    output_schema: prompt.output_schema.clone(),
                     permission: prompt.permission.clone(),
                 },
             )
@@ -805,6 +807,9 @@ impl ForegroundBackend for ProductionBackend {
                 if let Some(reply) = self.read_attributed_reply(session_id, message_id).await? {
                     return Ok(reply);
                 }
+                return Err(OcaError::new(ErrorCode::ProtocolMismatch).with_error(
+                    "completed attributed assistant message chain has no valid worker status reply",
+                ));
             }
         }
     }

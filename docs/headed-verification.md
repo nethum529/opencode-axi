@@ -19,7 +19,9 @@ required CI evidence; the live probe validates only the installed OpenCode/herdr
    binding says `DO NOT TYPE: composer unbound`; do not type in the composer. Use `oca m <ref> ...`
    or `oca q <ref> ...` instead.
 5. When `GET /session/<id>/message` returns 200, assert the captured TUI contains the dispatched
-   prompt or turn and the worker's model string. A zero-token empty conversation is a failure.
+   prompt or turn, the worker's model string, and ordinary conversational assistant prose before
+   the final fenced `json` contract block. A zero-token empty conversation, a tool-call-only turn,
+   or a contract block with no visible explanatory prose is a failure.
 6. When that history request returns a non-200 response, assert `oca events <ref>` contains
    `oca.history.unreadable` and `oca f <ref>` prints the unreadable-history warning.
 7. Assert the tab remains open through intermediate completed steps. The shared
@@ -34,3 +36,9 @@ required CI evidence; the live probe validates only the installed OpenCode/herdr
    Tmux resets `@oca-identity` to the full identity followed by ` | DONE`, ` | PARTIAL`,
    ` | BLOCKED`, ` | FAILED`, or ` | UNCLEAR`. A marker-write failure must remain visible in
    `oca events <ref>` as `oca.display.unmarked` even though the detached helper's stderr is hidden.
+
+The default `[dispatch] transport = "text"` sends no prompt `format` field, so a fresh dispatch
+cannot acquire OpenCode's `retryCount`-inside-format history poisoning. The retry-count purge and
+history diagnostics remain necessary for legacy rows and for the one-release
+`[dispatch] transport = "schema"` escape hatch, which intentionally preserves the old format
+envelope.

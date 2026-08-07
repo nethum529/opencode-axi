@@ -1,0 +1,34 @@
+[
+  {
+    "info": {
+      "id": "msg_assistant_older",
+      "sessionID": "ses_target",
+      "role": "assistant",
+      "parentID": "msg_this_dispatch",
+      "time": { "created": 1, "completed": 9 },
+      "finish": "tool-calls"
+    },
+    "parts": [
+      {
+        "type": "text",
+        "text": "An older attributed step reported a draft.\n```json\n{\"status\":\"done\",\"files\":[\"older-message.rs\"],\"note\":\"This valid reply belongs to an older attributed message. It must lose to the newest message that carries any fenced worker contract block.\"}\n```"
+      }
+    ]
+  },
+  {
+    "info": {
+      "id": "msg_assistant",
+      "sessionID": "ses_target",
+      "role": "assistant",
+      "parentID": "msg_this_dispatch",
+      "time": { "created": 10, "completed": 20 },
+      "finish": "stop"
+    },
+    "parts": [
+      {
+        "type": "text",
+        "text": "An obsolete draft appears first.\n```json\n{\"status\":\"done\",\"files\":[\"obsolete.rs\"],\"note\":\"This earlier block is intentionally superseded and must never determine the classified state or normalized terminal reply.\"}\n```\nThe last block is authoritative.\n```json\n{\"status\":\"blocked\",\"files\":[\"selected.rs\"],\"note\":\"The last fenced block in the newest attributed message is authoritative. This fixture proves deterministic selection instead of accepting an obsolete earlier draft.\"}\n```"
+      }
+    ]
+  }
+]

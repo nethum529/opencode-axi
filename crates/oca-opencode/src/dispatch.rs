@@ -1,26 +1,38 @@
 //! Foreground-specific projections over facade responses and SSE frames.
 
+use oca_core::{FencedReplyError, worker_reply_payload};
 use serde_json::Value;
 
 use crate::{MessageWithParts, SseEvent};
 
-/// Returns the structured assistant reply attributed to `message_id`, if the
-/// projected message read model already contains one.
-#[must_use]
+/// Returns the structured or fenced assistant reply attributed to `message_id`,
+/// if the projected message read model already contains one.
+///
+/// # Errors
+///
+/// Returns an error when the newest attributed message carrying a fenced JSON
+/// reply has an unclosed fence or malformed JSON.
 pub fn attributed_structured_reply(
     messages: &[MessageWithParts],
     session_id: &str,
     message_id: &str,
-) -> Option<Value> {
-    messages.iter().rev().find_map(|message| {
-        let info = message.info.as_object()?;
-        (info.get("role")?.as_str()? == "assistant"
-            && info.get("sessionID")?.as_str()? == session_id
-            && info.get("parentID")?.as_str()? == message_id)
-            .then(|| info.get("structured").cloned())
-            .flatten()
-            .filter(|structured| !structured.is_null())
-    })
+) -> Result<Option<Value>, FencedReplyError> {
+    for message in messages.iter().rev() {
+        let Some(info) = message.info.as_object() else {
+            continue;
+        };
+        let attributed = info.get("role").and_then(Value::as_str) == Some("assistant")
+            && info.get("sessionID").and_then(Value::as_str) == Some(session_id)
+            && info.get("parentID").and_then(Value::as_str) == Some(message_id);
+        if !attributed {
+            continue;
+        }
+        match worker_reply_payload(info.get("structured"), &message.parts)? {
+            Some(reply) => return Ok(Some(reply)),
+            None => continue,
+        }
+    }
+    Ok(None)
 }
 
 /// Returns a completed structured assistant reply carried by a streamed
@@ -138,12 +150,35 @@ mod tests {
         ];
 
         assert_eq!(
-            attributed_structured_reply(&messages, "ses_target", "msg_target"),
+            attributed_structured_reply(&messages, "ses_target", "msg_target").unwrap(),
             Some(json!({"status":"partial"}))
         );
         assert_eq!(
-            attributed_structured_reply(&messages, "ses_other", "msg_target"),
+            attributed_structured_reply(&messages, "ses_other", "msg_target").unwrap(),
             None
+        );
+    }
+
+    #[test]
+    fn reconciliation_reads_a_fenced_reply_from_text_parts() {
+        let messages = vec![MessageWithParts {
+            info: json!({
+                "role":"assistant", "sessionID":"ses_target", "parentID":"msg_target"
+            }),
+            parts: vec![json!({
+                "type":"text",
+                "text":"Work completed in prose.\n```json\n{\"status\":\"done\",\"files\":[\"src/lib.rs\"],\"note\":\"The foreground reconciliation path selects the fenced payload after ordinary visible prose. It then passes the unchanged contract object to structural validation and finalization.\"}\n```"
+            })],
+            extra: Map::new(),
+        }];
+
+        assert_eq!(
+            attributed_structured_reply(&messages, "ses_target", "msg_target").unwrap(),
+            Some(json!({
+                "status":"done",
+                "files":["src/lib.rs"],
+                "note":"The foreground reconciliation path selects the fenced payload after ordinary visible prose. It then passes the unchanged contract object to structural validation and finalization."
+            }))
         );
     }
 

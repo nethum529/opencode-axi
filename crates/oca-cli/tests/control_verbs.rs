@@ -96,13 +96,36 @@ fn message_on_terminal_sessions_reuses_the_session_and_sends_full_turn_context()
             request.body["parts"],
             serde_json::json!([{ "type": "text", "text": "use the prior analysis" }])
         );
-        assert_eq!(request.body["format"]["type"], "json_schema");
+        assert!(
+            request.body.get("format").is_none(),
+            "text transport must omit the poisonable format field"
+        );
         assert!(request.body.get("delivery").is_none());
         assert_eq!(
             stored_record(home.path()).last_state,
             Some(RefState::Running)
         );
     }
+}
+
+#[test]
+fn schema_transport_escape_hatch_keeps_the_continuation_format_field() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
+    let port = listener.local_addr().expect("fake server address").port();
+    let server = thread::spawn(move || serve_confirmed_prompt(&listener));
+    let home = prepared_home(port, RefState::Done, "high");
+    std::fs::write(
+        home.path().join(".oca/config.toml"),
+        "[dispatch]\ntransport = \"schema\"\n",
+    )
+    .expect("schema transport config");
+
+    let output = run_oca(home.path(), ["m", "w4f2a1", "continue in schema mode"]);
+    let request = server.join().expect("fake server completes");
+
+    assert_success(&output);
+    assert_eq!(request.body["format"]["type"], "json_schema");
+    assert!(request.body["format"]["schema"].is_object());
 }
 
 #[test]

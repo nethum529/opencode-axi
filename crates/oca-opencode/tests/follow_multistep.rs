@@ -78,7 +78,52 @@ async fn completed_three_message_turn_without_any_reply_is_a_protocol_mismatch()
 }
 
 #[tokio::test]
-async fn completed_single_message_turn_keeps_its_existing_classification() {
+async fn completed_single_message_prose_turn_classifies_its_fenced_reply() {
+    let outcome = follow_fixture(include_str!(
+        "fixtures/follow_single_message_prose_reply.json"
+    ))
+    .await
+    .unwrap();
+
+    let FollowOutcome::Terminal(terminal) = outcome else {
+        panic!("single-message fixture must classify as terminal");
+    };
+    assert_eq!(terminal.state, WorkerState::Partial);
+    assert_eq!(terminal.message.id, "msg_assistant");
+    assert_eq!(
+        terminal.message.reply().unwrap()["files"],
+        serde_json::json!(["src/follow.rs"])
+    );
+}
+
+#[tokio::test]
+async fn malformed_fenced_reply_is_a_protocol_mismatch() {
+    let error = follow_fixture(include_str!("fixtures/follow_malformed_block.json"))
+        .await
+        .unwrap_err();
+
+    assert_protocol_mismatch(error);
+}
+
+#[tokio::test]
+async fn last_fenced_block_in_the_newest_message_is_authoritative() {
+    let outcome = follow_fixture(include_str!("fixtures/follow_multiple_blocks.json"))
+        .await
+        .unwrap();
+
+    let FollowOutcome::Terminal(terminal) = outcome else {
+        panic!("multiple-block fixture must classify as terminal");
+    };
+    assert_eq!(terminal.state, WorkerState::Blocked);
+    assert_eq!(terminal.message.id, "msg_assistant");
+    assert_eq!(
+        terminal.message.reply().unwrap()["files"],
+        serde_json::json!(["selected.rs"])
+    );
+}
+
+#[tokio::test]
+async fn structured_reply_precedes_a_fenced_reply_in_the_same_message() {
     let message = FollowMessage {
         id: "msg_assistant".to_owned(),
         session_id: "ses_target".to_owned(),
@@ -86,20 +131,37 @@ async fn completed_single_message_turn_keeps_its_existing_classification() {
         role: "assistant".to_owned(),
         completed: true,
         structured: Some(serde_json::json!({
-            "status": "blocked",
-            "files": [],
-            "note": "Waiting for required user input before continuing the assigned worker task."
+            "status": "done",
+            "files": ["structured.rs"],
+            "note": "The legacy structured value remains authoritative while schema transport is enabled. A conflicting text fence must not replace this compatibility payload."
         })),
-        parts: Vec::new(),
+        parts: vec![serde_json::json!({
+            "type": "text",
+            "text": "Conflicting prose.\n```json\n{\"status\":\"blocked\",\"files\":[\"fenced.rs\"],\"note\":\"This fenced value deliberately conflicts with the structured reply and must lose because legacy structured transport has explicit precedence.\"}\n```"
+        })],
         error: None,
     };
     let outcome = follow_messages(vec![message]).await.unwrap();
 
     let FollowOutcome::Terminal(terminal) = outcome else {
-        panic!("single-message fixture must classify as terminal");
+        panic!("structured fixture must classify as terminal");
     };
-    assert_eq!(terminal.state, WorkerState::Blocked);
-    assert_eq!(terminal.message.id, "msg_assistant");
+    assert_eq!(terminal.state, WorkerState::Done);
+    assert_eq!(
+        terminal.message.reply().unwrap()["files"],
+        serde_json::json!(["structured.rs"])
+    );
+}
+
+fn assert_protocol_mismatch(error: FollowError) {
+    assert_eq!(
+        error,
+        FollowError::Protocol {
+            message:
+                "completed attributed assistant message chain has no valid worker status reply"
+                    .to_owned(),
+        }
+    );
 }
 
 async fn follow_fixture(fixture: &str) -> Result<FollowOutcome, FollowError> {

@@ -16,6 +16,8 @@ pub struct ForegroundRequest {
     pub prompt: String,
     pub role: String,
     pub contract: ReplyContract,
+    /// Whether to retain the legacy JSON-schema output transport for this turn.
+    pub schema_transport: bool,
     pub policy: WorkerPolicy,
     pub cwd: PathBuf,
     pub display: DisplayMode,
@@ -30,7 +32,7 @@ pub struct DispatchPrompt {
     pub variant: String,
     pub role: String,
     pub text: String,
-    pub output_schema: Value,
+    pub output_schema: Option<Value>,
     pub permission: PermissionProfile,
 }
 
@@ -262,7 +264,7 @@ where
         variant: request.model.variant.clone(),
         role: request.role.clone(),
         text: request.prompt.clone(),
-        output_schema: request.contract.schema(),
+        output_schema: request.schema_transport.then(|| request.contract.schema()),
         permission: request.policy.permission_profile(),
     };
     match backend.prompt_async(&session_id, &prompt).await {
@@ -694,6 +696,31 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_transport_selects_schema_attachment_without_changing_confirmation() {
+        for (schema_transport, expect_schema) in [(false, false), (true, true)] {
+            let mut backend = FakeBackend::normal();
+            let mut request = request("luna", "h");
+            request.schema_transport = schema_transport;
+
+            block_on(run_foreground(&mut backend, request)).unwrap();
+
+            assert_eq!(
+                backend
+                    .prompt
+                    .as_ref()
+                    .expect("prompt captured")
+                    .output_schema
+                    .is_some(),
+                expect_schema
+            );
+            assert!(
+                backend.calls.contains(&"confirm"),
+                "landed-prompt confirmation is transport-independent"
+            );
+        }
+    }
+
+    #[test]
     fn tooled_incompatible_model_fails_before_backend_preparation_or_provider_access() {
         let mut backend = FakeBackend::normal();
         let error = block_on(run_foreground(&mut backend, request("flash", "h")))
@@ -849,6 +876,7 @@ mod tests {
             prompt: "do the work".to_owned(),
             role: "impl".to_owned(),
             contract: ReplyContract::Impl,
+            schema_transport: false,
             policy: WorkerPolicy::restricted([cwd.clone()]),
             cwd,
             display: DisplayMode::Herdr,

@@ -13,8 +13,8 @@ use oca_display::{Acknowledgement, HerdrClient};
 use oca_opencode::{OpenCodeClient, PromptRequest, TextPart};
 use oca_server::ConnectOrStart;
 use oca_state::{
-    Intent, IntentOperation, IntentPhase, IntentStore, OcaConfig, RefPatch, RefRecord, RefState,
-    RefStore, RefStorePaths, SessionTurnLock,
+    DispatchTransport, Intent, IntentOperation, IntentPhase, IntentStore, OcaConfig, RefPatch,
+    RefRecord, RefState, RefStore, RefStorePaths, SessionTurnLock,
 };
 use url::Url;
 
@@ -263,6 +263,7 @@ struct ControlContext {
     role: String,
     contract: ReplyContract,
     policy: WorkerPolicy,
+    schema_transport: bool,
 }
 
 impl ControlContext {
@@ -290,6 +291,7 @@ impl ControlContext {
             model,
             contract: ReplyContract::resolve(&role)?,
             policy: WorkerPolicy::restricted([cwd]),
+            schema_transport: config.dispatch.transport == DispatchTransport::Schema,
             role,
         })
     }
@@ -301,7 +303,7 @@ impl ControlContext {
             variant: self.model.variant.clone(),
             role: self.role.clone(),
             parts: vec![TextPart { text }],
-            output_schema: Some(self.contract.schema()),
+            output_schema: self.schema_transport.then(|| self.contract.schema()),
             permission: self.policy.permission_profile(),
         }
     }
