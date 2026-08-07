@@ -1,8 +1,14 @@
 #![cfg(unix)]
 
-use std::{fs, os::unix::fs::PermissionsExt};
+use std::{
+    fs,
+    os::unix::fs::PermissionsExt,
+    sync::{Mutex, MutexGuard, PoisonError},
+};
 
 use oca_display::{TmuxClient, TmuxError};
+
+static TMUX_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
 
 #[test]
 fn creates_and_closes_only_the_ref_owned_window_against_a_fake_tmux() {
@@ -56,6 +62,7 @@ fn a_fake_tmux_failure_is_typed() {
 }
 
 struct Fixture {
+    _lock: MutexGuard<'static, ()>,
     _temp: tempfile::TempDir,
     executable: std::path::PathBuf,
     cwd: std::path::PathBuf,
@@ -64,6 +71,14 @@ struct Fixture {
 
 impl Fixture {
     fn new(exit_code: u8) -> Self {
+        // A sibling test can otherwise fork while this fixture is writing its
+        // script. The child inherits the write descriptor and Linux can reject
+        // the script exec with ETXTBSY (errno 26).
+        // A failing sibling test poisons the lock; take it anyway so the
+        // failure reports once instead of twice.
+        let lock = TMUX_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("tmux");
         let cwd = temp.path().join("worker");
@@ -83,6 +98,7 @@ impl Fixture {
         permissions.set_mode(0o700);
         fs::set_permissions(&executable, permissions).unwrap();
         Self {
+            _lock: lock,
             _temp: temp,
             executable,
             cwd,
