@@ -1224,9 +1224,25 @@ mod tests {
                 expected: "Invalid",
                 expected_file: None,
             },
+            Case {
+                // A json-ish opener is a contract attempt, so an unparseable
+                // body must stop the walk instead of borrowing an older reply.
+                name: "jsonish-opener-unparseable-body",
+                text: "```json\n{\"status\":\"done\",,}\n```",
+                expected: "Invalid",
+                expected_file: None,
+            },
+            Case {
+                // Only a status-bearing body promotes a bare fence. An ordinary
+                // JSON sample must stay deferrable rather than become a contract.
+                name: "bare-fence-valid-non-contract-json",
+                text: "```\n{\"retries\":2,\"enabled\":true}\n```",
+                expected: "Absent",
+                expected_file: None,
+            },
         ];
 
-        assert_eq!(cases.len(), 11, "the reviewer decision table is exhaustive");
+        assert_eq!(cases.len(), 13, "the reviewer decision table is exhaustive");
         for case in cases {
             let message = FollowMessage {
                 id: case.name.to_owned(),
