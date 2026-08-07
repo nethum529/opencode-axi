@@ -101,6 +101,7 @@ fn headed_tmux_background_journals_events_while_detached_stream_is_live() {
             "event",
             "prompt_async",
             "messages",
+            "messages",
             "event",
             "messages",
         ]
@@ -108,8 +109,12 @@ fn headed_tmux_background_journals_events_while_detached_stream_is_live() {
     assert_eq!(
         tmux.wait_for_calls(2),
         [
-            format!("new-window -d -n oca-{reference} -- opencode --session ses_tmux_journal"),
-            format!("kill-window -t =oca-{reference}"),
+            format!(
+                "new-window -d -n oca-{reference} | impl | openai/gpt-5.6-luna | high | DO NOT TYPE: composer unbound -- opencode --session ses_tmux_journal"
+            ),
+            format!(
+                "kill-window -t =oca-{reference} | impl | openai/gpt-5.6-luna | high | DO NOT TYPE: composer unbound"
+            ),
         ]
     );
 }
@@ -138,7 +143,7 @@ impl FakeOpenCode {
             let mut subscriptions = 0;
             let mut event_handler = None;
 
-            while requests.len() < 7 && started.elapsed() < Duration::from_secs(5) {
+            while requests.len() < 8 && started.elapsed() < Duration::from_secs(5) {
                 let (mut stream, _) = match listener.accept() {
                     Ok(connection) => connection,
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {

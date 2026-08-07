@@ -18,6 +18,7 @@ use url::Url;
 
 use crate::{
     FollowCommand,
+    attach_diagnostics::{HistoryProbe, journal_history_diagnostic, probe_history},
     crash_recovery::{ReconcileCommand, event_cursor_failpoint, persist_intent, reconcile_ref},
     worktree_dispatch::finalize_turn,
 };
@@ -84,8 +85,24 @@ pub async fn execute_follow(
             .with_error(error.to_string())
             .with_ref(&command.reference)
     })?;
-    let journal = EventJournal::create(&state_directory, &reference, &message_id)
+    let mut journal = EventJournal::create(&state_directory, &reference, &message_id)
         .map_err(|error| journal_error(&command.reference, &error.to_string()))?;
+    let history = probe_history(&client, &record.session_id).await;
+    if let HistoryProbe::RateLimited {
+        body,
+        retry_after_ms,
+    } = &history
+    {
+        let error = OcaError::new(ErrorCode::RateLimited)
+            .with_ref(&command.reference)
+            .with_error(body);
+        return Err(match retry_after_ms {
+            Some(delay) => error.with_retry_after_ms(*delay),
+            None => error,
+        });
+    }
+    journal_history_diagnostic(&mut journal, &record.session_id, &history)
+        .map_err(|error| journal_error(&command.reference, &error))?;
     let intent_store = IntentStore::in_directory(&state_directory);
     let intent = intent_store
         .read(&command.reference)
@@ -138,17 +155,30 @@ pub async fn execute_follow(
                 } else {
                     FollowExit::Success
                 },
-                stdout: render_terminal(&command.reference, &terminal, command.json),
+                stdout: with_history_warning(
+                    &history,
+                    render_terminal(&command.reference, &terminal, command.json),
+                ),
             })
         }
         FollowOutcome::Timeout => Ok(FollowCommandOutput {
             exit: FollowExit::Timeout,
-            stdout: format!("oca wake ref={} state=timeout\n", command.reference),
+            stdout: with_history_warning(
+                &history,
+                format!("oca wake ref={} state=timeout\n", command.reference),
+            ),
         }),
         FollowOutcome::ServerUnreachable => Err(server_unreachable(
             &command.reference,
             "the OpenCode server could not be reached",
         )),
+    }
+}
+
+fn with_history_warning(history: &HistoryProbe, output: String) -> String {
+    match history.warning() {
+        Some(warning) => format!("warning: {warning}\n{output}"),
+        None => output,
     }
 }
 

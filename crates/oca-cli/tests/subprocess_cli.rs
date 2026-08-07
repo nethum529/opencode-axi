@@ -192,6 +192,7 @@ impl FollowFixture {
         };
         let recording = Recording {
             exchanges: vec![
+                empty_messages(),
                 RecordedExchange {
                     request: HttpRequest::new("GET", "/event?directory=%2Frepo", no_headers(), []),
                     response: HttpResponse::new(
@@ -204,12 +205,25 @@ impl FollowFixture {
                 empty_messages(),
             ],
         };
-        Self::with_recording(recording, 3)
+        Self::with_recording(recording, 4)
     }
 
     fn with_sse(chunks: Vec<Vec<u8>>) -> Self {
         let recording = Recording {
             exchanges: vec![
+                RecordedExchange {
+                    request: HttpRequest::new(
+                        "GET",
+                        "/session/ses_target/message",
+                        no_headers(),
+                        [],
+                    ),
+                    response: HttpResponse::new(
+                        200,
+                        [("content-type", "application/json")],
+                        [b"[]".to_vec()],
+                    ),
+                },
                 RecordedExchange {
                     request: HttpRequest::new("GET", "/event?directory=%2Frepo", no_headers(), []),
                     response: HttpResponse::new(
@@ -233,7 +247,7 @@ impl FollowFixture {
                 },
             ],
         };
-        Self::with_recording(recording, 2)
+        Self::with_recording(recording, 3)
     }
 
     fn with_recording(recording: Recording, request_count: usize) -> Self {

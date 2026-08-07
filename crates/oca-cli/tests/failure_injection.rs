@@ -561,7 +561,7 @@ fn every_429_is_terminal_rate_limited_with_retry_metadata_and_no_replay() {
     let output = run(&home, ["--json", "f", "w4f2a1"]);
     let requests = server.join().expect("failure server thread");
     assert_rate_limit(&output, Some(4_000));
-    assert_eq!(routes(&requests), ["event"]);
+    assert_eq!(routes(&requests), ["messages"]);
 }
 
 #[test]
