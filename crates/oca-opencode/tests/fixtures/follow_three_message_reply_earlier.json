@@ -1,0 +1,54 @@
+[
+  {
+    "info": {
+      "id": "msg_assistant_step_1",
+      "sessionID": "ses_target",
+      "role": "assistant",
+      "parentID": "msg_this_dispatch",
+      "time": { "created": 10, "completed": 20 },
+      "finish": "tool-calls"
+    },
+    "parts": [
+      { "type": "step-start" },
+      { "type": "reasoning", "text": "Inspect the classifier." },
+      { "type": "tool", "tool": "read" },
+      { "type": "step-finish", "reason": "tool-calls" }
+    ]
+  },
+  {
+    "info": {
+      "id": "msg_assistant_step_2",
+      "sessionID": "ses_target",
+      "role": "assistant",
+      "parentID": "msg_this_dispatch",
+      "time": { "created": 21, "completed": 30 },
+      "finish": "tool-calls"
+    },
+    "parts": [
+      { "type": "step-start" },
+      { "type": "reasoning", "text": "Report the completed work." },
+      {
+        "type": "text",
+        "text": "{\"status\":\"done\",\"files\":[\"src/follow.rs\"],\"note\":\"The classifier now walks every attributed assistant message in the completed turn and selects the newest valid structured worker reply before finalization. Deterministic fixtures cover both successful multi-step decoding and truthful rejection when no status reply exists.\"}"
+      },
+      { "type": "tool", "tool": "bash" },
+      { "type": "step-finish", "reason": "tool-calls" }
+    ]
+  },
+  {
+    "info": {
+      "id": "msg_assistant_step_3",
+      "sessionID": "ses_target",
+      "role": "assistant",
+      "parentID": "msg_this_dispatch",
+      "time": { "created": 31, "completed": 40 },
+      "finish": "tool-calls"
+    },
+    "parts": [
+      { "type": "step-start" },
+      { "type": "reasoning", "text": "Run the final verification tool." },
+      { "type": "tool", "tool": "bash" },
+      { "type": "step-finish", "reason": "tool-calls" }
+    ]
+  }
+]

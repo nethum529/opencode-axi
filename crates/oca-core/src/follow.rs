@@ -37,21 +37,20 @@ pub struct FollowMessage {
 }
 
 impl FollowMessage {
-    fn worker_state(&self) -> Option<WorkerState> {
+    fn worker_reply(&self) -> Option<(WorkerState, Value)> {
         self.structured
-            .as_ref()
-            .and_then(|value| value.get("status"))
-            .and_then(Value::as_str)
-            .and_then(parse_worker_state)
-            .or_else(|| {
-                self.parts.iter().find_map(|part| {
-                    let text = part.get("text")?.as_str()?;
-                    let value: Value = serde_json::from_str(text).ok()?;
-                    value
-                        .get("status")
-                        .and_then(Value::as_str)
-                        .and_then(parse_worker_state)
-                })
+            .iter()
+            .cloned()
+            .chain(self.parts.iter().filter_map(|part| {
+                let text = part.get("text")?.as_str()?;
+                serde_json::from_str(text).ok()
+            }))
+            .find_map(|reply| {
+                let state = reply
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .and_then(parse_worker_state)?;
+                Some((state, reply))
             })
     }
 
@@ -517,7 +516,7 @@ fn protocol_error(error: FollowTransportError) -> FollowError {
 struct TurnTracker<'a> {
     target: &'a FollowTarget,
     event_ids: HashSet<String>,
-    attributed: Option<FollowMessage>,
+    attributed: Vec<FollowMessage>,
 }
 
 impl<'a> TurnTracker<'a> {
@@ -525,7 +524,7 @@ impl<'a> TurnTracker<'a> {
         Self {
             target,
             event_ids: HashSet::new(),
-            attributed: None,
+            attributed: Vec::new(),
         }
     }
 
@@ -537,25 +536,26 @@ impl<'a> TurnTracker<'a> {
         &mut self,
         messages: Vec<FollowMessage>,
     ) -> Result<Option<FollowTerminal>, FollowError> {
-        for message in messages {
-            if self.is_attributed(&message) && message.completed {
-                return terminal_from_message(message).map(Some);
-            }
-        }
-        Ok(None)
+        self.attributed = messages
+            .into_iter()
+            .filter(|message| self.is_attributed(message))
+            .collect();
+        let Some(message) = self.attributed.last().filter(|message| message.completed) else {
+            return Ok(None);
+        };
+        terminal_from_chain(&self.attributed, message.clone()).map(Some)
     }
 
     fn observe(&mut self, event: &OcaEvent) -> Result<Option<FollowTerminal>, FollowError> {
         if let Some(message) = event.message.as_ref()
             && self.is_attributed(message)
-            && message.completed
         {
-            self.attributed = Some(message.clone());
+            self.attributed.push(message.clone());
         }
         if event.is_session_idle()
-            && let Some(message) = self.attributed.take()
+            && let Some(message) = self.attributed.last().filter(|message| message.completed)
         {
-            return terminal_from_message(message).map(Some);
+            return terminal_from_chain(&self.attributed, message.clone()).map(Some);
         }
         Ok(None)
     }
@@ -567,12 +567,24 @@ impl<'a> TurnTracker<'a> {
     }
 }
 
-fn terminal_from_message(message: FollowMessage) -> Result<FollowTerminal, FollowError> {
-    let state = message
-        .worker_state()
+fn terminal_from_chain(
+    messages: &[FollowMessage],
+    mut message: FollowMessage,
+) -> Result<FollowTerminal, FollowError> {
+    let (state, reply) = messages
+        .iter()
+        .rev()
+        .find_map(FollowMessage::worker_reply)
         .ok_or_else(|| FollowError::Protocol {
-            message: "attributed terminal assistant message has no valid worker status".to_owned(),
+            // A completed tool-using turn without a role reply is not success. Keep this a
+            // distinct protocol mismatch so callers never silently finalize it as `done`.
+            message:
+                "completed attributed assistant message chain has no valid worker status reply"
+                    .to_owned(),
         })?;
+    // OpenCode can put the JSON text on an earlier tool step. Preserve the newest message as the
+    // terminal boundary while exposing the selected reply through the existing projection API.
+    message.structured = Some(reply);
     Ok(FollowTerminal { state, message })
 }
 
