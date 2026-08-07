@@ -1,6 +1,6 @@
 //! Headed-attach identity and unreadable-history diagnostics.
 
-use oca_core::{EventJournalWriter, OcaEvent, resolve_model};
+use oca_core::{EventJournalWriter, FollowBoundaryTerminal, OcaEvent, resolve_model};
 use oca_opencode::{OpenCodeClient, OpenCodeError};
 use oca_state::{OcaConfig, RefRecord};
 use serde_json::json;
@@ -142,6 +142,18 @@ pub(crate) fn herdr_agent_name(reference: &str, record: &RefRecord, config: &Oca
     agent_name_slug(reference, agent, model_short, &variant)
 }
 
+/// Adds a terminal marker while retaining herdr's 32-character slug limit.
+pub(crate) fn terminal_agent_name(base: &str, terminal: FollowBoundaryTerminal) -> String {
+    let suffix = match terminal {
+        FollowBoundaryTerminal::Done => "-done",
+        FollowBoundaryTerminal::Failed => "-fail",
+    };
+    let mut name = base.to_owned();
+    name.truncate(32 - suffix.len());
+    name.push_str(suffix);
+    name
+}
+
 fn resolved_model(alias: &str, effort: &str, config: &OcaConfig) -> (String, String) {
     resolve_model(alias, effort, config.model_catalog()).map_or_else(
         |_| (alias.to_owned(), effort.to_owned()),
@@ -226,6 +238,29 @@ mod tests {
         assert!(slug.bytes().all(|byte| byte.is_ascii_lowercase()
             || byte.is_ascii_digit()
             || matches!(byte, b'-' | b'_')));
+    }
+
+    #[test]
+    fn terminal_suffix_reserves_space_when_the_base_slug_is_already_32_characters() {
+        let base = "w6h6mn-impl-review-an-extremely-";
+        assert_eq!(base.len(), 32);
+
+        assert_eq!(
+            terminal_agent_name(base, FollowBoundaryTerminal::Done),
+            "w6h6mn-impl-review-an-extre-done"
+        );
+        assert_eq!(
+            terminal_agent_name(base, FollowBoundaryTerminal::Failed),
+            "w6h6mn-impl-review-an-extre-fail"
+        );
+        assert_eq!(
+            terminal_agent_name(base, FollowBoundaryTerminal::Done).len(),
+            32
+        );
+        assert_eq!(
+            terminal_agent_name(base, FollowBoundaryTerminal::Failed).len(),
+            32
+        );
     }
 
     #[test]

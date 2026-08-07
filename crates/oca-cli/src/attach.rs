@@ -14,7 +14,8 @@ use url::Url;
 use crate::{
     AttachCommand,
     attach_diagnostics::{
-        HistoryProbe, herdr_agent_name, journal_history_diagnostic, probe_history, worker_identity,
+        HistoryProbe, herdr_agent_name, journal_history_diagnostic, probe_history,
+        terminal_agent_name, worker_identity,
     },
 };
 
@@ -153,7 +154,7 @@ async fn run_herdr_attach(
         .map_err(|error| error.to_string())?;
 
     let launch_result = async {
-        herdr
+        let agent = herdr
             .agent_start(
                 &tab,
                 turn.agent_name,
@@ -165,15 +166,19 @@ async fn run_herdr_attach(
             &command.reference,
             RefPatch::default().with_herdr_tab(tab.as_str()),
         )
-        .map_err(|error| format!("could not record herdr tab: {error}"))
+        .map_err(|error| format!("could not record herdr tab: {error}"))?;
+        Ok::<_, String>(agent)
     }
     .await;
-    if let Err(error) = launch_result {
-        // Before the tab id is durable, `oca k` cannot clean it up. A launch
-        // or persistence failure therefore retains best-effort local cleanup.
-        let _ = herdr.close_tab(&tab).await;
-        return Err(error);
-    }
+    let agent = match launch_result {
+        Ok(agent) => agent,
+        Err(error) => {
+            // Before the tab id is durable, `oca k` cannot clean it up. A launch
+            // or persistence failure therefore retains best-effort local cleanup.
+            let _ = herdr.close_tab(&tab).await;
+            return Err(error);
+        }
+    };
 
     let follow_result = async {
         let mut journal =
@@ -198,10 +203,23 @@ async fn run_herdr_attach(
     .await;
 
     match follow_result {
-        Ok(FollowBoundaryOutcome::Terminal) if config.herdr.close_on_done => herdr
-            .close_tab(&tab)
-            .await
-            .map_err(|error| error.to_string()),
+        Ok(FollowBoundaryOutcome::Terminal(terminal)) => {
+            let terminal_name = terminal_agent_name(turn.agent_name, terminal);
+            let rename_result = herdr
+                .rename_agent(&agent, &terminal_name)
+                .await
+                .map_err(|error| error.to_string());
+            let close_result = if config.herdr.close_on_done {
+                herdr
+                    .close_tab(&tab)
+                    .await
+                    .map_err(|error| error.to_string())
+            } else {
+                Ok(())
+            };
+            rename_result?;
+            close_result
+        }
         Ok(_) => Ok(()),
         // The persisted tab remains explicitly killable when following fails;
         // absence of a terminal boundary must never close a live worker tab.
@@ -244,9 +262,16 @@ async fn run_tmux_attach(command: &AttachCommand, turn: AttachTurn<'_>) -> Resul
     .await;
 
     match follow_result {
-        Ok(FollowBoundaryOutcome::Terminal) => tmux
-            .close_window(&window)
-            .map_err(|error| error.to_string()),
+        Ok(FollowBoundaryOutcome::Terminal(terminal)) => {
+            let marker_result = tmux
+                .mark_terminal(&window, turn.worker_identity, terminal)
+                .map_err(|error| error.to_string());
+            let close_result = tmux
+                .close_window(&window)
+                .map_err(|error| error.to_string());
+            marker_result?;
+            close_result
+        }
         Ok(_) => Ok(()),
         Err(error) => {
             // A window created before follow failure would otherwise be

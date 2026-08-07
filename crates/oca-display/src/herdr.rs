@@ -219,6 +219,21 @@ impl HerdrClient {
         Ok(AgentId(started.agent.terminal_id))
     }
 
+    /// Renames one running agent by its stable terminal identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed transport, timeout, server, or envelope error.
+    pub async fn rename_agent(&self, agent: &AgentId, name: &str) -> Result<(), HerdrError> {
+        let _: OkResult = self
+            .call(
+                "agent.rename",
+                json!({ "target": agent.as_str(), "name": name }),
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Closes one herdr tab.
     ///
     /// # Errors

@@ -130,6 +130,16 @@ impl FollowOutcome {
     }
 }
 
+/// The outcome class carried by an attributed live terminal boundary.
+///
+/// This classification uses only OpenCode's assistant-message error field. It
+/// deliberately does not decode the worker's structured reply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FollowBoundaryTerminal {
+    Done,
+    Failed,
+}
+
 /// Outcomes for consumers that need only the attributed live turn boundary.
 ///
 /// Unlike [`FollowOutcome`], a terminal boundary does not decode the worker's
@@ -137,7 +147,7 @@ impl FollowOutcome {
 /// the target assistant completing before `session.idle` is sufficient.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FollowBoundaryOutcome {
-    Terminal,
+    Terminal(FollowBoundaryTerminal),
     Timeout,
     ServerUnreachable,
 }
@@ -314,7 +324,17 @@ where
     )
     .await?;
     Ok(match outcome {
-        RawFollowOutcome::Terminal(_) => FollowBoundaryOutcome::Terminal,
+        RawFollowOutcome::Terminal(chain) => {
+            let boundary = chain
+                .last()
+                .expect("a terminal boundary is the last attributed step");
+            let terminal = if boundary.error.is_some() {
+                FollowBoundaryTerminal::Failed
+            } else {
+                FollowBoundaryTerminal::Done
+            };
+            FollowBoundaryOutcome::Terminal(terminal)
+        }
         RawFollowOutcome::Timeout => FollowBoundaryOutcome::Timeout,
         RawFollowOutcome::ServerUnreachable => FollowBoundaryOutcome::ServerUnreachable,
     })
@@ -1057,7 +1077,10 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert_eq!(outcome, FollowBoundaryOutcome::Terminal);
+        assert_eq!(
+            outcome,
+            FollowBoundaryOutcome::Terminal(FollowBoundaryTerminal::Done)
+        );
         assert_eq!(
             journal.0,
             [
@@ -1067,6 +1090,30 @@ mod tests {
                 "session.idle"
             ],
             "history and completed steps must not end the live display follow before idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_boundary_classifies_an_attributed_assistant_error_as_failed() {
+        let mut failed = message("msg_this_dispatch", "done", true);
+        failed.error = Some(serde_json::json!({"name":"ProviderError"}));
+        let transport = ScriptedTransport {
+            subscriptions: Mutex::new(VecDeque::from([subscription([
+                Ok(Some(event("evt-failed", "message.updated", Some(failed)))),
+                Ok(Some(event("evt-idle", "session.idle", None))),
+            ])])),
+            reconciliations: Mutex::new(VecDeque::from([Ok(Vec::new())])),
+            cursors: Mutex::new(Vec::new()),
+        };
+
+        let outcome =
+            follow_until_terminal_boundary::<_, Journal>(&transport, &target(), None, None)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            outcome,
+            FollowBoundaryOutcome::Terminal(FollowBoundaryTerminal::Failed)
         );
     }
 

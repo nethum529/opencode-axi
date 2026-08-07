@@ -6,6 +6,7 @@ use std::{
     sync::{Mutex, MutexGuard, PoisonError},
 };
 
+use oca_core::FollowBoundaryTerminal;
 use oca_display::{TmuxClient, TmuxError};
 
 static TMUX_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
@@ -27,10 +28,12 @@ fn creates_and_closes_only_the_ref_owned_window_against_a_fake_tmux() {
             &fixture.cwd,
         )
         .unwrap();
-    client.close_window(&window).unwrap();
-
     assert_eq!(window.name(), "fixParser");
     assert_eq!(window.id(), "@42");
+    client
+        .mark_terminal(&window, WORKER_IDENTITY, FollowBoundaryTerminal::Done)
+        .unwrap();
+    client.close_window(&window).unwrap();
     assert_eq!(
         fixture.calls(),
         [
@@ -77,10 +80,51 @@ fn creates_and_closes_only_the_ref_owned_window_against_a_fake_tmux() {
             "pane-border-format".to_owned(),
             "#{@oca-identity}".to_owned(),
             "--call--".to_owned(),
+            "set-option".to_owned(),
+            "-w".to_owned(),
+            "-t".to_owned(),
+            "@42".to_owned(),
+            "@oca-identity".to_owned(),
+            format!("{WORKER_IDENTITY} | DONE"),
+            "--call--".to_owned(),
             "kill-window".to_owned(),
             "-t".to_owned(),
             "@42".to_owned(),
             "--call--".to_owned(),
+        ]
+    );
+}
+
+#[test]
+fn resets_the_identity_to_failed_for_an_errored_terminal_boundary() {
+    let fixture = Fixture::new(0);
+    let client = TmuxClient::new(fixture.executable.as_os_str());
+    let window = client
+        .new_window(
+            "wabc12",
+            "fixParser",
+            WORKER_IDENTITY,
+            "http://127.0.0.1:4096/",
+            "ses_target",
+            &fixture.cwd,
+        )
+        .unwrap();
+
+    client
+        .mark_terminal(&window, WORKER_IDENTITY, FollowBoundaryTerminal::Failed)
+        .unwrap();
+
+    let calls = fixture.calls();
+    assert_eq!(
+        &calls[calls.len() - 7..],
+        [
+            "set-option",
+            "-w",
+            "-t",
+            "@42",
+            "@oca-identity",
+            &format!("{WORKER_IDENTITY} | FAILED"),
+            "--call--",
         ]
     );
 }
