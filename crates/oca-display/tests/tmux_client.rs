@@ -86,6 +86,30 @@ fn a_fake_tmux_failure_is_typed() {
     );
 }
 
+#[test]
+fn a_window_id_tmux_never_prints_is_typed() {
+    let fixture = Fixture::with_window_id(0, "window one");
+    let error = TmuxClient::new(fixture.executable.as_os_str())
+        .new_window(
+            "wabc12",
+            "fixParser",
+            "http://127.0.0.1:4096/",
+            "ses_target",
+            &fixture.cwd,
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(&error, TmuxError::InvalidWindowId { output } if output == "window one"),
+        "{error}"
+    );
+    assert!(
+        !fixture.calls().iter().any(|call| call == "kill-window"),
+        "an unusable window id leaves nothing to close: {:?}",
+        fixture.calls()
+    );
+}
+
 struct Fixture {
     _lock: MutexGuard<'static, ()>,
     _temp: tempfile::TempDir,
@@ -96,6 +120,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(exit_code: u8) -> Self {
+        Self::with_window_id(exit_code, "@42")
+    }
+
+    fn with_window_id(exit_code: u8, window_id: &str) -> Self {
         // A sibling test can otherwise fork while this fixture is writing its
         // script. The child inherits the write descriptor and Linux can reject
         // the script exec with ETXTBSY (errno 26).
@@ -112,7 +140,7 @@ impl Fixture {
         fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = new-window ]; then printf 'cwd=%s\\n' \"$PWD\" >> '{}'; printf '@42\\n'; fi\nprintf '%s\\n' \"$@\" >> '{}'\nprintf '%s\\n' --call-- >> '{}'\nexit {exit_code}\n",
+                "#!/bin/sh\nif [ \"$1\" = new-window ]; then printf 'cwd=%s\\n' \"$PWD\" >> '{}'; printf '{window_id}\\n'; fi\nprintf '%s\\n' \"$@\" >> '{}'\nprintf '%s\\n' --call-- >> '{}'\nexit {exit_code}\n",
                 log.display(),
                 log.display(),
                 log.display(),

@@ -1124,7 +1124,7 @@ mod tests {
     #[test]
     fn attach_is_parseable_but_not_an_agent_surface_command() {
         assert_eq!(
-            parse_from(["oca", "__attach", "wabc12", "ses_1", "/repo", "fixParser",]).unwrap(),
+            parse_from(["oca", "__attach", "wabc12", "ses_1", "/repo", "fixParser"]).unwrap(),
             Command::Attach(AttachCommand {
                 reference: "wabc12".to_owned(),
                 session_id: "ses_1".to_owned(),
