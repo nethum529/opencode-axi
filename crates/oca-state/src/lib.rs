@@ -7,9 +7,9 @@ mod refs;
 mod session;
 
 pub use config::{
-    ConfigDiagnostic, ConfigError, ConfigLoadError, ConfigLoader, HerdrConfig, ModelConfig,
-    OcaConfig, PermissionMode, PublishConfig, PublishOverride, PublishSettings, RetentionConfig,
-    RoleConfig, ServerConfig,
+    ConfigDiagnostic, ConfigError, ConfigLoadError, ConfigLoader, DispatchConfig,
+    DispatchTransport, HerdrConfig, ModelConfig, OcaConfig, PermissionMode, PublishConfig,
+    PublishOverride, PublishSettings, RetentionConfig, RoleConfig, ServerConfig,
 };
 pub use intents::{
     INTENT_SCHEMA_VERSION, Intent, IntentDurability, IntentOperation, IntentPhase, IntentRequest,

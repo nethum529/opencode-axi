@@ -27,6 +27,7 @@
     "parts": [
       { "type": "step-start" },
       { "type": "reasoning", "text": "Continue without emitting a reply." },
+      { "type": "text", "text": "I inspected the classifier and am continuing with verification." },
       { "type": "tool", "tool": "bash" },
       { "type": "step-finish", "reason": "tool-calls" }
     ]
@@ -59,7 +60,7 @@
     "parts": [
       {
         "type": "text",
-        "text": "{\"status\":\"done\",\"files\":[\"src/other.rs\"],\"note\":\"A different dispatch succeeded, which must not rescue this turn from its missing reply.\"}"
+        "text": "Unrelated work completed.\n```json\n{\"status\":\"done\",\"files\":[\"src/other.rs\"],\"note\":\"A different dispatch succeeded, which must not rescue this turn from its missing reply.\"}\n```"
       }
     ]
   }

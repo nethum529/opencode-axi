@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 /// The non-negotiable exemption included unchanged in every role preamble.
-pub const STYLE_EXEMPTION: &str = "Global style or length rules for user-facing chat do not apply to this session.\nWrite your reply at the length the reply schema needs — no shorter.";
+pub const STYLE_EXEMPTION: &str = "Global style or length rules for user-facing chat do not apply to this session.\nWrite your reply at the length the reply contract needs — no shorter.";
 
 /// The role-specific data interpolated into the common worker guidance.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -61,8 +61,13 @@ fn render_role_preamble(role: &RolePreamble) -> String {
          Git, destructive actions, credentials, and external communication are denied, not asked. \
          Report denials in the reply note.\n\n\
          ## Reply contract\n\
-         Return the `{role_name}` schema field by field: {fields}.{impl_cap}\n\
-         Alongside the StructuredOutput call, include one short plain-text summary line in your final message.\n\n\
+         Converse normally in prose so your work is visible in the TUI.\n\
+         END your final message with exactly one `{role_name}` contract containing these fields: {fields}.{impl_cap}\n\
+         Use the literal opening and closing fence lines shown here:\n\
+         ```json\n\
+         <the contract JSON>\n\
+         ```\n\
+         Do not place the contract JSON anywhere else in the message.\n\n\
          ## Style exemption\n\
          {STYLE_EXEMPTION}\n",
         role_name = role.name,

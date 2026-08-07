@@ -1,7 +1,7 @@
 //! Transport-independent follow state machine and turn attribution.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fmt,
     future::Future,
     sync::{
@@ -37,26 +37,200 @@ pub struct FollowMessage {
 }
 
 impl FollowMessage {
-    fn worker_reply(&self) -> Option<(WorkerState, Value)> {
-        self.structured
-            .iter()
-            .cloned()
-            .chain(self.parts.iter().filter_map(|part| {
-                let text = part.get("text")?.as_str()?;
-                serde_json::from_str(text).ok()
-            }))
-            .find_map(|reply| {
-                let state = reply
-                    .get("status")
-                    .and_then(Value::as_str)
-                    .and_then(parse_worker_state)?;
-                Some((state, reply))
-            })
+    fn worker_reply(&self) -> WorkerReplyCandidate {
+        let has_structured = self
+            .structured
+            .as_ref()
+            .is_some_and(|value| !value.is_null());
+        match worker_reply_payload(self.structured.as_ref(), &self.parts) {
+            Ok(Some(reply)) => reply
+                .get("status")
+                .and_then(Value::as_str)
+                .and_then(parse_worker_state)
+                .map_or_else(
+                    || {
+                        if has_structured {
+                            WorkerReplyCandidate::Absent
+                        } else {
+                            WorkerReplyCandidate::Invalid
+                        }
+                    },
+                    |state| WorkerReplyCandidate::Valid(state, reply),
+                ),
+            Ok(None) => WorkerReplyCandidate::Absent,
+            Err(_) => WorkerReplyCandidate::Invalid,
+        }
     }
 
     #[must_use]
     pub fn reply(&self) -> Option<&Value> {
         self.structured.as_ref()
+    }
+}
+
+enum WorkerReplyCandidate {
+    Absent,
+    Valid(WorkerState, Value),
+    Invalid,
+}
+
+/// A malformed fenced JSON reply found in an assistant text part.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FencedReplyError;
+
+impl fmt::Display for FencedReplyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the selected fenced JSON worker reply is malformed")
+    }
+}
+
+impl std::error::Error for FencedReplyError {}
+
+/// Selects one worker reply payload from an assistant message.
+///
+/// A non-null structured value is authoritative for schema-mode and legacy
+/// turns. Otherwise, text parts are joined in order and the last top-level
+/// JSON-ish block whose opening and closing fences occupy their own lines is
+/// selected. A bare fenced block is also selected when its body looks like a
+/// status-bearing JSON contract; explicitly non-JSON fences are ignored.
+///
+/// The chain walker deliberately treats the transports asymmetrically: an
+/// invalid JSON-ish fence stops the walk because it is a live contract attempt,
+/// while an invalid structured value resumes the walk for legacy schema-mode
+/// tolerance. Do not harmonize those behaviors.
+pub fn worker_reply_payload(
+    structured: Option<&Value>,
+    parts: &[Value],
+) -> Result<Option<Value>, FencedReplyError> {
+    if let Some(structured) = structured.filter(|value| !value.is_null()) {
+        return Ok(Some(structured.clone()));
+    }
+
+    let text = parts
+        .iter()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let Some(block) = last_fenced_json_block(&text)? else {
+        return Ok(None);
+    };
+    serde_json::from_str(block.trim())
+        .map(Some)
+        .map_err(|_| FencedReplyError)
+}
+
+fn last_fenced_json_block(text: &str) -> Result<Option<String>, FencedReplyError> {
+    let mut selected = None;
+    let mut current = None::<OpenFence<'_>>;
+
+    for line in text.lines() {
+        if let Some(open) = current.as_mut() {
+            if is_closing_fence(line, open.marker, open.length) {
+                let block = open.lines.join("\n");
+                match open.kind {
+                    FenceKind::Jsonish => selected = Some(block),
+                    FenceKind::Bare if bare_block_is_contract_candidate(&block) => {
+                        selected = Some(block);
+                    }
+                    FenceKind::Bare | FenceKind::Other => {}
+                }
+                current = None;
+            } else {
+                open.lines.push(line);
+            }
+            continue;
+        }
+
+        if let Some(fence) = parse_fence_line(line) {
+            current = Some(OpenFence {
+                marker: fence.marker,
+                length: fence.length,
+                kind: fence.kind(),
+                lines: Vec::new(),
+            });
+        }
+    }
+
+    if let Some(open) = current {
+        let block = open.lines.join("\n");
+        if open.kind == FenceKind::Jsonish
+            || (open.kind == FenceKind::Bare && bare_block_is_contract_candidate(&block))
+        {
+            return Err(FencedReplyError);
+        }
+    }
+    Ok(selected)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FenceKind {
+    Jsonish,
+    Bare,
+    Other,
+}
+
+struct OpenFence<'a> {
+    marker: char,
+    length: usize,
+    kind: FenceKind,
+    lines: Vec<&'a str>,
+}
+
+struct FenceLine<'a> {
+    marker: char,
+    length: usize,
+    info: &'a str,
+}
+
+impl FenceLine<'_> {
+    fn kind(&self) -> FenceKind {
+        if self.length == 3
+            && self
+                .info
+                .split_whitespace()
+                .next()
+                .is_some_and(|tag| tag.eq_ignore_ascii_case("json"))
+        {
+            FenceKind::Jsonish
+        } else if self.info.is_empty() {
+            FenceKind::Bare
+        } else {
+            FenceKind::Other
+        }
+    }
+}
+
+fn parse_fence_line(line: &str) -> Option<FenceLine<'_>> {
+    let trimmed = line.trim();
+    let marker = trimmed.chars().next()?;
+    if !matches!(marker, '`' | '~') {
+        return None;
+    }
+    let length = trimmed
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    (length >= 3).then(|| FenceLine {
+        marker,
+        length,
+        info: trimmed[length..].trim(),
+    })
+}
+
+fn is_closing_fence(line: &str, marker: char, opening_length: usize) -> bool {
+    parse_fence_line(line).is_some_and(|fence| {
+        fence.marker == marker && fence.length >= opening_length && fence.info.is_empty()
+    })
+}
+
+fn bare_block_is_contract_candidate(block: &str) -> bool {
+    match serde_json::from_str::<Value>(block.trim()) {
+        Ok(value) => value.get("status").is_some(),
+        Err(_) => {
+            let trimmed = block.trim();
+            trimmed.starts_with('{') && trimmed.contains("\"status\"")
+        }
     }
 }
 
@@ -656,6 +830,7 @@ struct TurnTracker<'a> {
     target: &'a FollowTarget,
     event_ids: HashSet<String>,
     attributed: Vec<FollowMessage>,
+    pending_parts: HashMap<String, Vec<Value>>,
 }
 
 impl<'a> TurnTracker<'a> {
@@ -664,6 +839,7 @@ impl<'a> TurnTracker<'a> {
             target,
             event_ids: HashSet::new(),
             attributed: Vec::new(),
+            pending_parts: HashMap::new(),
         }
     }
 
@@ -672,6 +848,7 @@ impl<'a> TurnTracker<'a> {
     }
 
     fn reconcile(&mut self, messages: Vec<FollowMessage>) -> Option<FollowMessage> {
+        self.pending_parts.clear();
         self.attributed = messages
             .into_iter()
             .filter(|message| self.is_attributed(message))
@@ -680,15 +857,63 @@ impl<'a> TurnTracker<'a> {
     }
 
     fn observe(&mut self, event: &OcaEvent) -> Option<FollowMessage> {
+        if event.kind == "message.part.updated" {
+            self.observe_part(event);
+        }
         if let Some(message) = event.message.as_ref()
             && self.is_attributed(message)
         {
-            self.attributed.push(message.clone());
+            let mut message = message.clone();
+            if let Some(parts) = self.pending_parts.remove(&message.id) {
+                message.parts = parts;
+            }
+            if let Some(existing) = self
+                .attributed
+                .iter_mut()
+                .find(|existing| existing.id == message.id)
+            {
+                if message.parts.is_empty() {
+                    message.parts = std::mem::take(&mut existing.parts);
+                }
+                *existing = message;
+            } else {
+                self.attributed.push(message);
+            }
         }
         if event.is_session_idle() {
             return self.completed_boundary();
         }
         None
+    }
+
+    fn observe_part(&mut self, event: &OcaEvent) {
+        let Some(payload) = event.payload.as_ref() else {
+            return;
+        };
+        let Some(part) = payload
+            .pointer("/properties/part")
+            .or_else(|| payload.pointer("/data/part"))
+            .or_else(|| payload.get("part"))
+            .cloned()
+        else {
+            return;
+        };
+        let Some(message_id) = part
+            .get("messageID")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        if let Some(message) = self
+            .attributed
+            .iter_mut()
+            .find(|message| message.id == message_id)
+        {
+            upsert_part(&mut message.parts, part);
+        } else {
+            upsert_part(self.pending_parts.entry(message_id).or_default(), part);
+        }
     }
 
     /// The live terminal boundary: the newest attributed step, once completed.
@@ -711,21 +936,43 @@ impl<'a> TurnTracker<'a> {
     }
 }
 
+fn upsert_part(parts: &mut Vec<Value>, part: Value) {
+    let part_id = part.get("id").and_then(Value::as_str);
+    if let Some(index) = part_id.and_then(|part_id| {
+        parts
+            .iter()
+            .position(|existing| existing.get("id").and_then(Value::as_str) == Some(part_id))
+    }) {
+        parts[index] = part;
+    } else {
+        parts.push(part);
+    }
+}
+
 fn terminal_from_chain(
     messages: &[FollowMessage],
     mut message: FollowMessage,
 ) -> Result<FollowTerminal, FollowError> {
-    let (state, reply) = messages
+    let selected = messages
         .iter()
         .rev()
-        .find_map(FollowMessage::worker_reply)
-        .ok_or_else(|| FollowError::Protocol {
-            // A completed tool-using turn without a role reply is not success. Keep this a
-            // distinct protocol mismatch so callers never silently finalize it as `done`.
-            message:
-                "completed attributed assistant message chain has no valid worker status reply"
-                    .to_owned(),
-        })?;
+        .find_map(|message| match message.worker_reply() {
+            WorkerReplyCandidate::Absent => None,
+            candidate => Some(candidate),
+        });
+    let (state, reply) = match selected {
+        Some(WorkerReplyCandidate::Valid(state, reply)) => (state, reply),
+        Some(WorkerReplyCandidate::Invalid) | None => {
+            return Err(FollowError::Protocol {
+                // A completed tool-using turn without a role reply is not success. Keep this a
+                // distinct protocol mismatch so callers never silently finalize it as `done`.
+                message:
+                    "completed attributed assistant message chain has no valid worker status reply"
+                        .to_owned(),
+            });
+        }
+        Some(WorkerReplyCandidate::Absent) => unreachable!("absent candidates are skipped"),
+    };
     // OpenCode can put the JSON text on an earlier tool step. Preserve the newest message as the
     // terminal boundary while exposing the selected reply through the existing projection API.
     message.structured = Some(reply);
@@ -898,6 +1145,140 @@ mod tests {
             max_reconnect_attempts: 1,
             max_reconnect_elapsed: Duration::ZERO,
             initial_backoff: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn fenced_reply_decision_table_covers_jsonish_bare_and_nested_blocks() {
+        struct Case {
+            name: &'static str,
+            text: &'static str,
+            expected: &'static str,
+            expected_file: Option<&'static str>,
+        }
+
+        let cases = [
+            Case {
+                name: "uppercase json",
+                text: "```JSON\n{\"status\":\"blocked\",\"files\":[\"uppercase.rs\"]}\n```",
+                expected: "Valid(blocked)",
+                expected_file: Some("uppercase.rs"),
+            },
+            Case {
+                name: "bare fence (json-ish body)",
+                text: "```\n{\"status\":\"partial\",\"files\":[\"bare.rs\"]}\n```",
+                expected: "Valid(partial)",
+                expected_file: Some("bare.rs"),
+            },
+            Case {
+                name: "bare fence (non-json body)",
+                text: "```\nprintf 'ordinary code sample'\n```",
+                expected: "Absent",
+                expected_file: None,
+            },
+            Case {
+                name: "trailing attrs",
+                text: "```json contract=worker\n{\"status\":\"done\",\"files\":[\"attrs.rs\"]}\n```",
+                expected: "Valid(done)",
+                expected_file: Some("attrs.rs"),
+            },
+            Case {
+                name: "tilde json",
+                text: "~~~JsOn\n{\"status\":\"partial\",\"files\":[\"tilde.rs\"]}\n~~~",
+                expected: "Valid(partial)",
+                expected_file: Some("tilde.rs"),
+            },
+            Case {
+                name: "indented valid",
+                text: "   ```json\n{\"status\":\"done\",\"files\":[\"indented.rs\"]}\n   ```",
+                expected: "Valid(done)",
+                expected_file: Some("indented.rs"),
+            },
+            Case {
+                name: "unclosed",
+                text: "```json\n{\"status\":\"done\",\"files\":[\"unclosed.rs\"]}",
+                expected: "Invalid",
+                expected_file: None,
+            },
+            Case {
+                name: "nested-in-text",
+                text: "~~~text\n```json\n{\"status\":\"done\",\"files\":[\"nested.rs\"]}\n```\n~~~",
+                expected: "Absent",
+                expected_file: None,
+            },
+            Case {
+                name: "example-before-real",
+                text: "````text\n```json\n{\"status\":\"done\",\"files\":[\"example.rs\"]}\n```\n````\n```json\n{\"status\":\"blocked\",\"files\":[\"real.rs\"]}\n```",
+                expected: "Valid(blocked)",
+                expected_file: Some("real.rs"),
+            },
+            Case {
+                name: "example-with-no-real",
+                text: "````text\n```json\n{\"status\":\"done\",\"files\":[\"example-only.rs\"]}\n```\n````",
+                expected: "Absent",
+                expected_file: None,
+            },
+            Case {
+                name: "valid-then-unclosed",
+                text: "```json\n{\"status\":\"done\",\"files\":[\"obsolete.rs\"]}\n```\n```JSON\n{\"status\":\"blocked\",\"files\":[\"unfinished.rs\"]}",
+                expected: "Invalid",
+                expected_file: None,
+            },
+            Case {
+                // A json-ish opener is a contract attempt, so an unparseable
+                // body must stop the walk instead of borrowing an older reply.
+                name: "jsonish-opener-unparseable-body",
+                text: "```json\n{\"status\":\"done\",,}\n```",
+                expected: "Invalid",
+                expected_file: None,
+            },
+            Case {
+                // Only a status-bearing body promotes a bare fence. An ordinary
+                // JSON sample must stay deferrable rather than become a contract.
+                name: "bare-fence-valid-non-contract-json",
+                text: "```\n{\"retries\":2,\"enabled\":true}\n```",
+                expected: "Absent",
+                expected_file: None,
+            },
+        ];
+
+        assert_eq!(cases.len(), 13, "the reviewer decision table is exhaustive");
+        for case in cases {
+            let message = FollowMessage {
+                id: case.name.to_owned(),
+                session_id: "ses_target".to_owned(),
+                parent_id: Some("msg_this_dispatch".to_owned()),
+                role: "assistant".to_owned(),
+                completed: true,
+                structured: None,
+                parts: vec![serde_json::json!({"type": "text", "text": case.text})],
+                error: None,
+            };
+
+            let (actual, reply) = match message.worker_reply() {
+                WorkerReplyCandidate::Absent => ("Absent", None),
+                WorkerReplyCandidate::Invalid => ("Invalid", None),
+                WorkerReplyCandidate::Valid(WorkerState::Done, reply) => {
+                    ("Valid(done)", Some(reply))
+                }
+                WorkerReplyCandidate::Valid(WorkerState::Blocked, reply) => {
+                    ("Valid(blocked)", Some(reply))
+                }
+                WorkerReplyCandidate::Valid(WorkerState::Partial, reply) => {
+                    ("Valid(partial)", Some(reply))
+                }
+            };
+            assert_eq!(actual, case.expected, "decision row: {}", case.name);
+            assert_eq!(
+                reply
+                    .as_ref()
+                    .and_then(|value| value["files"].as_array())
+                    .and_then(|files| files.first())
+                    .and_then(Value::as_str),
+                case.expected_file,
+                "selected payload for decision row: {}",
+                case.name
+            );
         }
     }
 
@@ -1111,8 +1492,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_multi_step_event_turn_classifies_from_an_earlier_step_reply() {
-        // `message.updated` frames never carry parts, so a live multi-step turn can only expose
-        // its reply through the structured field of the step that emitted it.
         let step = |id: &str, structured: Option<Value>| FollowMessage {
             id: id.to_owned(),
             session_id: "ses_target".to_owned(),
@@ -1171,6 +1550,87 @@ mod tests {
             terminal.message.reply().unwrap()["files"],
             serde_json::json!(["src/follow.rs"])
         );
+    }
+
+    #[tokio::test]
+    async fn streamed_text_part_is_joined_to_its_message_before_idle_classification() {
+        let mut incomplete = message("msg_this_dispatch", "ignored", false);
+        incomplete.id = "msg_assistant".to_owned();
+        incomplete.structured = None;
+        let mut completed = incomplete.clone();
+        completed.completed = true;
+        let text = "The implementation is complete and visible as ordinary prose.\n```json\n{\"status\":\"done\",\"files\":[\"src/follow.rs\"],\"note\":\"The streamed text part remains attached to its attributed assistant message through the completed update. Idle classification can therefore decode the final fenced worker contract without a history read.\"}\n```";
+        let part = OcaEvent {
+            id: Some("evt-part".to_owned()),
+            cursor: Some("evt-part".to_owned()),
+            kind: "message.part.updated".to_owned(),
+            session_id: Some("ses_target".to_owned()),
+            payload: Some(serde_json::json!({
+                "type": "message.part.updated",
+                "properties": {"part": {
+                    "id": "prt_text",
+                    "messageID": "msg_assistant",
+                    "sessionID": "ses_target",
+                    "type": "text",
+                    "text": text
+                }}
+            })),
+            message: None,
+            known: true,
+        };
+        // A resumed stream can deliver a part before the frame that introduces
+        // its message, so both orderings must reach the same classification.
+        for part_arrives_first in [false, true] {
+            let start = event(
+                "evt-message-start",
+                "message.updated",
+                Some(incomplete.clone()),
+            );
+            let complete = event(
+                "evt-message-complete",
+                "message.updated",
+                Some(completed.clone()),
+            );
+            let ordered = if part_arrives_first {
+                vec![Ok(Some(part.clone())), Ok(Some(start))]
+            } else {
+                vec![Ok(Some(start)), Ok(Some(part.clone()))]
+            };
+            let transport = ScriptedTransport {
+                subscriptions: Mutex::new(VecDeque::from([subscription(
+                    ordered.into_iter().chain([
+                        Ok(Some(complete)),
+                        Ok(Some(event("evt-idle", "session.idle", None))),
+                    ]),
+                )])),
+                reconciliations: Mutex::new(VecDeque::from([Ok(Vec::new())])),
+                cursors: Mutex::new(Vec::new()),
+            };
+
+            let outcome = follow_until_terminal_with_policy::<_, Journal>(
+                &transport,
+                &target(),
+                None,
+                None,
+                test_policy(),
+            )
+            .await
+            .unwrap();
+
+            let FollowOutcome::Terminal(terminal) = outcome else {
+                panic!("streamed prose turn must classify as terminal");
+            };
+            assert_eq!(
+                terminal.state,
+                WorkerState::Done,
+                "part_arrives_first={part_arrives_first}"
+            );
+            assert_eq!(
+                terminal.message.reply().unwrap()["files"],
+                serde_json::json!(["src/follow.rs"]),
+                "part_arrives_first={part_arrives_first}"
+            );
+        }
     }
 
     #[tokio::test]

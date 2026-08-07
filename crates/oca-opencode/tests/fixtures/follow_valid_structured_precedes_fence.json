@@ -1,0 +1,23 @@
+[
+  {
+    "info": {
+      "id": "msg_assistant",
+      "sessionID": "ses_target",
+      "role": "assistant",
+      "parentID": "msg_this_dispatch",
+      "time": { "created": 10, "completed": 20 },
+      "finish": "stop",
+      "structured": {
+        "status": "done",
+        "files": ["structured.rs"],
+        "note": "The newest valid structured value remains authoritative while schema transport is enabled. A conflicting text fence in the same message must not replace this compatibility payload."
+      }
+    },
+    "parts": [
+      {
+        "type": "text",
+        "text": "Conflicting prose.\n```json\n{\"status\":\"blocked\",\"files\":[\"fenced.rs\"],\"note\":\"This fenced value deliberately conflicts with the structured reply and must lose because legacy structured transport has explicit precedence.\"}\n```"
+      }
+    ]
+  }
+]

@@ -1,0 +1,50 @@
+[
+  {
+    "info": {
+      "id": "msg_assistant_reply",
+      "sessionID": "ses_target",
+      "role": "assistant",
+      "parentID": "msg_this_dispatch",
+      "time": { "created": 1, "completed": 9 },
+      "finish": "tool-calls"
+    },
+    "parts": [
+      {
+        "type": "text",
+        "text": "The implementation is complete.\n```json\n{\"status\":\"done\",\"files\":[\"older.rs\"],\"note\":\"This valid worker reply remains selectable past an ordinary Rust code sample and a fence-less final assistant step in the same attributed turn.\"}\n```"
+      }
+    ]
+  },
+  {
+    "info": {
+      "id": "msg_assistant_code_sample",
+      "sessionID": "ses_target",
+      "role": "assistant",
+      "parentID": "msg_this_dispatch",
+      "time": { "created": 10, "completed": 19 },
+      "finish": "tool-calls"
+    },
+    "parts": [
+      {
+        "type": "text",
+        "text": "The relevant implementation now reads:\n```rust\nfn classify() -> WorkerState {\n    WorkerState::Done\n}\n```"
+      }
+    ]
+  },
+  {
+    "info": {
+      "id": "msg_assistant_final",
+      "sessionID": "ses_target",
+      "role": "assistant",
+      "parentID": "msg_this_dispatch",
+      "time": { "created": 20, "completed": 29 },
+      "finish": "stop"
+    },
+    "parts": [
+      {
+        "type": "text",
+        "text": "The final verification is complete and no further edits are needed."
+      }
+    ]
+  }
+]

@@ -1990,14 +1990,15 @@ fn running_multistep_messages(parent_id: &str) -> String {
             "sessionID": "ses_headed_background",
             "role": "assistant",
             "parentID": parent_id,
-            "time": {"created": 2, "completed": 3},
-            "structured": {
-                "status": "done",
-                "files": [],
-                "note": "This structured payload belongs to an earlier tool-using assistant step while the worker remains busy. It must not be treated as the live display terminal boundary before the session idle event."
-            }
+            "time": {"created": 2, "completed": 3}
         },
-        "parts": [{"type": "tool", "tool": "write"}]
+        "parts": [
+            {"type": "tool", "tool": "write"},
+            {
+                "type": "text",
+                "text": "An intermediate tool step has finished, but the worker is still busy.\n```json\n{\"status\":\"done\",\"files\":[],\"note\":\"This fenced payload belongs to an earlier tool-using assistant step while the worker remains busy. It must not be treated as the live display terminal boundary before the session idle event.\"}\n```"
+            }
+        ]
     }])
     .to_string()
 }
@@ -2161,6 +2162,10 @@ fn spawn_foreground_opencode() -> (u16, thread::JoinHandle<()>) {
                 }
                 3 => {
                     assert_eq!(request.path, "/session/ses_target/prompt_async");
+                    assert!(
+                        request.body.get("format").is_none(),
+                        "default headed dispatch must use text transport"
+                    );
                     message_id = request.body["messageID"].as_str().map(ToOwned::to_owned);
                     prompt_text = request.body["parts"][0]["text"]
                         .as_str()
@@ -2282,12 +2287,14 @@ fn terminal_messages_with_status(parent_id: &str, status: &str) -> String {
             "sessionID": "ses_target",
             "role": "assistant",
             "parentID": parent_id,
-            "time": {"created":1,"completed":2},
-            // Long enough to clear T27a's per-role reply floor, so this fixture
-            // stays valid once the floor lands on the integration branch.
-            "structured": {"status":status,"files":[],"note":"Implemented the requested change and verified it end to end against the fake server fixture. All assertions pass, no regressions were observed, and the worker finished with no outstanding follow-up work."}
+            "time": {"created":1,"completed":2}
         },
-        "parts": []
+        "parts": [{
+            "type": "text",
+            // Long enough to clear the per-role reply floor, so this fixture
+            // exercises the prose transport without weakening validation.
+            "text": format!("Implemented the requested change and verified it against the fake server fixture. The final contract follows.\n```json\n{{\"status\":\"{status}\",\"files\":[],\"note\":\"Implemented the requested change and verified it end to end against the fake server fixture. All assertions pass, no regressions were observed, and the worker finished with no outstanding follow-up work.\"}}\n```")
+        }]
     }])
     .to_string()
 }

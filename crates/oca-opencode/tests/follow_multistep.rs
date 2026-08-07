@@ -78,28 +78,115 @@ async fn completed_three_message_turn_without_any_reply_is_a_protocol_mismatch()
 }
 
 #[tokio::test]
-async fn completed_single_message_turn_keeps_its_existing_classification() {
-    let message = FollowMessage {
-        id: "msg_assistant".to_owned(),
-        session_id: "ses_target".to_owned(),
-        parent_id: Some("msg_this_dispatch".to_owned()),
-        role: "assistant".to_owned(),
-        completed: true,
-        structured: Some(serde_json::json!({
-            "status": "blocked",
-            "files": [],
-            "note": "Waiting for required user input before continuing the assigned worker task."
-        })),
-        parts: Vec::new(),
-        error: None,
-    };
-    let outcome = follow_messages(vec![message]).await.unwrap();
+async fn completed_single_message_prose_turn_classifies_its_fenced_reply() {
+    let outcome = follow_fixture(include_str!(
+        "fixtures/follow_single_message_prose_reply.json"
+    ))
+    .await
+    .unwrap();
 
     let FollowOutcome::Terminal(terminal) = outcome else {
         panic!("single-message fixture must classify as terminal");
     };
+    assert_eq!(terminal.state, WorkerState::Partial);
+    assert_eq!(terminal.message.id, "msg_assistant");
+    assert_eq!(
+        terminal.message.reply().unwrap()["files"],
+        serde_json::json!(["src/follow.rs"])
+    );
+}
+
+#[tokio::test]
+async fn malformed_fenced_reply_is_a_protocol_mismatch() {
+    let error = follow_fixture(include_str!("fixtures/follow_malformed_block.json"))
+        .await
+        .unwrap_err();
+
+    assert_protocol_mismatch(error);
+}
+
+#[tokio::test]
+async fn last_fenced_block_in_the_newest_message_is_authoritative() {
+    let outcome = follow_fixture(include_str!("fixtures/follow_multiple_blocks.json"))
+        .await
+        .unwrap();
+
+    let FollowOutcome::Terminal(terminal) = outcome else {
+        panic!("multiple-block fixture must classify as terminal");
+    };
     assert_eq!(terminal.state, WorkerState::Blocked);
     assert_eq!(terminal.message.id, "msg_assistant");
+    assert_eq!(
+        terminal.message.reply().unwrap()["files"],
+        serde_json::json!(["selected.rs"])
+    );
+}
+
+#[tokio::test]
+async fn invalid_structured_value_defers_to_an_older_valid_reply() {
+    let outcome = follow_fixture(include_str!(
+        "fixtures/follow_invalid_structured_then_older_valid.json"
+    ))
+    .await
+    .unwrap();
+
+    let FollowOutcome::Terminal(terminal) = outcome else {
+        panic!("legacy structured fallback fixture must classify as terminal");
+    };
+    assert_eq!(terminal.state, WorkerState::Partial);
+    assert_eq!(terminal.message.id, "msg_assistant_newer_garbage");
+    assert_eq!(
+        terminal.message.reply().unwrap()["files"],
+        serde_json::json!(["older-structured.rs"])
+    );
+}
+
+#[tokio::test]
+async fn newest_valid_structured_reply_precedes_fences() {
+    let outcome = follow_fixture(include_str!(
+        "fixtures/follow_valid_structured_precedes_fence.json"
+    ))
+    .await
+    .unwrap();
+
+    let FollowOutcome::Terminal(terminal) = outcome else {
+        panic!("structured fixture must classify as terminal");
+    };
+    assert_eq!(terminal.state, WorkerState::Done);
+    assert_eq!(
+        terminal.message.reply().unwrap()["files"],
+        serde_json::json!(["structured.rs"])
+    );
+}
+
+#[tokio::test]
+async fn rust_fence_in_an_intermediate_step_and_fenceless_final_defer_to_older_reply() {
+    let outcome = follow_fixture(include_str!(
+        "fixtures/follow_rust_fence_defers_to_older_reply.json"
+    ))
+    .await
+    .unwrap();
+
+    let FollowOutcome::Terminal(terminal) = outcome else {
+        panic!("ordinary code sample fixture must classify as terminal");
+    };
+    assert_eq!(terminal.state, WorkerState::Done);
+    assert_eq!(terminal.message.id, "msg_assistant_final");
+    assert_eq!(
+        terminal.message.reply().unwrap()["files"],
+        serde_json::json!(["older.rs"])
+    );
+}
+
+fn assert_protocol_mismatch(error: FollowError) {
+    assert_eq!(
+        error,
+        FollowError::Protocol {
+            message:
+                "completed attributed assistant message chain has no valid worker status reply"
+                    .to_owned(),
+        }
+    );
 }
 
 async fn follow_fixture(fixture: &str) -> Result<FollowOutcome, FollowError> {

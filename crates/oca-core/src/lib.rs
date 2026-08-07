@@ -20,11 +20,11 @@ pub use error::{
     exit, parse_error_envelope, validate_error_envelope,
 };
 pub use follow::{
-    EventJournalWriter, EventSubscription, FollowBoundaryOutcome, FollowBoundaryTerminal,
-    FollowError, FollowMessage, FollowOutcome, FollowPolicy, FollowTarget, FollowTerminal,
-    FollowTransport, FollowTransportError, OcaEvent, follow_until_terminal,
+    EventJournalWriter, EventSubscription, FencedReplyError, FollowBoundaryOutcome,
+    FollowBoundaryTerminal, FollowError, FollowMessage, FollowOutcome, FollowPolicy, FollowTarget,
+    FollowTerminal, FollowTransport, FollowTransportError, OcaEvent, follow_until_terminal,
     follow_until_terminal_boundary, follow_until_terminal_from_cursor,
-    follow_until_terminal_with_policy,
+    follow_until_terminal_with_policy, worker_reply_payload,
 };
 pub use foreground::{
     DispatchPrompt, ForegroundBackend, ForegroundOutcome, ForegroundRequest, TerminalReply,
