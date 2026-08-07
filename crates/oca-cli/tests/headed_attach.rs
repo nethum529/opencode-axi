@@ -20,6 +20,11 @@ use oca_server::{ConnectOrStart, ServerRecord};
 use oca_state::{RefRecord, RefState, RefStore, RefStorePaths};
 use serde_json::{Value, json};
 
+/// Fixture patience for events that take milliseconds on an idle machine.
+/// The gate runs these subprocess-heavy tests in parallel right after a cold
+/// build, where a short deadline reports load as a fixture failure.
+const FIXTURE_PATIENCE: Duration = Duration::from_secs(20);
+
 #[test]
 fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_events_flow() {
     let home = tempfile::tempdir().unwrap();
@@ -67,7 +72,7 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
         .path()
         .join(".oca/events")
         .join(format!("{reference}.{message_id}.jsonl"));
-    wait_for_nonempty_file(&journal, Duration::from_secs(2));
+    wait_for_nonempty_file(&journal, FIXTURE_PATIENCE);
 
     let events = Command::new(env!("CARGO_BIN_EXE_oca"))
         .args(["events", reference, "--json"])
@@ -348,7 +353,7 @@ fn headed_background_sse_confirms_prompt_when_history_rejects_its_stored_record(
         .join(".oca/events")
         .join(format!("{reference}.{message_id}.jsonl"));
     release_terminal.store(true, Ordering::SeqCst);
-    wait_for_nonempty_file(&journal, Duration::from_secs(2));
+    wait_for_nonempty_file(&journal, FIXTURE_PATIENCE);
 
     let events = Command::new(env!("CARGO_BIN_EXE_oca"))
         .args(["events", reference, "--json"])
@@ -470,7 +475,7 @@ fn headed_attach_records_and_closes_the_tab_after_terminal_state() {
     prepare_attach_home(home.path(), &socket, port, "herdr");
 
     let output = Command::new(env!("CARGO_BIN_EXE_oca"))
-        .args(["__attach", "wabc12", "ses_target", "/worker"])
+        .args(["__attach", "wabc12", "ses_target", "/worker", "sayHi"])
         .env("HOME", home.path())
         .current_dir(home.path())
         .output()
@@ -502,7 +507,7 @@ fn headed_attach_records_and_closes_the_tab_after_terminal_state() {
     );
     assert_eq!(calls[1]["params"]["label"], "oca");
     assert_eq!(calls[1]["params"]["focus"], false);
-    assert_eq!(calls[2]["params"]["label"], "wabc12");
+    assert_eq!(calls[2]["params"]["label"], "sayHi");
     assert_eq!(calls[2]["params"]["cwd"], "/worker");
     assert_eq!(calls[2]["params"]["focus"], false);
     assert_eq!(calls[3]["params"]["name"], "opencode");
@@ -541,7 +546,7 @@ fn a_follow_failure_keeps_the_persisted_tab_open_for_an_explicit_kill() {
     prepare_attach_home(home.path(), &socket, port, "herdr");
 
     let output = Command::new(env!("CARGO_BIN_EXE_oca"))
-        .args(["__attach", "wabc12", "ses_target", "/worker"])
+        .args(["__attach", "wabc12", "ses_target", "/worker", "fixParser"])
         .env("HOME", home.path())
         .current_dir(home.path())
         .output()
@@ -576,6 +581,7 @@ fn a_follow_failure_keeps_the_persisted_tab_open_for_an_explicit_kill() {
         Some("t1"),
         "`oca k` needs the persisted tab id to close a tab the follower abandoned"
     );
+    assert_eq!(calls[2]["params"]["label"], "fixParser");
 }
 
 #[test]
@@ -613,7 +619,7 @@ fn background_spawn_then_kill_closes_the_tab_and_exits_its_tui_process() {
         .next()
         .unwrap()
         .to_owned();
-    wait_for_ref_tab(home.path(), &reference, Duration::from_secs(2));
+    wait_for_ref_tab(home.path(), &reference, FIXTURE_PATIENCE);
 
     let started = Instant::now();
     let killed = Command::new(env!("CARGO_BIN_EXE_oca"))
@@ -650,6 +656,7 @@ fn background_spawn_then_kill_closes_the_tab_and_exits_its_tui_process() {
         ]
     );
     assert_eq!(calls[4]["params"]["tab_id"], "spawned-t1");
+    assert_eq!(calls[2]["params"]["label"], "keepRunning");
     assert_eq!(
         fs::read_to_string(home.path().join("attached-opencode-args"))
             .unwrap()
@@ -665,7 +672,7 @@ fn a_headless_ref_ends_the_attach_helper_quietly() {
     prepare_attach_home(home.path(), &socket, 1, "headless");
 
     let output = Command::new(env!("CARGO_BIN_EXE_oca"))
-        .args(["__attach", "wabc12", "ses_target", "/worker"])
+        .args(["__attach", "wabc12", "ses_target", "/worker", "wabc12"])
         .env("HOME", home.path())
         .current_dir(home.path())
         .output()
@@ -745,7 +752,7 @@ fn no_herdr_and_no_tmux_is_a_silent_headless_http_dispatch() {
 }
 
 #[test]
-fn no_herdr_inside_tmux_creates_and_cleans_up_a_ref_named_window() {
+fn no_herdr_inside_tmux_creates_and_cleans_up_a_task_named_window() {
     let home = tempfile::tempdir().unwrap();
     let missing_socket = home.path().join("missing-herdr.sock");
     let tmux = FakeTmux::new(home.path());
@@ -770,15 +777,15 @@ fn no_herdr_inside_tmux_creates_and_cleans_up_a_ref_named_window() {
     let record = only_ref(home.path());
     assert_eq!(record.display.as_deref(), Some("tmux"));
     opencode.join().unwrap();
-    let calls = tmux.wait_for_calls(2);
+    let calls = tmux.wait_for_calls(3);
     assert_eq!(
         calls,
         [
             format!(
-                "new-window -d -n oca-{} -- opencode --session ses_target",
-                record.id
+                "new-window -d -P -F #{{window_id}} -n finishInside -- opencode attach http://127.0.0.1:{port}/ --session ses_target"
             ),
-            format!("kill-window -t =oca-{}", record.id),
+            format!("set-option -w -t @42 @oca-ref {}", record.id),
+            "kill-window -t @42".to_owned(),
         ]
     );
 }
@@ -917,13 +924,11 @@ fn accept_discovery_probe(listener: &UnixListener) {
 
 fn accept_unix_with_timeout(listener: &UnixListener) -> UnixStream {
     listener.set_nonblocking(true).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(2);
+    let deadline = Instant::now() + FIXTURE_PATIENCE;
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
+                stream.set_read_timeout(Some(FIXTURE_PATIENCE)).unwrap();
                 return stream;
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1014,9 +1019,7 @@ fn spawn_herdr_recording_calls_after_agent_start(
                 thread::sleep(Duration::from_millis(5));
                 continue;
             };
-            stream
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
+            stream.set_read_timeout(Some(FIXTURE_PATIENCE)).unwrap();
             let request = read_unix_request(&stream);
             let request_id = request["id"].as_str().unwrap();
             writeln!(
@@ -1046,7 +1049,7 @@ fn spawn_herdr_with_attached_process(
             if index == 4 {
                 accept_discovery_probe(&listener);
             }
-            let (mut stream, _) = accept_unix_before(&listener, Duration::from_secs(3));
+            let (mut stream, _) = accept_unix_before(&listener, FIXTURE_PATIENCE);
             let request = read_unix_request(&stream);
             let request_id = request["id"].as_str().unwrap();
             let result = match index {
@@ -1139,7 +1142,7 @@ fn spawn_background_abort_opencode(tab_closed: Arc<AtomicBool>) -> (u16, thread:
         let prompt_text = Arc::new(Mutex::new(None::<String>));
         let mut handlers = Vec::new();
         for _ in 0..8 {
-            let (mut stream, _) = accept_tcp_before(&listener, Duration::from_secs(3));
+            let (mut stream, _) = accept_tcp_before(&listener, FIXTURE_PATIENCE);
             let event_count = Arc::clone(&event_count);
             let message_id = Arc::clone(&message_id);
             let prompt_text = Arc::clone(&prompt_text);
@@ -1171,7 +1174,7 @@ fn spawn_background_abort_opencode(tab_closed: Arc<AtomicBool>) -> (u16, thread:
                         )
                         .unwrap();
                         stream.flush().unwrap();
-                        wait_for_flag(&tab_closed, Duration::from_secs(2));
+                        wait_for_flag(&tab_closed, FIXTURE_PATIENCE);
                         let parent_id = message_id.lock().unwrap().clone().unwrap();
                         write!(stream, "{}", abort_terminal_sse(&parent_id)).unwrap();
                     }
@@ -1388,7 +1391,7 @@ fn spawn_headed_background_opencode() -> (u16, thread::JoinHandle<Vec<HttpReques
         let mut message_reads = 0;
         let mut event_handler = None;
 
-        while requests.len() < 7 && started.elapsed() < Duration::from_secs(5) {
+        while requests.len() < 7 && started.elapsed() < FIXTURE_PATIENCE {
             let (mut stream, _) = match listener.accept() {
                 Ok(connection) => connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1434,7 +1437,7 @@ fn spawn_headed_background_opencode() -> (u16, thread::JoinHandle<Vec<HttpReques
                         )
                         .unwrap();
                         stream.flush().unwrap();
-                        wait_for_flag(&release, Duration::from_secs(3));
+                        wait_for_flag(&release, FIXTURE_PATIENCE);
                         write!(stream, "{}", terminal_sse(&parent_id)).unwrap();
                         stream.flush().unwrap();
                     }));
@@ -1490,7 +1493,7 @@ fn spawn_poisoned_history_opencode() -> (u16, thread::JoinHandle<Vec<HttpRequest
         let mut event_subscriptions = 0;
         let mut handlers = Vec::new();
 
-        while requests.len() < 10 && started.elapsed() < Duration::from_secs(5) {
+        while requests.len() < 10 && started.elapsed() < FIXTURE_PATIENCE {
             let (mut stream, _) = match listener.accept() {
                 Ok(connection) => connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1530,7 +1533,7 @@ fn spawn_poisoned_history_opencode() -> (u16, thread::JoinHandle<Vec<HttpRequest
                         )
                         .unwrap();
                         stream.flush().unwrap();
-                        let deadline = Instant::now() + Duration::from_secs(2);
+                        let deadline = Instant::now() + FIXTURE_PATIENCE;
                         while history_reads.load(Ordering::SeqCst) == 0 {
                             assert!(Instant::now() < deadline, "history was never queried");
                             thread::sleep(Duration::from_millis(5));
@@ -1550,7 +1553,7 @@ fn spawn_poisoned_history_opencode() -> (u16, thread::JoinHandle<Vec<HttpRequest
                         )
                         .unwrap();
                         stream.flush().unwrap();
-                        wait_for_flag(&release, Duration::from_secs(3));
+                        wait_for_flag(&release, FIXTURE_PATIENCE);
                         write!(stream, "{}", poisoned_terminal_sse(&parent_id)).unwrap();
                         stream.flush().unwrap();
                     }));
@@ -1593,7 +1596,7 @@ fn spawn_unconfirmed_prompt_opencode(
         let mut last_request = None;
         let mut requests = Vec::new();
 
-        while started.elapsed() < Duration::from_secs(5) {
+        while started.elapsed() < FIXTURE_PATIENCE {
             let (mut stream, _) = match listener.accept() {
                 Ok(connection) => connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -2097,7 +2100,10 @@ impl FakeTmux {
         let log = directory.join("tmux-calls");
         fs::write(
             &executable,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = new-window ]; then printf '@42\\n'; fi\n",
+                log.display()
+            ),
         )
         .unwrap();
         let mut permissions = fs::metadata(&executable).unwrap().permissions();
@@ -2107,7 +2113,7 @@ impl FakeTmux {
     }
 
     fn wait_for_calls(&self, expected: usize) -> Vec<String> {
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + FIXTURE_PATIENCE;
         loop {
             let calls = fs::read_to_string(&self.log)
                 .unwrap_or_default()

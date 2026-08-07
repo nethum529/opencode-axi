@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::{
     DisplayMode, OcaError, PermissionProfile, ReplyContract, ResolvedModel, RoleReply,
-    WorkerPolicy, decode_role_reply, validate_reply_floor,
+    WorkerPolicy, decode_role_reply, task_display_name, validate_reply_floor,
 };
 
 /// A fully locally-resolved foreground dispatch.
@@ -137,6 +137,7 @@ pub trait ForegroundBackend {
         reference: &str,
         session_id: &str,
         cwd: &std::path::Path,
+        display_name: &str,
         display: DisplayMode,
     ) -> Result<(), OcaError>;
 
@@ -288,10 +289,17 @@ where
 
     let pending = backend.write_ref(&session_id, &message_id, &request)?;
     let reference = backend.acknowledge(pending, &request.model, request.json)?;
+    let display_name = task_display_name(&request.prompt, &reference);
 
     // The helper cannot be spawned until the acknowledgement is emitted and
     // flushed by the backend's acknowledgement boundary.
-    backend.spawn_attach(&reference, &session_id, &request.cwd, request.display)?;
+    backend.spawn_attach(
+        &reference,
+        &session_id,
+        &request.cwd,
+        &display_name,
+        request.display,
+    )?;
 
     Ok(StartedDispatch {
         request,
@@ -428,6 +436,7 @@ mod tests {
             _reference: &str,
             _session_id: &str,
             _cwd: &std::path::Path,
+            _display_name: &str,
             _display: DisplayMode,
         ) -> Result<(), OcaError> {
             Ok(())
@@ -604,10 +613,12 @@ mod tests {
             _reference: &str,
             _session_id: &str,
             _cwd: &std::path::Path,
+            display_name: &str,
             _display: DisplayMode,
         ) -> Result<(), OcaError> {
             self.calls.push("spawn");
             assert_eq!(self.calls[self.calls.len() - 2], "ack");
+            assert_eq!(display_name, "doWork");
             Ok(())
         }
 

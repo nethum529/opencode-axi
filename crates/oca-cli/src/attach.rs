@@ -5,7 +5,7 @@ use std::{path::Path, time::Duration};
 use oca_core::{
     DisplayMode, FollowBoundaryOutcome, FollowTarget, RefId, follow_until_terminal_boundary,
 };
-use oca_display::{HerdrClient, TmuxClient};
+use oca_display::{HerdrClient, TmuxClient, opencode_attach_argv};
 use oca_opencode::OpenCodeClient;
 use oca_server::ConnectOrStart;
 use oca_state::{EventJournal, OcaConfig, RefPatch, RefStore, RefStorePaths};
@@ -127,7 +127,7 @@ async fn run_herdr_attach(
         .await
         .map_err(|error| error.to_string())?;
     let tab = herdr
-        .tab(&workspace, &command.reference, true, &command.cwd)
+        .tab(&workspace, &command.display_name, true, &command.cwd)
         .await
         .map_err(|error| error.to_string())?;
 
@@ -135,13 +135,7 @@ async fn run_herdr_attach(
         herdr
             .agent_start(
                 &tab,
-                vec![
-                    "opencode".to_owned(),
-                    "attach".to_owned(),
-                    turn.base_url.to_string(),
-                    "--session".to_owned(),
-                    command.session_id.clone(),
-                ],
+                opencode_attach_argv(turn.base_url.as_str(), &command.session_id),
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -194,7 +188,13 @@ async fn run_herdr_attach(
 async fn run_tmux_attach(command: &AttachCommand, turn: AttachTurn<'_>) -> Result<(), String> {
     let tmux = TmuxClient::default();
     let window = tmux
-        .new_window(&command.reference, &command.session_id, &command.cwd)
+        .new_window(
+            &command.reference,
+            &command.display_name,
+            turn.base_url.as_str(),
+            &command.session_id,
+            &command.cwd,
+        )
         .map_err(|error| error.to_string())?;
     let follow_result = async {
         let mut journal =
