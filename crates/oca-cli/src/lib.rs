@@ -247,8 +247,8 @@ const DISPATCH_EXAMPLES: &[&[&str]] = &[
     &["oca", "luna:h", "implement", "the", "ticket"],
     &["oca", "sol", "-e", "x", "review", "the", "diff"],
     &["oca", "terra:medium", "summarize", "the", "change"],
-    &["oca", "flash:max", "run", "the", "tests"],
-    &["oca", "deepseek:h", "check", "the", "parser"],
+    &["oca", "terra:max", "run", "the", "tests"],
+    &["oca", "luna:h", "check", "the", "parser"],
     &["oca", "luna:h", "-b", "dispatch", "in", "background"],
     &["oca", "--json", "luna:h", "--", "--literal", "prompt"],
 ];
@@ -304,7 +304,7 @@ const DISPATCH_FLAGS: &[FlagGrammar] = &[
         kind: AgentFlag::Headless,
         spellings: &["--headless"],
         value: FlagValueForm::None,
-        argv_examples: &[&["oca", "flash:h", "--headless", "run", "without", "a", "tui"]],
+        argv_examples: &[&["oca", "terra:h", "--headless", "run", "without", "a", "tui"]],
     },
 ];
 
@@ -802,6 +802,7 @@ fn parse_dispatch(
         EffortInput::both(inline_effort, flagged_effort),
         catalog,
     )?;
+    model.validate_tooled()?;
     if prompt.is_empty() {
         return Err(usage("a prompt is required"));
     }
@@ -1188,6 +1189,19 @@ mod tests {
         };
         assert!(command.background);
         assert_eq!(command.prompt, "implement this");
+    }
+
+    #[test]
+    fn default_flash_dispatch_fails_before_a_prompt_can_reach_the_provider() {
+        let error = parse_from(["oca", "flash:high", "implement", "this"])
+            .expect_err("the default flash alias cannot run tooled dispatches");
+
+        assert_eq!(error.code_kind(), ErrorCode::ModelUnsupportedTooled);
+        assert_eq!(
+            error.error(),
+            "deepseek-v4-flash-free: every variant is a thinking variant and the provider rejects tool use (tool_choice) in thinking mode; this alias cannot run tooled dispatches"
+        );
+        assert!(error.help().contains("another model alias"));
     }
 
     #[test]

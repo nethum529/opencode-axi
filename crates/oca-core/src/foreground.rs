@@ -228,6 +228,8 @@ pub(crate) async fn start_dispatch<B>(
 where
     B: ForegroundBackend,
 {
+    request.model.validate_tooled()?;
+
     // Preparation happens once, outside the recovery paths below: those re-call
     // create_session only. The worktree backend's create_session records the
     // session again on recovery, which is safe because that step patches an
@@ -661,8 +663,8 @@ mod tests {
     }
 
     #[test]
-    fn every_alias_subscribes_before_prompt_and_carries_its_role_policy() {
-        for (alias, effort) in [("luna", "h"), ("sol", "h"), ("terra", "h"), ("flash", "h")] {
+    fn every_supported_alias_subscribes_before_prompt_and_carries_its_role_policy() {
+        for (alias, effort) in [("luna", "h"), ("sol", "h"), ("terra", "h")] {
             let mut backend = FakeBackend::normal();
             block_on(run_foreground(&mut backend, request(alias, effort)))
                 .unwrap_or_else(|error| panic!("{alias} dispatch failed: {error}"));
@@ -689,6 +691,19 @@ mod tests {
             assert_eq!(prompt.model.alias, alias);
             assert_eq!(prompt.permission.0.len(), 5);
         }
+    }
+
+    #[test]
+    fn tooled_incompatible_model_fails_before_backend_preparation_or_provider_access() {
+        let mut backend = FakeBackend::normal();
+        let error = block_on(run_foreground(&mut backend, request("flash", "h")))
+            .expect_err("the default flash model must be rejected locally");
+
+        assert_eq!(error.code_kind(), ErrorCode::ModelUnsupportedTooled);
+        assert!(
+            backend.calls.is_empty(),
+            "blocked dispatch must be side-effect free"
+        );
     }
 
     #[test]

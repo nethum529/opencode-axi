@@ -223,6 +223,24 @@ mod tests {
         assert_eq!(subscription_drops.load(Ordering::SeqCst), 1);
     }
 
+    #[test]
+    fn tooled_incompatible_background_model_fails_before_provider_access() {
+        let subscription_drops = Arc::new(AtomicUsize::new(0));
+        let mut backend = FakeBackend::new(Arc::clone(&subscription_drops));
+        let mut request = request();
+        request.model = resolve_model("flash", "high", ModelCatalog::default()).unwrap();
+
+        let error = block_on(run_background(&mut backend, request))
+            .expect_err("the default flash model must be rejected locally");
+
+        assert_eq!(error.code_kind(), crate::ErrorCode::ModelUnsupportedTooled);
+        assert!(
+            backend.calls.is_empty(),
+            "blocked dispatch must be side-effect free"
+        );
+        assert_eq!(subscription_drops.load(Ordering::SeqCst), 0);
+    }
+
     fn request() -> BackgroundRequest {
         let cwd = PathBuf::from("/work");
         BackgroundRequest {

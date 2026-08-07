@@ -157,6 +157,22 @@ fn assert_dispatch_contract_matches_resolver() {
     );
 
     for published in contract.dispatch_aliases {
+        let tooled_incompatible = DEFAULT_MODEL_DEFINITIONS.iter().any(|definition| {
+            definition.tooled_incompatible
+                && (definition.alias == published.alias
+                    || definition.synonyms.contains(&published.alias))
+        });
+        if tooled_incompatible {
+            let effort = published
+                .effort_ladder
+                .first()
+                .expect("blocked aliases still publish their ladder");
+            let error = parse_from(["oca", published.alias, "-e", effort, "blocked", "example"])
+                .expect_err("blocked aliases must fail before provider dispatch");
+            assert_eq!(error.code(), ErrorCode::ModelUnsupportedTooled.as_str());
+            continue;
+        }
+
         assert!(
             dispatch_examples.iter().any(|arguments| {
                 dispatch_pair(arguments, contract.dispatch_aliases).0 == published.alias

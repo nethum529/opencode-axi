@@ -72,6 +72,10 @@ pub async fn execute_message(
 
     let config = load_config(home)?;
     let context = ControlContext::from_record(&record, &config, command.effort.as_deref())?;
+    context
+        .model
+        .validate_tooled()
+        .map_err(|error| error.with_ref(&command.reference))?;
     let client = discovered_client(home, &config, &command.reference)?;
     let directory = record.session_directory().ok_or_else(|| {
         OcaError::new(ErrorCode::ProtocolMismatch)
@@ -162,6 +166,10 @@ pub async fn execute_queue(
 
     let config = load_config(home)?;
     let context = ControlContext::from_record(&record, &config, None)?;
+    context
+        .model
+        .validate_tooled()
+        .map_err(|error| error.with_ref(&command.reference))?;
     let client = discovered_client(home, &config, &command.reference)?;
     let message_id = mint_message_id()?;
     client
