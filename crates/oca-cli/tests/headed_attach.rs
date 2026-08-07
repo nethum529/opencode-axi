@@ -62,6 +62,13 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
         .split_whitespace()
         .next()
         .expect("background acknowledgement ref");
+    assert_eq!(
+        acknowledgement,
+        format!(
+            "{reference} running openai/gpt-5.6-luna:high\nheaded: {reference} | impl | openai/gpt-5.6-luna | high | DO NOT TYPE: composer unbound\n"
+        ),
+        "the oca-owned headed guard must retain the resolved variant"
+    );
 
     let record = ref_store(home.path()).resolve(reference).unwrap().unwrap();
     let message_id = record
@@ -121,7 +128,8 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
             requests[2].path.as_str(),
             "/session/ses_headed_background/prompt_async",
             "/session/ses_headed_background/message",
-            requests[5].path.as_str(),
+            "/session/ses_headed_background/message",
+            requests[6].path.as_str(),
             "/session/ses_headed_background/message",
         ],
         "headed background admission must confirm the user message before spawning the helper"
@@ -129,13 +137,14 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
     assert!(requests[0].path.starts_with("/agent?directory="));
     assert!(requests[1].path.starts_with("/session?directory="));
     assert!(requests[2].path.starts_with("/event?directory="));
-    assert!(requests[5].path.starts_with("/event?directory="));
+    assert!(requests[6].path.starts_with("/event?directory="));
     let dispatched_message_id = requests[3].body["messageID"]
         .as_str()
         .expect("prompt carries a caller message id");
     assert_eq!(dispatched_message_id, message_id);
     assert_eq!(requests[4].body, Value::Null);
-    assert_eq!(requests[6].body, Value::Null);
+    assert_eq!(requests[5].body, Value::Null);
+    assert_eq!(requests[7].body, Value::Null);
 
     let final_events = Command::new(env!("CARGO_BIN_EXE_oca"))
         .args(["events", reference, "--json"])
@@ -353,7 +362,7 @@ fn headed_background_sse_confirms_prompt_when_history_rejects_its_stored_record(
         .join(".oca/events")
         .join(format!("{reference}.{message_id}.jsonl"));
     release_terminal.store(true, Ordering::SeqCst);
-    wait_for_nonempty_file(&journal, FIXTURE_PATIENCE);
+    wait_for_file_contains(&journal, "message.updated", FIXTURE_PATIENCE);
 
     let events = Command::new(env!("CARGO_BIN_EXE_oca"))
         .args(["events", reference, "--json"])
@@ -436,6 +445,11 @@ fn follow_reports_done_and_journals_terminal_events_when_history_stays_poisoned(
         rendered.contains("state=done"),
         "unexpected follow output: {rendered}"
     );
+    assert!(
+        rendered.contains("session history is unreadable (HTTP 400)")
+            && rendered.contains("retryCount-in-format poisoning"),
+        "headless follow must surface the same history condition: {rendered}"
+    );
     assert!(rendered.contains("status: done"));
 
     let events = Command::new(env!("CARGO_BIN_EXE_oca"))
@@ -452,7 +466,15 @@ fn follow_reports_done_and_journals_terminal_events_when_history_stays_poisoned(
         .iter()
         .map(|event| event["kind"].as_str().unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(kinds, ["session.busy", "message.updated", "session.idle"]);
+    assert_eq!(
+        kinds,
+        [
+            "oca.history.unreadable",
+            "session.busy",
+            "message.updated",
+            "session.idle"
+        ]
+    );
 
     let requests = opencode.join().unwrap();
     assert!(
@@ -510,7 +532,7 @@ fn headed_attach_records_and_closes_the_tab_after_terminal_state() {
     assert_eq!(calls[2]["params"]["label"], "sayHi");
     assert_eq!(calls[2]["params"]["cwd"], "/worker");
     assert_eq!(calls[2]["params"]["focus"], false);
-    assert_eq!(calls[3]["params"]["name"], "opencode");
+    assert_eq!(calls[3]["params"]["name"], "wabc12-impl-flash-high");
     assert_eq!(calls[3]["params"]["kind"], "opencode");
     assert_eq!(
         calls[3]["params"]["args"],
@@ -582,6 +604,22 @@ fn a_follow_failure_keeps_the_persisted_tab_open_for_an_explicit_kill() {
         "`oca k` needs the persisted tab id to close a tab the follower abandoned"
     );
     assert_eq!(calls[2]["params"]["label"], "fixParser");
+    assert_eq!(calls[3]["params"]["name"], "wabc12-impl-flash-high");
+    let events = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["events", "wabc12", "--json"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert!(events.status.success());
+    let page: Value = serde_json::from_slice(&events.stdout).unwrap();
+    assert_eq!(page["events"][0]["kind"], "oca.history.unreadable");
+    assert!(
+        page["events"][0]["data"]
+            .as_str()
+            .unwrap()
+            .contains("retryCount-in-format poisoning")
+    );
 }
 
 #[test]
@@ -777,7 +815,7 @@ fn no_herdr_inside_tmux_creates_and_cleans_up_a_task_named_window() {
     let record = only_ref(home.path());
     assert_eq!(record.display.as_deref(), Some("tmux"));
     opencode.join().unwrap();
-    let calls = tmux.wait_for_calls(3);
+    let calls = tmux.wait_for_calls(6);
     assert_eq!(
         calls,
         [
@@ -785,6 +823,12 @@ fn no_herdr_inside_tmux_creates_and_cleans_up_a_task_named_window() {
                 "new-window -d -P -F #{{window_id}} -n finishInside -- opencode attach http://127.0.0.1:{port}/ --session ses_target"
             ),
             format!("set-option -w -t @42 @oca-ref {}", record.id),
+            format!(
+                "set-option -w -t @42 @oca-identity {} | impl | openai/gpt-5.6-luna | high | DO NOT TYPE: composer unbound",
+                record.id
+            ),
+            "set-option -w -t @42 pane-border-status top".to_owned(),
+            "set-option -w -t @42 pane-border-format #{@oca-identity}".to_owned(),
             "kill-window -t @42".to_owned(),
         ]
     );
@@ -1141,7 +1185,7 @@ fn spawn_background_abort_opencode(tab_closed: Arc<AtomicBool>) -> (u16, thread:
         let message_id = Arc::new(Mutex::new(None::<String>));
         let prompt_text = Arc::new(Mutex::new(None::<String>));
         let mut handlers = Vec::new();
-        for _ in 0..8 {
+        for _ in 0..9 {
             let (mut stream, _) = accept_tcp_before(&listener, FIXTURE_PATIENCE);
             let event_count = Arc::clone(&event_count);
             let message_id = Arc::clone(&message_id);
@@ -1316,6 +1360,18 @@ fn spawn_attach_opencode() -> (u16, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
+        let (mut probe, _) = listener.accept().unwrap();
+        assert_eq!(
+            read_http_request(&mut probe).path,
+            "/session/ses_target/message"
+        );
+        write_http_response(
+            &mut probe,
+            "200 OK",
+            "application/json",
+            &terminal_messages("msg_dispatch"),
+        );
+
         let (mut event, _) = listener.accept().unwrap();
         assert_eq!(
             read_http_request(&mut event).path,
@@ -1352,6 +1408,18 @@ fn spawn_failing_history_opencode() -> (u16, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
+        let (mut probe, _) = listener.accept().unwrap();
+        assert_eq!(
+            read_http_request(&mut probe).path,
+            "/session/ses_target/message"
+        );
+        write_http_response(
+            &mut probe,
+            "400 Bad Request",
+            "application/json",
+            &json!({"error": "Expected OutputFormatJsonSchema, got retryCount"}).to_string(),
+        );
+
         let (mut event, _) = listener.accept().unwrap();
         assert_eq!(
             read_http_request(&mut event).path,
@@ -1391,7 +1459,7 @@ fn spawn_headed_background_opencode() -> (u16, thread::JoinHandle<Vec<HttpReques
         let mut message_reads = 0;
         let mut event_handler = None;
 
-        while requests.len() < 7 && started.elapsed() < FIXTURE_PATIENCE {
+        while requests.len() < 8 && started.elapsed() < FIXTURE_PATIENCE {
             let (mut stream, _) = match listener.accept() {
                 Ok(connection) => connection,
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -1784,6 +1852,21 @@ fn wait_for_nonempty_file(path: &Path, timeout: Duration) {
     }
 }
 
+fn wait_for_file_contains(path: &Path, needle: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if fs::read_to_string(path).is_ok_and(|contents| contents.contains(needle)) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for `{needle}` in {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn spawn_foreground_opencode() -> (u16, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1876,7 +1959,7 @@ fn spawn_tmux_foreground_opencode() -> (u16, thread::JoinHandle<()>) {
         let mut message_id = None;
         let mut prompt_text = None;
         let mut message_reads = 0;
-        for _ in 0..8 {
+        for _ in 0..9 {
             let (mut stream, _) = listener.accept().unwrap();
             let request = read_http_request(&mut stream);
             if request.path.starts_with("/agent?directory=") {
@@ -1961,7 +2044,7 @@ fn prepare_attach_home(home: &Path, socket: &Path, port: u16, display: &str) {
             id: "wabc12".to_owned(),
             session_id: "ses_target".to_owned(),
             message_id: Some("msg_dispatch".to_owned()),
-            alias: Some("luna".to_owned()),
+            alias: Some("flash".to_owned()),
             effort: Some("high".to_owned()),
             role: Some("impl".to_owned()),
             cwd: Some("/worker".to_owned()),

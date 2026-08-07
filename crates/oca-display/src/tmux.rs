@@ -82,6 +82,7 @@ impl TmuxClient {
         &self,
         reference: &str,
         name: &str,
+        worker_identity: &str,
         base_url: &str,
         session_id: &str,
         cwd: &Path,
@@ -108,26 +109,36 @@ impl TmuxClient {
             name: name.to_owned(),
         };
 
-        let option_status = Command::new(&self.executable)
-            .args(["set-option", "-w", "-t"])
-            .arg(window.id())
-            .args(["@oca-ref", reference])
-            .status();
-        let option_status = match option_status {
-            Ok(status) => status,
-            Err(source) => {
+        for (option, value) in [
+            ("@oca-ref", reference),
+            ("@oca-identity", worker_identity),
+            ("pane-border-status", "top"),
+            ("pane-border-format", "#{@oca-identity}"),
+        ] {
+            if let Err(error) = self.set_window_option(&window, option, value) {
                 let _ = self.close_window(&window);
-                return Err(TmuxError::Invoke {
-                    operation: "set-option",
-                    source,
-                });
+                return Err(error);
             }
-        };
-        if let Err(error) = ensure_success("set-option", option_status) {
-            let _ = self.close_window(&window);
-            return Err(error);
         }
         Ok(window)
+    }
+
+    fn set_window_option(
+        &self,
+        window: &TmuxWindow,
+        option: &str,
+        value: &str,
+    ) -> Result<(), TmuxError> {
+        let status = Command::new(&self.executable)
+            .args(["set-option", "-w", "-t"])
+            .arg(window.id())
+            .args([option, value])
+            .status()
+            .map_err(|source| TmuxError::Invoke {
+                operation: "set-option",
+                source,
+            })?;
+        ensure_success("set-option", status)
     }
 
     /// Closes exactly the ref-owned window rather than a fuzzy tmux target.

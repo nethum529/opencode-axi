@@ -183,17 +183,22 @@ impl HerdrClient {
         })
     }
 
-    /// Starts the interactive agent described by `argv` in a tab's root pane.
+    /// Starts the named interactive agent described by `argv` in a tab's root pane.
     ///
     /// Herdr owns the canonical executable for the named agent kind. Therefore
-    /// the first argv item supplies both `name` and `kind`, while the remaining
-    /// items are passed as agent arguments.
+    /// the first argv item supplies `kind`, while `name` is an independent
+    /// user-visible identity and the remaining items are passed as agent arguments.
     ///
     /// # Errors
     ///
     /// Returns [`HerdrError::InvalidAgentArgv`] for an empty command, or a typed
     /// transport, timeout, server, or envelope error.
-    pub async fn agent_start(&self, tab: &TabId, argv: Vec<String>) -> Result<AgentId, HerdrError> {
+    pub async fn agent_start(
+        &self,
+        tab: &TabId,
+        name: &str,
+        argv: Vec<String>,
+    ) -> Result<AgentId, HerdrError> {
         let Some((program, args)) = argv.split_first() else {
             return Err(HerdrError::InvalidAgentArgv);
         };
@@ -204,7 +209,7 @@ impl HerdrClient {
             .call(
                 "agent.start",
                 json!({
-                    "name": program,
+                    "name": name,
                     "kind": program,
                     "pane_id": tab.root_pane_id,
                     "args": args,

@@ -4,8 +4,8 @@ use std::process::{Command, Output};
 
 use oca_core::{OcaEvent, RefId};
 use oca_state::{
-    EventJournal, Intent, IntentDurability, IntentOperation, IntentPhase, IntentStore, RefRecord,
-    RefState, RefStore, RefStorePaths,
+    EventJournal, Intent, IntentDurability, IntentOperation, IntentPhase, IntentStore, RefPatch,
+    RefRecord, RefState, RefStore, RefStorePaths,
 };
 use serde_json::{Value, json};
 
@@ -20,6 +20,24 @@ fn blocked_count_is_a_byte_exact_bare_integer() {
     assert!(output.status.success());
     assert_eq!(output.stdout, b"1");
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn plain_ls_prints_the_full_headed_binding_with_its_variant() {
+    let fixture = Fixture::new();
+    fixture.insert("w00001", RefState::Running);
+    fixture.mark_headed("w00001");
+
+    let output = fixture.run(&["ls"]);
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert!(
+        String::from_utf8(output.stdout).unwrap().ends_with(
+            "headed: w00001 | impl | openai/gpt-5.6-luna | high | DO NOT TYPE: composer unbound\n"
+        ),
+        "the headed list guard must retain the resolved variant"
+    );
 }
 
 #[test]
@@ -230,6 +248,18 @@ impl Fixture {
             "/other/repo".to_owned(),
             "other-spawner".to_owned(),
         );
+    }
+
+    fn mark_headed(&self, reference: &str) {
+        RefStore::with_paths(RefStorePaths::in_directory(self.home.path().join(".oca")))
+            .patch(
+                reference,
+                RefPatch {
+                    display: Some("herdr".to_owned()),
+                    ..RefPatch::default()
+                },
+            )
+            .unwrap();
     }
 
     fn insert_with_scope(

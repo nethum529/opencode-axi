@@ -27,6 +27,7 @@ use oca_state::{
 
 use crate::{
     DispatchCommand,
+    attach_diagnostics::binding_identity,
     crash_recovery::{RESERVED_SESSION_ID, intent_failpoint, persist_intent, prompt_sha256},
     scope::Scope,
     transport::{CreateSessionOperation, create_session_error, open_code_error, prompt_error},
@@ -692,9 +693,15 @@ impl ForegroundBackend for ProductionBackend {
         model: &ResolvedModel,
         json: bool,
     ) -> Result<String, OcaError> {
+        let headed_role = self
+            .intent
+            .as_ref()
+            .and_then(|intent| intent.requested.as_ref())
+            .filter(|request| matches!(request.display.as_deref(), Some("herdr" | "tmux")))
+            .map(|request| request.role.clone());
         let pending = match pending {
             PendingProductionRef::Reserved(reference) => {
-                print_ack(&reference, model, json).map_err(io_error)?;
+                print_ack(&reference, model, json, headed_role.as_deref()).map_err(io_error)?;
                 return Ok(reference);
             }
             PendingProductionRef::Allocated(pending) => *pending,
@@ -702,7 +709,9 @@ impl ForegroundBackend for ProductionBackend {
         match self.post_ack_durability {
             PostAckDurability::Complete => {
                 let completion = pending
-                    .acknowledge_with(|record| print_ack(&record.id, model, json))
+                    .acknowledge_with(|record| {
+                        print_ack(&record.id, model, json, headed_role.as_deref())
+                    })
                     .map_err(io_error)?;
                 if let Some(warning) = completion.durability_warning() {
                     eprintln!("warning: {warning}");
@@ -711,7 +720,7 @@ impl ForegroundBackend for ProductionBackend {
             }
             PostAckDurability::Transfer => {
                 let reference = pending.record().id.clone();
-                print_ack(&reference, model, json).map_err(io_error)?;
+                print_ack(&reference, model, json, headed_role.as_deref()).map_err(io_error)?;
                 drop(pending);
                 Ok(reference)
             }
@@ -882,13 +891,27 @@ fn message_text(message: &MessageWithParts) -> String {
         .join("")
 }
 
-fn print_ack(reference: &str, model: &ResolvedModel, json: bool) -> io::Result<()> {
+fn print_ack(
+    reference: &str,
+    model: &ResolvedModel,
+    json: bool,
+    headed_role: Option<&str>,
+) -> io::Result<()> {
     let document = Acknowledgement::from_resolved(reference, "running", model);
-    let rendered = if json {
+    let mut rendered = if json {
         document.render_json()
     } else {
         document.render_toon()
     };
+    if !json && let Some(role) = headed_role {
+        let binding = binding_identity(
+            reference,
+            role,
+            &format!("{}/{}", model.provider, model.model),
+            &model.variant,
+        );
+        rendered.push_str(&format!("headed: {binding}\n"));
+    }
     let mut stdout = io::stdout().lock();
     stdout.write_all(rendered.as_bytes())?;
     stdout.flush()

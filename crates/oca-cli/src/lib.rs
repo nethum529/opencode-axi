@@ -7,6 +7,7 @@ use oca_core::{
 use oca_state::OcaConfig;
 
 mod attach;
+mod attach_diagnostics;
 mod background;
 mod control;
 mod crash_recovery;

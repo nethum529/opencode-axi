@@ -8,7 +8,7 @@ use std::{
 
 use oca_core::{ErrorCode, exit, parse_error_envelope};
 use oca_server::{ConnectOrStart, ServerRecord};
-use oca_state::{RefRecord, RefStore, RefStorePaths};
+use oca_state::{RefPatch, RefRecord, RefStore, RefStorePaths};
 use oca_testkit::{
     HttpRequest, HttpResponse, RecordedExchange, Recording, ReplayHttpServer, ReplayServer,
 };
@@ -144,6 +144,25 @@ fn follow_exit_codes_are_frozen_at_the_real_process_boundary() {
 }
 
 #[test]
+fn follow_prints_the_full_headed_binding_with_its_variant() {
+    let fixture = FollowFixture::terminal_headed("done");
+    let output = run_oca_in_home(fixture.home.path(), &["f", "w4f2a1"]);
+    fixture
+        .server
+        .join()
+        .expect("fake server thread must finish");
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    assert!(
+        String::from_utf8(output.stdout).unwrap().starts_with(
+            "headed: w4f2a1 | impl | openai/gpt-5.6-luna | high | DO NOT TYPE: composer unbound\noca wake ref=w4f2a1 state=done\n"
+        ),
+        "the headed follow guard must retain the resolved variant"
+    );
+}
+
+#[test]
 fn reachable_idle_follow_waits_for_t_before_exit_four() {
     let fixture = FollowFixture::reachable_idle();
     let started = std::time::Instant::now();
@@ -177,6 +196,22 @@ impl FollowFixture {
         Self::with_sse(vec![sse.into_bytes()])
     }
 
+    fn terminal_headed(status: &str) -> Self {
+        let fixture = Self::terminal(status);
+        RefStore::with_paths(RefStorePaths::in_directory(
+            fixture.home.path().join(".oca"),
+        ))
+        .patch(
+            "w4f2a1",
+            RefPatch {
+                display: Some("herdr".to_owned()),
+                ..RefPatch::default()
+            },
+        )
+        .expect("mark fixture ref headed");
+        fixture
+    }
+
     fn disconnected() -> Self {
         Self::with_sse(Vec::new())
     }
@@ -192,6 +227,7 @@ impl FollowFixture {
         };
         let recording = Recording {
             exchanges: vec![
+                empty_messages(),
                 RecordedExchange {
                     request: HttpRequest::new("GET", "/event?directory=%2Frepo", no_headers(), []),
                     response: HttpResponse::new(
@@ -204,12 +240,25 @@ impl FollowFixture {
                 empty_messages(),
             ],
         };
-        Self::with_recording(recording, 3)
+        Self::with_recording(recording, 4)
     }
 
     fn with_sse(chunks: Vec<Vec<u8>>) -> Self {
         let recording = Recording {
             exchanges: vec![
+                RecordedExchange {
+                    request: HttpRequest::new(
+                        "GET",
+                        "/session/ses_target/message",
+                        no_headers(),
+                        [],
+                    ),
+                    response: HttpResponse::new(
+                        200,
+                        [("content-type", "application/json")],
+                        [b"[]".to_vec()],
+                    ),
+                },
                 RecordedExchange {
                     request: HttpRequest::new("GET", "/event?directory=%2Frepo", no_headers(), []),
                     response: HttpResponse::new(
@@ -233,7 +282,7 @@ impl FollowFixture {
                 },
             ],
         };
-        Self::with_recording(recording, 2)
+        Self::with_recording(recording, 3)
     }
 
     fn with_recording(recording: Recording, request_count: usize) -> Self {

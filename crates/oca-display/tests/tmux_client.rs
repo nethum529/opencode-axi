@@ -9,6 +9,8 @@ use std::{
 use oca_display::{TmuxClient, TmuxError};
 
 static TMUX_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+const WORKER_IDENTITY: &str =
+    "wabc12 | impl's agent | openai/gpt-5.6 | high | DO NOT TYPE: composer unbound";
 
 #[test]
 fn creates_and_closes_only_the_ref_owned_window_against_a_fake_tmux() {
@@ -19,6 +21,7 @@ fn creates_and_closes_only_the_ref_owned_window_against_a_fake_tmux() {
         .new_window(
             "wabc12",
             "fixParser",
+            WORKER_IDENTITY,
             "http://127.0.0.1:4096/",
             "ses_target",
             &fixture.cwd,
@@ -53,6 +56,27 @@ fn creates_and_closes_only_the_ref_owned_window_against_a_fake_tmux() {
             "@oca-ref".to_owned(),
             "wabc12".to_owned(),
             "--call--".to_owned(),
+            "set-option".to_owned(),
+            "-w".to_owned(),
+            "-t".to_owned(),
+            "@42".to_owned(),
+            "@oca-identity".to_owned(),
+            WORKER_IDENTITY.to_owned(),
+            "--call--".to_owned(),
+            "set-option".to_owned(),
+            "-w".to_owned(),
+            "-t".to_owned(),
+            "@42".to_owned(),
+            "pane-border-status".to_owned(),
+            "top".to_owned(),
+            "--call--".to_owned(),
+            "set-option".to_owned(),
+            "-w".to_owned(),
+            "-t".to_owned(),
+            "@42".to_owned(),
+            "pane-border-format".to_owned(),
+            "#{@oca-identity}".to_owned(),
+            "--call--".to_owned(),
             "kill-window".to_owned(),
             "-t".to_owned(),
             "@42".to_owned(),
@@ -68,6 +92,7 @@ fn a_fake_tmux_failure_is_typed() {
         .new_window(
             "wabc12",
             "fixParser",
+            WORKER_IDENTITY,
             "http://127.0.0.1:4096/",
             "ses_target",
             &fixture.cwd,
@@ -93,6 +118,7 @@ fn a_window_id_tmux_never_prints_is_typed() {
         .new_window(
             "wabc12",
             "fixParser",
+            WORKER_IDENTITY,
             "http://127.0.0.1:4096/",
             "ses_target",
             &fixture.cwd,

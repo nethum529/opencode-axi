@@ -433,7 +433,7 @@ fn serve_partial_then_review(listener: TcpListener, review: ReviewReply) {
     let mut first_prompt = None;
     let mut second_message = None;
     let mut second_prompt = None;
-    for index in 0..11 {
+    for index in 0..12 {
         let (mut stream, _) = listener.accept().expect("fake accepts request");
         let request = read_request(&mut stream);
         match index {
@@ -504,8 +504,7 @@ fn serve_partial_then_review(listener: TcpListener, review: ReviewReply) {
                 );
                 write_response(&mut stream, "200 OK", "application/json", &body.to_string());
             }
-            9 => write_response(&mut stream, "200 OK", "text/event-stream", ""),
-            10 => {
+            9 | 11 => {
                 let note = match review {
                     ReviewReply::Valid => {
                         "Applied every review finding in the existing worktree without changing the original task identity or commit message source. Verified the second checkpoint is complete and independently reviewable. WORKER-SUPPLIED"
@@ -515,6 +514,7 @@ fn serve_partial_then_review(listener: TcpListener, review: ReviewReply) {
                 let body = assistant_reply(second_message.as_deref().unwrap(), "done", note);
                 write_response(&mut stream, "200 OK", "application/json", &body.to_string());
             }
+            10 => write_response(&mut stream, "200 OK", "text/event-stream", ""),
             _ => unreachable!(),
         }
     }

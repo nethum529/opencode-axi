@@ -11,7 +11,12 @@ use oca_server::ConnectOrStart;
 use oca_state::{EventJournal, OcaConfig, RefPatch, RefStore, RefStorePaths};
 use url::Url;
 
-use crate::AttachCommand;
+use crate::{
+    AttachCommand,
+    attach_diagnostics::{
+        HistoryProbe, herdr_agent_name, journal_history_diagnostic, probe_history, worker_identity,
+    },
+};
 
 /// Runs the hidden, detached headed attach helper.
 ///
@@ -71,6 +76,10 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
         .ok_or_else(|| "no OpenCode server record is available".to_owned())?;
     let base_url = Url::parse(&format!("http://127.0.0.1:{}", server.port))
         .map_err(|error| format!("invalid OpenCode server URL: {error}"))?;
+    let client = OpenCodeClient::new(base_url.clone());
+    let history = probe_history(&client, &command.session_id).await;
+    let identity = worker_identity(&command.reference, &record, &config, &history);
+    let agent_name = herdr_agent_name(&command.reference, &record, &config);
 
     match mode {
         DisplayMode::Herdr => {
@@ -80,6 +89,10 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
                 base_url: &base_url,
                 message_id: &message_id,
                 directory: &directory,
+                worker_identity: &identity,
+                agent_name: &agent_name,
+                client: &client,
+                history: &history,
             };
             run_herdr_attach(command, home, &config, &refs, turn).await
         }
@@ -90,6 +103,10 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
                 base_url: &base_url,
                 message_id: &message_id,
                 directory: &directory,
+                worker_identity: &identity,
+                agent_name: &agent_name,
+                client: &client,
+                history: &history,
             };
             run_tmux_attach(command, turn).await
         }
@@ -103,6 +120,10 @@ struct AttachTurn<'a> {
     base_url: &'a Url,
     message_id: &'a str,
     directory: &'a str,
+    worker_identity: &'a str,
+    agent_name: &'a str,
+    client: &'a OpenCodeClient,
+    history: &'a HistoryProbe,
 }
 
 async fn run_herdr_attach(
@@ -135,6 +156,7 @@ async fn run_herdr_attach(
         herdr
             .agent_start(
                 &tab,
+                turn.agent_name,
                 opencode_attach_argv(turn.base_url.as_str(), &command.session_id),
             )
             .await
@@ -157,13 +179,15 @@ async fn run_herdr_attach(
         let mut journal =
             EventJournal::create(turn.state_directory, turn.reference, turn.message_id)
                 .map_err(|error| format!("could not create event journal: {error}"))?;
+        journal_history_diagnostic(&mut journal, &command.session_id, turn.history)
+            .map_err(|error| format!("could not record history diagnostic: {error}"))?;
         let target = FollowTarget {
             session_id: command.session_id.clone(),
             message_id: turn.message_id.to_owned(),
             directory: turn.directory.to_owned(),
         };
         follow_until_terminal_boundary::<_, EventJournal>(
-            &OpenCodeClient::new(turn.base_url.clone()),
+            turn.client,
             &target,
             None,
             Some(&mut journal),
@@ -191,6 +215,7 @@ async fn run_tmux_attach(command: &AttachCommand, turn: AttachTurn<'_>) -> Resul
         .new_window(
             &command.reference,
             &command.display_name,
+            turn.worker_identity,
             turn.base_url.as_str(),
             &command.session_id,
             &command.cwd,
@@ -200,13 +225,15 @@ async fn run_tmux_attach(command: &AttachCommand, turn: AttachTurn<'_>) -> Resul
         let mut journal =
             EventJournal::create(turn.state_directory, turn.reference, turn.message_id)
                 .map_err(|error| format!("could not create event journal: {error}"))?;
+        journal_history_diagnostic(&mut journal, &command.session_id, turn.history)
+            .map_err(|error| format!("could not record history diagnostic: {error}"))?;
         let target = FollowTarget {
             session_id: command.session_id.clone(),
             message_id: turn.message_id.to_owned(),
             directory: turn.directory.to_owned(),
         };
         follow_until_terminal_boundary::<_, EventJournal>(
-            &OpenCodeClient::new(turn.base_url.clone()),
+            turn.client,
             &target,
             None,
             Some(&mut journal),

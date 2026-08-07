@@ -446,6 +446,7 @@ fn live_herdr_workspace_tab_agent_start_and_tui_boot_has_no_idle() {
         let launch = herdr
             .agent_start(
                 &tab,
+                "oca-live-idle-boot",
                 vec![
                     "opencode".to_owned(),
                     "attach".to_owned(),
@@ -583,6 +584,7 @@ fn live_queue_runs_after_turn_and_abort_reaches_terminal_for_tab_close() {
         if let Err(error) = herdr
             .agent_start(
                 &tab,
+                "oca-live-abort",
                 vec![
                     "opencode".to_owned(),
                     "attach".to_owned(),

@@ -11,6 +11,7 @@ use oca_state::{
 
 use crate::{
     ListCommand,
+    attach_diagnostics::headed_binding,
     crash_recovery::{ReconciledState, reconcile_for_list},
     scope::Scope,
 };
@@ -67,7 +68,7 @@ fn execute_list_with_scope(
                 || record_matches_scope(record, scope)
                 || is_attention_record(home, record, &overrides)
         })
-        .map(|record| worker_from_record(record, &overrides))
+        .map(|record| worker_from_record(record, &overrides, &config))
         .collect::<Vec<_>>();
     if command.blocked {
         workers.retain(|worker| worker.state == ListState::Blocked);
@@ -78,15 +79,23 @@ fn execute_list_with_scope(
         return Ok(workers.len().to_string());
     }
     let total = u64::try_from(workers.len()).unwrap_or(u64::MAX);
+    let headed_bindings = workers
+        .iter()
+        .filter_map(|worker| worker.headed_binding.as_deref())
+        .collect::<Vec<_>>();
     let items = workers
-        .into_iter()
-        .map(|worker| ListItem::new(worker.reference, worker.state.as_str()))
+        .iter()
+        .map(|worker| ListItem::new(&worker.reference, worker.state.as_str()))
         .collect();
     let document = ListDocument::new(items, 0, total);
     Ok(if command.json {
         document.render_json()
     } else {
-        document.render_toon()
+        let mut output = document.render_toon();
+        for binding in headed_bindings {
+            output.push_str(&format!("headed: {binding}\n"));
+        }
+        output
     })
 }
 
@@ -156,6 +165,7 @@ impl From<Option<RefState>> for ListState {
 struct Worker {
     reference: String,
     state: ListState,
+    headed_binding: Option<String>,
 }
 
 impl Worker {
@@ -167,7 +177,11 @@ impl Worker {
     }
 }
 
-fn worker_from_record(record: RefRecord, overrides: &HashMap<String, ReconciledState>) -> Worker {
+fn worker_from_record(
+    record: RefRecord,
+    overrides: &HashMap<String, ReconciledState>,
+    config: &OcaConfig,
+) -> Worker {
     let state = match overrides.get(&record.id) {
         Some(ReconciledState::PromptUncertain) => ListState::PromptUncertain,
         Some(ReconciledState::PublishedUncertain) => ListState::PublishedUncertain,
@@ -176,6 +190,7 @@ fn worker_from_record(record: RefRecord, overrides: &HashMap<String, ReconciledS
         None => record.last_state.into(),
     };
     Worker {
+        headed_binding: headed_binding(&record, config),
         reference: record.id,
         state,
     }

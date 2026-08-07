@@ -64,7 +64,8 @@ fn background_then_separate_follow_reconciles_an_already_finished_turn() {
     );
 
     // This is a new process after dispatch has already exited. The fake server
-    // reports the turn as completed only through the one-shot messages read.
+    // reports the turn as completed only through history reads. Follow first
+    // diagnoses readability, then performs its attributed reconciliation.
     let follow = Command::new(env!("CARGO_BIN_EXE_oca"))
         .args(["f", &reference])
         .env("HOME", home.path())
@@ -101,6 +102,7 @@ fn background_then_separate_follow_reconciles_an_already_finished_turn() {
             "event",
             "prompt_async",
             "messages",
+            "messages",
             "event",
             "messages"
         ]
@@ -123,7 +125,7 @@ fn background_then_separate_follow_reconciles_an_already_finished_turn() {
 fn serve_background_then_follow(listener: TcpListener) -> Vec<CapturedRequest> {
     let mut captured = Vec::new();
     let mut message_id = None;
-    for index in 0..7 {
+    for index in 0..8 {
         let (mut stream, _) = listener.accept().expect("fake accepts request");
         let request = read_request(&mut stream);
         match index {
@@ -145,7 +147,7 @@ fn serve_background_then_follow(listener: TcpListener) -> Vec<CapturedRequest> {
                     r#"{"id":"ses_background"}"#,
                 );
             }
-            2 | 5 => {
+            2 | 6 => {
                 assert!(request.path.starts_with("/event?directory="));
                 write_response(&mut stream, "200 OK", "text/event-stream", "");
             }
@@ -166,7 +168,7 @@ fn serve_background_then_follow(listener: TcpListener) -> Vec<CapturedRequest> {
                 }]);
                 write_response(&mut stream, "200 OK", "application/json", &body.to_string());
             }
-            6 => {
+            5 | 7 => {
                 assert_eq!(request.path, "/session/ses_background/message");
                 let body = json!([{
                     "info": {
@@ -178,7 +180,7 @@ fn serve_background_then_follow(listener: TcpListener) -> Vec<CapturedRequest> {
                         "structured": {
                             "status": "done",
                             "files": [],
-                            "note": "Reconciled the already-finished background turn through the one-shot message lookup without replaying its original prompt. Verified the separate follow process reports the single attributed terminal result."
+                            "note": "Reconciled the already-finished background turn through message history without replaying its original prompt. Verified the separate follow process reports the single attributed terminal result after its readability probe."
                         }
                     },
                     "parts": []

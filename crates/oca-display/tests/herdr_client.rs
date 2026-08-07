@@ -211,13 +211,13 @@ fn tab_rejects_a_malformed_response_envelope() {
 }
 
 #[test]
-fn agent_start_succeeds_with_shared_input_argv() {
+fn agent_start_decouples_worker_identity_from_executable_kind() {
     let fixture = Fixture::new(3, |index, request| match index {
         0 => existing_workspace(request),
         1 => created_tab(request),
         2 => {
             assert_request(request, "agent.start");
-            assert_eq!(request["params"]["name"], "opencode");
+            assert_eq!(request["params"]["name"], "wabc12-impl-luna-low");
             assert_eq!(request["params"]["kind"], "opencode");
             assert_eq!(request["params"]["pane_id"], "p1");
             assert_eq!(request["params"]["args"], json!(["--session", "ses_1"]));
@@ -242,6 +242,7 @@ fn agent_start_succeeds_with_shared_input_argv() {
 
     let agent = run(client.agent_start(
         &tab,
+        "wabc12-impl-luna-low",
         vec!["opencode".into(), "--session".into(), "ses_1".into()],
     ))
     .unwrap();
@@ -264,7 +265,12 @@ fn agent_start_times_out_against_a_fake_socket() {
     let (_, tab) = workspace_and_tab(&client);
 
     assert_timeout(
-        run(client.agent_start(&tab, vec!["opencode".into(), "--session".into()])).unwrap_err(),
+        run(client.agent_start(
+            &tab,
+            "worker identity",
+            vec!["opencode".into(), "--session".into()],
+        ))
+        .unwrap_err(),
     );
     fixture.finish();
 }
@@ -284,7 +290,12 @@ fn agent_start_rejects_a_malformed_response_envelope() {
     let (_, tab) = workspace_and_tab(&client);
 
     assert_malformed(
-        run(client.agent_start(&tab, vec!["opencode".into(), "--session".into()])).unwrap_err(),
+        run(client.agent_start(
+            &tab,
+            "worker identity",
+            vec!["opencode".into(), "--session".into()],
+        ))
+        .unwrap_err(),
     );
     fixture.finish();
 }
