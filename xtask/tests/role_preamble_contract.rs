@@ -23,6 +23,9 @@ fn every_generated_preamble_has_the_ordered_clauses_and_verbatim_exemption() {
             .expect("every supplied role has a generated preamble");
 
         assert!(preamble.contains(STYLE_EXEMPTION));
+        assert!(preamble.contains(
+            "Alongside the StructuredOutput call, include one short plain-text summary line in your final message."
+        ));
         assert_clause_order(preamble);
         assert!(preamble.contains(role.name()));
         for field in role.fields() {

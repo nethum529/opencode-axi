@@ -130,14 +130,36 @@ impl FollowOutcome {
     }
 }
 
+/// The marker displayed for an attributed live terminal boundary.
+///
+/// Reply-backed markers use the same attributed-chain classification as
+/// [`FollowOutcome`]. A provider error without a valid reply is failed, while
+/// any other completed chain that cannot be classified is explicitly unclear.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FollowBoundaryTerminal {
+    Done,
+    Partial,
+    Blocked,
+    Failed,
+    Unclear,
+}
+
+impl FollowBoundaryTerminal {
+    /// Whether the configured terminal-close policy closes this state.
+    #[must_use]
+    pub const fn should_close(self, close_on_done: bool) -> bool {
+        close_on_done && matches!(self, Self::Done)
+    }
+}
+
 /// Outcomes for consumers that need only the attributed live turn boundary.
 ///
-/// Unlike [`FollowOutcome`], a terminal boundary does not decode the worker's
-/// structured status. This is intended for display-lifetime ownership, where
-/// the target assistant completing before `session.idle` is sufficient.
+/// Unlike [`FollowOutcome`], reply classification does not decide when the
+/// live boundary is reached. It is performed only after the target assistant
+/// completes and `session.idle` arrives, solely to derive a visible marker.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FollowBoundaryOutcome {
-    Terminal,
+    Terminal(FollowBoundaryTerminal),
     Timeout,
     ServerUnreachable,
 }
@@ -290,9 +312,9 @@ where
 /// Follows the live event stream until an attributed completed assistant
 /// message is followed by the target session's idle boundary.
 ///
-/// History seeds attribution but cannot terminate this follow on its own. The
-/// worker's structured reply is deliberately not decoded, keeping display
-/// lifetime independent from multi-step reply classification.
+/// History seeds attribution but cannot terminate this follow on its own.
+/// Reply decoding happens only after the live boundary is reached, keeping
+/// display lifetime independent from multi-step reply classification.
 pub async fn follow_until_terminal_boundary<T, J>(
     transport: &T,
     target: &FollowTarget,
@@ -314,7 +336,9 @@ where
     )
     .await?;
     Ok(match outcome {
-        RawFollowOutcome::Terminal(_) => FollowBoundaryOutcome::Terminal,
+        RawFollowOutcome::Terminal(chain) => {
+            FollowBoundaryOutcome::Terminal(marker_from_chain(&chain))
+        }
         RawFollowOutcome::Timeout => FollowBoundaryOutcome::Timeout,
         RawFollowOutcome::ServerUnreachable => FollowBoundaryOutcome::ServerUnreachable,
     })
@@ -403,6 +427,23 @@ fn classify_outcome(outcome: RawFollowOutcome) -> Result<FollowOutcome, FollowEr
         RawFollowOutcome::Timeout => FollowOutcome::Timeout,
         RawFollowOutcome::ServerUnreachable => FollowOutcome::ServerUnreachable,
     })
+}
+
+fn marker_from_chain(chain: &[FollowMessage]) -> FollowBoundaryTerminal {
+    let boundary = chain
+        .last()
+        .expect("a terminal boundary is the last attributed step")
+        .clone();
+    let boundary_failed = boundary.error.is_some();
+    match terminal_from_chain(chain, boundary) {
+        Ok(terminal) => match terminal.state {
+            WorkerState::Done => FollowBoundaryTerminal::Done,
+            WorkerState::Partial => FollowBoundaryTerminal::Partial,
+            WorkerState::Blocked => FollowBoundaryTerminal::Blocked,
+        },
+        Err(_) if boundary_failed => FollowBoundaryTerminal::Failed,
+        Err(_) => FollowBoundaryTerminal::Unclear,
+    }
 }
 
 async fn follow_with_policy_and_cursor<T, J>(
@@ -860,6 +901,118 @@ mod tests {
         }
     }
 
+    fn terminal_turn(message: FollowMessage) -> ScriptedTransport {
+        ScriptedTransport {
+            subscriptions: Mutex::new(VecDeque::from([subscription([
+                Ok(Some(event(
+                    "evt-terminal",
+                    "message.updated",
+                    Some(message),
+                ))),
+                Ok(Some(event("evt-idle", "session.idle", None))),
+            ])])),
+            reconciliations: Mutex::new(VecDeque::from([Ok(Vec::new())])),
+            cursors: Mutex::new(Vec::new()),
+        }
+    }
+
+    async fn classified_state(status: &str) -> WorkerState {
+        let outcome = follow_until_terminal::<_, Journal>(
+            &terminal_turn(message("msg_this_dispatch", status, true)),
+            &target(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let FollowOutcome::Terminal(terminal) = outcome else {
+            panic!("scripted turn must classify as terminal");
+        };
+        terminal.state
+    }
+
+    async fn boundary_marker(message: FollowMessage) -> FollowBoundaryTerminal {
+        let outcome = follow_until_terminal_boundary::<_, Journal>(
+            &terminal_turn(message),
+            &target(),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let FollowBoundaryOutcome::Terminal(marker) = outcome else {
+            panic!("scripted turn must reach a terminal boundary");
+        };
+        marker
+    }
+
+    #[tokio::test]
+    async fn done_marker_matches_the_classified_turn_state() {
+        assert_eq!(classified_state("done").await, WorkerState::Done);
+        assert_eq!(
+            boundary_marker(message("msg_this_dispatch", "done", true)).await,
+            FollowBoundaryTerminal::Done
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_marker_matches_the_classified_turn_state() {
+        assert_eq!(classified_state("partial").await, WorkerState::Partial);
+        assert_eq!(
+            boundary_marker(message("msg_this_dispatch", "partial", true)).await,
+            FollowBoundaryTerminal::Partial
+        );
+    }
+
+    #[tokio::test]
+    async fn blocked_marker_matches_the_classified_turn_state() {
+        assert_eq!(classified_state("blocked").await, WorkerState::Blocked);
+        assert_eq!(
+            boundary_marker(message("msg_this_dispatch", "blocked", true)).await,
+            FollowBoundaryTerminal::Blocked
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_boundary_without_a_valid_reply_gets_a_failed_marker() {
+        let mut failed = message("msg_this_dispatch", "ignored", true);
+        failed.structured = None;
+        failed.error = Some(serde_json::json!({"name":"ProviderError"}));
+
+        assert_eq!(
+            boundary_marker(failed).await,
+            FollowBoundaryTerminal::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn unclassifiable_boundary_without_an_error_gets_an_unclear_marker() {
+        let mut unclear = message("msg_this_dispatch", "ignored", true);
+        unclear.structured = None;
+
+        assert_eq!(
+            boundary_marker(unclear).await,
+            FollowBoundaryTerminal::Unclear
+        );
+    }
+
+    #[test]
+    fn close_on_done_policy_closes_only_done_markers() {
+        for marker in [
+            FollowBoundaryTerminal::Done,
+            FollowBoundaryTerminal::Partial,
+            FollowBoundaryTerminal::Blocked,
+            FollowBoundaryTerminal::Failed,
+            FollowBoundaryTerminal::Unclear,
+        ] {
+            assert_eq!(
+                marker.should_close(true),
+                marker == FollowBoundaryTerminal::Done
+            );
+            assert!(!marker.should_close(false));
+        }
+    }
+
     #[tokio::test]
     async fn foreign_turn_and_duplicate_idle_do_not_replace_parent_attribution() {
         let transport = ScriptedTransport {
@@ -1057,7 +1210,10 @@ mod tests {
                 .await
                 .unwrap();
 
-        assert_eq!(outcome, FollowBoundaryOutcome::Terminal);
+        assert_eq!(
+            outcome,
+            FollowBoundaryOutcome::Terminal(FollowBoundaryTerminal::Done)
+        );
         assert_eq!(
             journal.0,
             [
@@ -1067,6 +1223,31 @@ mod tests {
                 "session.idle"
             ],
             "history and completed steps must not end the live display follow before idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_boundary_classifies_an_attributed_assistant_error_as_failed() {
+        let mut failed = message("msg_this_dispatch", "ignored", true);
+        failed.structured = None;
+        failed.error = Some(serde_json::json!({"name":"ProviderError"}));
+        let transport = ScriptedTransport {
+            subscriptions: Mutex::new(VecDeque::from([subscription([
+                Ok(Some(event("evt-failed", "message.updated", Some(failed)))),
+                Ok(Some(event("evt-idle", "session.idle", None))),
+            ])])),
+            reconciliations: Mutex::new(VecDeque::from([Ok(Vec::new())])),
+            cursors: Mutex::new(Vec::new()),
+        };
+
+        let outcome =
+            follow_until_terminal_boundary::<_, Journal>(&transport, &target(), None, None)
+                .await
+                .unwrap();
+
+        assert_eq!(
+            outcome,
+            FollowBoundaryOutcome::Terminal(FollowBoundaryTerminal::Failed)
         );
     }
 

@@ -31,7 +31,7 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
     init_repository(home.path());
     let socket = home.path().join("fake-herdr.sock");
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let herdr = spawn_herdr_lifecycle(&socket, 2, Arc::clone(&calls));
+    let herdr = spawn_herdr_lifecycle(&socket, 2, true, Arc::clone(&calls));
     let (port, opencode, release_terminal) = spawn_headed_background_opencode();
     prepare_dispatch_home(home.path(), &socket, port);
 
@@ -177,6 +177,7 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
             "workspace.create",
             "tab.create",
             "agent.start",
+            "agent.rename",
             "tab.close",
         ],
         "tab.close proves the detached helper consumed the attributed terminal events"
@@ -189,6 +190,13 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
             "--session",
             "ses_headed_background"
         ])
+    );
+    assert_eq!(calls[4]["params"]["target"], "p1");
+    assert!(
+        calls[4]["params"]["name"]
+            .as_str()
+            .unwrap()
+            .ends_with("-done")
     );
 
     let final_record = ref_store(home.path()).resolve(reference).unwrap().unwrap();
@@ -492,8 +500,8 @@ fn headed_attach_records_and_closes_the_tab_after_terminal_state() {
     let home = tempfile::tempdir().unwrap();
     let socket = home.path().join("fake-herdr.sock");
     let calls = Arc::new(Mutex::new(Vec::new()));
-    let herdr = spawn_herdr_lifecycle(&socket, 1, Arc::clone(&calls));
-    let (port, opencode) = spawn_attach_opencode();
+    let herdr = spawn_herdr_lifecycle(&socket, 1, true, Arc::clone(&calls));
+    let (port, opencode) = spawn_attach_opencode(false);
     prepare_attach_home(home.path(), &socket, port, "herdr");
 
     let output = Command::new(env!("CARGO_BIN_EXE_oca"))
@@ -524,6 +532,7 @@ fn headed_attach_records_and_closes_the_tab_after_terminal_state() {
             "workspace.create",
             "tab.create",
             "agent.start",
+            "agent.rename",
             "tab.close"
         ]
     );
@@ -551,11 +560,158 @@ fn headed_attach_records_and_closes_the_tab_after_terminal_state() {
             .all(|argument| argument != "--read-only"),
         "T03 passed, so headed attach must remain shared-input"
     );
-    assert_eq!(calls[4]["params"]["tab_id"], "t1");
+    assert_eq!(calls[4]["params"]["target"], "p1");
+    assert_eq!(calls[4]["params"]["name"], "wabc12-impl-flash-high-done");
+    assert_eq!(calls[5]["params"]["tab_id"], "t1");
 
     let record = ref_store(home.path()).resolve("wabc12").unwrap().unwrap();
     assert_eq!(record.display.as_deref(), Some("herdr"));
     assert_eq!(record.herdr_tab.as_deref(), Some("t1"));
+}
+
+#[test]
+fn terminal_rename_remains_visible_when_close_on_done_is_false() {
+    let home = tempfile::tempdir().unwrap();
+    let socket = home.path().join("fake-herdr.sock");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let herdr = spawn_herdr_lifecycle(&socket, 1, false, Arc::clone(&calls));
+    let (port, opencode) = spawn_attach_opencode(true);
+    prepare_attach_home(home.path(), &socket, port, "herdr");
+    fs::write(
+        home.path().join(".oca/config.toml"),
+        format!(
+            "[herdr]\nsocket = {}\nclose_on_done = false\n",
+            serde_json::to_string(&socket.display().to_string()).unwrap()
+        ),
+    )
+    .unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["__attach", "wabc12", "ses_target", "/worker", "sayHi"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "attach failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    herdr.join().unwrap();
+    opencode.join().unwrap();
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls[4]["method"], "agent.rename");
+    assert_eq!(calls[4]["params"]["target"], "p1");
+    assert_eq!(calls[4]["params"]["name"], "wabc12-impl-flash-high-fail");
+    assert!(
+        calls.iter().all(|call| call["method"] != "tab.close"),
+        "close_on_done=false must retain the renamed watcher tab"
+    );
+    assert_eq!(
+        ref_store(home.path())
+            .resolve("wabc12")
+            .unwrap()
+            .unwrap()
+            .herdr_tab
+            .as_deref(),
+        Some("t1"),
+        "terminal rename must not disturb the persisted tab id mapping"
+    );
+}
+
+#[test]
+fn blocked_reply_gets_blocked_marker_and_stays_open_with_close_on_done_enabled() {
+    let home = tempfile::tempdir().unwrap();
+    let socket = home.path().join("fake-herdr.sock");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let herdr = spawn_herdr_lifecycle(&socket, 1, false, Arc::clone(&calls));
+    let (port, opencode) = spawn_attach_opencode_state("blocked");
+    prepare_attach_home(home.path(), &socket, port, "herdr");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["__attach", "wabc12", "ses_target", "/worker", "sayHi"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "attach failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    herdr.join().unwrap();
+    opencode.join().unwrap();
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls[4]["method"], "agent.rename");
+    assert_eq!(calls[4]["params"]["target"], "p1");
+    assert_eq!(calls[4]["params"]["name"], "wabc12-impl-flash-high-blkd");
+    assert!(
+        calls.iter().all(|call| call["method"] != "tab.close"),
+        "close_on_done=true must retain a blocked worker for captain action"
+    );
+}
+
+#[test]
+fn a_failed_terminal_rename_still_closes_the_tab_it_could_not_mark() {
+    let home = tempfile::tempdir().unwrap();
+    let socket = home.path().join("fake-herdr.sock");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let herdr = spawn_herdr_lifecycle_with_rename(&socket, 1, true, false, Arc::clone(&calls));
+    let (port, opencode) = spawn_attach_opencode(false);
+    prepare_attach_home(home.path(), &socket, port, "herdr");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["__attach", "wabc12", "ses_target", "/worker", "sayHi"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "display stays best effort: a marker failure cannot fail the helper"
+    );
+    herdr.join().unwrap();
+    opencode.join().unwrap();
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "workspace.list",
+            "workspace.create",
+            "tab.create",
+            "agent.start",
+            "agent.rename",
+            "tab.close"
+        ],
+        "a marker oca could not publish must never strand the tab it was closing"
+    );
+    drop(calls);
+
+    let events = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["events", "wabc12", "--json"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert!(events.status.success());
+    let page: Value = serde_json::from_slice(&events.stdout).unwrap();
+    let unmarked = page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "oca.display.unmarked")
+        .expect("a marker failure must remain diagnosable after detached stderr is discarded");
+    let data: Value = serde_json::from_str(unmarked["data"].as_str().unwrap()).unwrap();
+    assert_eq!(data["backend"], "herdr");
+    assert_eq!(data["condition"], "terminal marker write failed");
 }
 
 #[test]
@@ -815,7 +971,7 @@ fn no_herdr_inside_tmux_creates_and_cleans_up_a_task_named_window() {
     let record = only_ref(home.path());
     assert_eq!(record.display.as_deref(), Some("tmux"));
     opencode.join().unwrap();
-    let calls = tmux.wait_for_calls(6);
+    let calls = tmux.wait_for_calls(7);
     assert_eq!(
         calls,
         [
@@ -829,8 +985,59 @@ fn no_herdr_inside_tmux_creates_and_cleans_up_a_task_named_window() {
             ),
             "set-option -w -t @42 pane-border-status top".to_owned(),
             "set-option -w -t @42 pane-border-format #{@oca-identity}".to_owned(),
+            format!(
+                "set-option -w -t @42 @oca-identity {} | impl | openai/gpt-5.6-luna | high | DO NOT TYPE: composer unbound | DONE",
+                record.id
+            ),
             "kill-window -t @42".to_owned(),
         ]
+    );
+}
+
+#[test]
+fn tmux_close_on_done_false_keeps_a_done_window_with_its_marker() {
+    let home = tempfile::tempdir().unwrap();
+    let missing_socket = home.path().join("missing-herdr.sock");
+    let tmux = FakeTmux::new(home.path());
+    let (port, opencode) = spawn_tmux_foreground_opencode();
+    prepare_dispatch_home(home.path(), &missing_socket, port);
+    fs::write(
+        home.path().join(".oca/config.toml"),
+        format!(
+            "[herdr]\nsocket = {}\nclose_on_done = false\n",
+            serde_json::to_string(&missing_socket.display().to_string()).unwrap()
+        ),
+    )
+    .unwrap();
+    let path = prepend_path(home.path());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["luna:h", "keep", "done", "inside", "tmux"])
+        .env("HOME", home.path())
+        .env("TMUX", "fake-client")
+        .env("PATH", path)
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "dispatch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record = only_ref(home.path());
+    opencode.join().unwrap();
+    let calls = tmux.wait_for_calls(6);
+    assert_eq!(
+        calls.last().unwrap(),
+        &format!(
+            "set-option -w -t @42 @oca-identity {} | impl | openai/gpt-5.6-luna | high | DO NOT TYPE: composer unbound | DONE",
+            record.id
+        )
+    );
+    assert!(
+        calls.iter().all(|call| call != "kill-window -t @42"),
+        "close_on_done=false must retain even a done tmux window"
     );
 }
 
@@ -921,6 +1128,17 @@ fn a_malformed_herdr_envelope_never_fails_the_dispatch() {
 fn spawn_herdr_lifecycle(
     socket: &Path,
     discovery_probe_count: usize,
+    close_on_done: bool,
+    calls: Arc<Mutex<Vec<Value>>>,
+) -> thread::JoinHandle<()> {
+    spawn_herdr_lifecycle_with_rename(socket, discovery_probe_count, close_on_done, true, calls)
+}
+
+fn spawn_herdr_lifecycle_with_rename(
+    socket: &Path,
+    discovery_probe_count: usize,
+    close_on_done: bool,
+    rename_succeeds: bool,
     calls: Arc<Mutex<Vec<Value>>>,
 ) -> thread::JoinHandle<()> {
     let listener = UnixListener::bind(socket).unwrap();
@@ -928,7 +1146,8 @@ fn spawn_herdr_lifecycle(
         for _ in 0..discovery_probe_count {
             accept_discovery_probe(&listener);
         }
-        for index in 0..5 {
+        let request_count = if close_on_done { 6 } else { 5 };
+        for index in 0..request_count {
             let mut stream = accept_unix_with_timeout(&listener);
             let request = read_unix_request(&stream);
             let request_id = request["id"].as_str().unwrap();
@@ -947,10 +1166,20 @@ fn spawn_herdr_lifecycle(
                     "type":"agent_started",
                     "agent":{"terminal_id":"term1"}
                 }),
-                4 => json!({"type":"ok"}),
+                // An unparseable result is the envelope failure the client
+                // reports for a rename herdr could not apply.
+                4 if !rename_succeeds => json!({}),
+                4 | 5 => json!({"type":"ok"}),
                 _ => unreachable!(),
             };
             writeln!(stream, "{}", json!({"id":request_id,"result":result})).unwrap();
+            calls.lock().unwrap().push(request);
+        }
+        // Record anything sent beyond the expected sequence. Without this, a
+        // test asserting oca sent no further call passes merely because the
+        // fixture stopped listening.
+        if let Some(stream) = try_accept_unix(&listener, Duration::from_millis(500)) {
+            let request = read_unix_request(&stream);
             calls.lock().unwrap().push(request);
         }
     })
@@ -964,6 +1193,28 @@ fn accept_discovery_probe(listener: &UnixListener) {
         0,
         "herdr discovery probe must not send a protocol request"
     );
+}
+
+/// Accepts a connection the fixture does not expect, so a test asserting that
+/// oca sent nothing further fails when oca in fact sent something.
+fn try_accept_unix(listener: &UnixListener, patience: Duration) -> Option<UnixStream> {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + patience;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_read_timeout(Some(patience)).unwrap();
+                return Some(stream);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("could not accept a herdr socket connection: {error}"),
+        }
+    }
 }
 
 fn accept_unix_with_timeout(listener: &UnixListener) -> UnixStream {
@@ -996,7 +1247,7 @@ fn spawn_herdr_until_agent_start(
     thread::spawn(move || {
         accept_discovery_probe(&listener);
         accept_discovery_probe(&listener);
-        for index in 0..4 {
+        for index in 0..6 {
             let mut stream = accept_unix_with_timeout(&listener);
             let request = read_unix_request(&stream);
             let request_id = request["id"].as_str().unwrap();
@@ -1015,6 +1266,7 @@ fn spawn_herdr_until_agent_start(
                     "type":"agent_started",
                     "agent":{"terminal_id":"term1"}
                 }),
+                4 | 5 => json!({"type":"ok"}),
                 _ => unreachable!(),
             };
             writeln!(stream, "{}", json!({"id":request_id,"result":result})).unwrap();
@@ -1356,7 +1608,11 @@ fn read_unix_request(stream: &UnixStream) -> Value {
     serde_json::from_str(&line).unwrap()
 }
 
-fn spawn_attach_opencode() -> (u16, thread::JoinHandle<()>) {
+fn spawn_attach_opencode(failed: bool) -> (u16, thread::JoinHandle<()>) {
+    spawn_attach_opencode_state(if failed { "failed" } else { "done" })
+}
+
+fn spawn_attach_opencode_state(state: &'static str) -> (u16, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
@@ -1365,12 +1621,12 @@ fn spawn_attach_opencode() -> (u16, thread::JoinHandle<()>) {
             read_http_request(&mut probe).path,
             "/session/ses_target/message"
         );
-        write_http_response(
-            &mut probe,
-            "200 OK",
-            "application/json",
-            &terminal_messages("msg_dispatch"),
-        );
+        let terminal_body = if state == "failed" {
+            failed_terminal_messages("msg_dispatch")
+        } else {
+            terminal_messages_with_status("msg_dispatch", state)
+        };
+        write_http_response(&mut probe, "200 OK", "application/json", &terminal_body);
 
         let (mut event, _) = listener.accept().unwrap();
         assert_eq!(
@@ -1394,12 +1650,7 @@ fn spawn_attach_opencode() -> (u16, thread::JoinHandle<()>) {
             read_http_request(&mut messages).path,
             "/session/ses_target/message"
         );
-        write_http_response(
-            &mut messages,
-            "200 OK",
-            "application/json",
-            &terminal_messages("msg_dispatch"),
-        );
+        write_http_response(&mut messages, "200 OK", "application/json", &terminal_body);
     });
     (port, server)
 }
@@ -2021,6 +2272,10 @@ fn spawn_tmux_foreground_opencode() -> (u16, thread::JoinHandle<()>) {
 }
 
 fn terminal_messages(parent_id: &str) -> String {
+    terminal_messages_with_status(parent_id, "done")
+}
+
+fn terminal_messages_with_status(parent_id: &str, status: &str) -> String {
     json!([{
         "info": {
             "id": "msg_assistant",
@@ -2030,7 +2285,22 @@ fn terminal_messages(parent_id: &str) -> String {
             "time": {"created":1,"completed":2},
             // Long enough to clear T27a's per-role reply floor, so this fixture
             // stays valid once the floor lands on the integration branch.
-            "structured": {"status":"done","files":[],"note":"Implemented the requested change and verified it end to end against the fake server fixture. All assertions pass, no regressions were observed, and the worker finished with no outstanding follow-up work."}
+            "structured": {"status":status,"files":[],"note":"Implemented the requested change and verified it end to end against the fake server fixture. All assertions pass, no regressions were observed, and the worker finished with no outstanding follow-up work."}
+        },
+        "parts": []
+    }])
+    .to_string()
+}
+
+fn failed_terminal_messages(parent_id: &str) -> String {
+    json!([{
+        "info": {
+            "id": "msg_assistant",
+            "sessionID": "ses_target",
+            "role": "assistant",
+            "parentID": parent_id,
+            "time": {"created":1,"completed":2},
+            "error": {"name":"ProviderError","message":"provider turn failed"}
         },
         "parts": []
     }])

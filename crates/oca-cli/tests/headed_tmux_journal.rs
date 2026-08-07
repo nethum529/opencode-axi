@@ -108,7 +108,7 @@ fn headed_tmux_background_journals_events_while_detached_stream_is_live() {
         ]
     );
     assert_eq!(
-        tmux.wait_for_calls(6),
+        tmux.wait_for_calls(7),
         [
             format!(
                 "new-window -d -P -F #{{window_id}} -n journalHeaded -- opencode attach http://127.0.0.1:{port}/ --session ses_tmux_journal"
@@ -119,6 +119,9 @@ fn headed_tmux_background_journals_events_while_detached_stream_is_live() {
             ),
             "set-option -w -t @42 pane-border-status top".to_owned(),
             "set-option -w -t @42 pane-border-format #{@oca-identity}".to_owned(),
+            format!(
+                "set-option -w -t @42 @oca-identity {reference} | impl | openai/gpt-5.6-luna | high | DO NOT TYPE: composer unbound | DONE"
+            ),
             "kill-window -t @42".to_owned(),
         ]
     );

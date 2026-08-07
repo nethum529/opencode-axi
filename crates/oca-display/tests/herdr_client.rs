@@ -246,7 +246,40 @@ fn agent_start_decouples_worker_identity_from_executable_kind() {
         vec!["opencode".into(), "--session".into(), "ses_1".into()],
     ))
     .unwrap();
-    assert_eq!(agent.as_str(), "term1");
+    assert_eq!(agent.as_str(), "p1");
+    fixture.finish();
+}
+
+#[test]
+fn agent_rename_targets_the_pane_returned_by_tab_create() {
+    let fixture = Fixture::new(4, |index, request| match index {
+        0 => existing_workspace(request),
+        1 => created_tab(request),
+        2 => {
+            assert_request(request, "agent.start");
+            FakeResponse::Result(json!({
+                "type":"agent_started",
+                "agent":{"terminal_id":"term1"}
+            }))
+        }
+        3 => {
+            assert_request(request, "agent.rename");
+            assert_eq!(request["params"]["target"], "p1");
+            assert_eq!(request["params"]["name"], "wabc12-impl-luna-low-done");
+            FakeResponse::Result(json!({"type":"ok"}))
+        }
+        _ => unreachable!(),
+    });
+    let client = fixture.client();
+    let (_, tab) = workspace_and_tab(&client);
+    let agent = run(client.agent_start(
+        &tab,
+        "wabc12-impl-luna-low",
+        vec!["opencode".into(), "--session".into(), "ses_1".into()],
+    ))
+    .unwrap();
+
+    run(client.rename_agent(&agent, "wabc12-impl-luna-low-done")).unwrap();
     fixture.finish();
 }
 

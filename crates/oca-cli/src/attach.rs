@@ -14,7 +14,8 @@ use url::Url;
 use crate::{
     AttachCommand,
     attach_diagnostics::{
-        HistoryProbe, herdr_agent_name, journal_history_diagnostic, probe_history, worker_identity,
+        HistoryProbe, herdr_agent_name, journal_history_diagnostic, journal_unmarked_display,
+        probe_history, terminal_agent_name, worker_identity,
     },
 };
 
@@ -108,7 +109,7 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
                 client: &client,
                 history: &history,
             };
-            run_tmux_attach(command, turn).await
+            run_tmux_attach(command, &config, turn).await
         }
         DisplayMode::Headless => Ok(()),
     }
@@ -153,7 +154,7 @@ async fn run_herdr_attach(
         .map_err(|error| error.to_string())?;
 
     let launch_result = async {
-        herdr
+        let agent = herdr
             .agent_start(
                 &tab,
                 turn.agent_name,
@@ -165,43 +166,64 @@ async fn run_herdr_attach(
             &command.reference,
             RefPatch::default().with_herdr_tab(tab.as_str()),
         )
-        .map_err(|error| format!("could not record herdr tab: {error}"))
+        .map_err(|error| format!("could not record herdr tab: {error}"))?;
+        Ok::<_, String>(agent)
     }
     .await;
-    if let Err(error) = launch_result {
-        // Before the tab id is durable, `oca k` cannot clean it up. A launch
-        // or persistence failure therefore retains best-effort local cleanup.
-        let _ = herdr.close_tab(&tab).await;
-        return Err(error);
-    }
+    let agent = match launch_result {
+        Ok(agent) => agent,
+        Err(error) => {
+            // Before the tab id is durable, `oca k` cannot clean it up. A launch
+            // or persistence failure therefore retains best-effort local cleanup.
+            let _ = herdr.close_tab(&tab).await;
+            return Err(error);
+        }
+    };
 
-    let follow_result = async {
-        let mut journal =
-            EventJournal::create(turn.state_directory, turn.reference, turn.message_id)
-                .map_err(|error| format!("could not create event journal: {error}"))?;
-        journal_history_diagnostic(&mut journal, &command.session_id, turn.history)
-            .map_err(|error| format!("could not record history diagnostic: {error}"))?;
-        let target = FollowTarget {
-            session_id: command.session_id.clone(),
-            message_id: turn.message_id.to_owned(),
-            directory: turn.directory.to_owned(),
-        };
-        follow_until_terminal_boundary::<_, EventJournal>(
-            turn.client,
-            &target,
-            None,
-            Some(&mut journal),
-        )
-        .await
-        .map_err(|error| format!("could not follow worker terminal state: {error}"))
-    }
-    .await;
+    let mut journal = EventJournal::create(turn.state_directory, turn.reference, turn.message_id)
+        .map_err(|error| format!("could not create event journal: {error}"))?;
+    journal_history_diagnostic(&mut journal, &command.session_id, turn.history)
+        .map_err(|error| format!("could not record history diagnostic: {error}"))?;
+    let target = FollowTarget {
+        session_id: command.session_id.clone(),
+        message_id: turn.message_id.to_owned(),
+        directory: turn.directory.to_owned(),
+    };
+    let follow_result = follow_until_terminal_boundary::<_, EventJournal>(
+        turn.client,
+        &target,
+        None,
+        Some(&mut journal),
+    )
+    .await
+    .map_err(|error| format!("could not follow worker terminal state: {error}"));
 
     match follow_result {
-        Ok(FollowBoundaryOutcome::Terminal) if config.herdr.close_on_done => herdr
-            .close_tab(&tab)
-            .await
-            .map_err(|error| error.to_string()),
+        Ok(FollowBoundaryOutcome::Terminal(terminal)) => {
+            let terminal_name = terminal_agent_name(turn.agent_name, terminal);
+            let rename_result = herdr
+                .rename_agent(&agent, &terminal_name)
+                .await
+                .map_err(|error| error.to_string());
+            let diagnostic_result = match rename_result.as_ref() {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    journal_unmarked_display(&mut journal, &command.session_id, "herdr", error)
+                        .map_err(|error| format!("could not record unmarked display: {error}"))
+                }
+            };
+            let close_result = if terminal.should_close(config.herdr.close_on_done) {
+                herdr
+                    .close_tab(&tab)
+                    .await
+                    .map_err(|error| error.to_string())
+            } else {
+                Ok(())
+            };
+            diagnostic_result?;
+            rename_result?;
+            close_result
+        }
         Ok(_) => Ok(()),
         // The persisted tab remains explicitly killable when following fails;
         // absence of a terminal boundary must never close a live worker tab.
@@ -209,7 +231,11 @@ async fn run_herdr_attach(
     }
 }
 
-async fn run_tmux_attach(command: &AttachCommand, turn: AttachTurn<'_>) -> Result<(), String> {
+async fn run_tmux_attach(
+    command: &AttachCommand,
+    config: &OcaConfig,
+    turn: AttachTurn<'_>,
+) -> Result<(), String> {
     let tmux = TmuxClient::default();
     let window = tmux
         .new_window(
@@ -221,32 +247,58 @@ async fn run_tmux_attach(command: &AttachCommand, turn: AttachTurn<'_>) -> Resul
             &command.cwd,
         )
         .map_err(|error| error.to_string())?;
-    let follow_result = async {
-        let mut journal =
-            EventJournal::create(turn.state_directory, turn.reference, turn.message_id)
-                .map_err(|error| format!("could not create event journal: {error}"))?;
-        journal_history_diagnostic(&mut journal, &command.session_id, turn.history)
-            .map_err(|error| format!("could not record history diagnostic: {error}"))?;
-        let target = FollowTarget {
-            session_id: command.session_id.clone(),
-            message_id: turn.message_id.to_owned(),
-            directory: turn.directory.to_owned(),
+    // The window already exists, so journal setup must not return past the
+    // cleanup arm below or it strands the window it just opened.
+    let mut journal =
+        match EventJournal::create(turn.state_directory, turn.reference, turn.message_id)
+            .map_err(|error| format!("could not create event journal: {error}"))
+            .and_then(|mut journal| {
+                journal_history_diagnostic(&mut journal, &command.session_id, turn.history)
+                    .map(|()| journal)
+                    .map_err(|error| format!("could not record history diagnostic: {error}"))
+            }) {
+            Ok(journal) => journal,
+            Err(error) => {
+                let _ = tmux.close_window(&window);
+                return Err(error);
+            }
         };
-        follow_until_terminal_boundary::<_, EventJournal>(
-            turn.client,
-            &target,
-            None,
-            Some(&mut journal),
-        )
-        .await
-        .map_err(|error| format!("could not follow worker terminal state: {error}"))
-    }
-    .await;
+    let target = FollowTarget {
+        session_id: command.session_id.clone(),
+        message_id: turn.message_id.to_owned(),
+        directory: turn.directory.to_owned(),
+    };
+    let follow_result = follow_until_terminal_boundary::<_, EventJournal>(
+        turn.client,
+        &target,
+        None,
+        Some(&mut journal),
+    )
+    .await
+    .map_err(|error| format!("could not follow worker terminal state: {error}"));
 
     match follow_result {
-        Ok(FollowBoundaryOutcome::Terminal) => tmux
-            .close_window(&window)
-            .map_err(|error| error.to_string()),
+        Ok(FollowBoundaryOutcome::Terminal(terminal)) => {
+            let marker_result = tmux
+                .mark_terminal(&window, turn.worker_identity, terminal)
+                .map_err(|error| error.to_string());
+            let diagnostic_result = match marker_result.as_ref() {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    journal_unmarked_display(&mut journal, &command.session_id, "tmux", error)
+                        .map_err(|error| format!("could not record unmarked display: {error}"))
+                }
+            };
+            let close_result = if terminal.should_close(config.herdr.close_on_done) {
+                tmux.close_window(&window)
+                    .map_err(|error| error.to_string())
+            } else {
+                Ok(())
+            };
+            diagnostic_result?;
+            marker_result?;
+            close_result
+        }
         Ok(_) => Ok(()),
         Err(error) => {
             // A window created before follow failure would otherwise be

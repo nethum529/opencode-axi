@@ -61,7 +61,8 @@ fn render_role_preamble(role: &RolePreamble) -> String {
          Git, destructive actions, credentials, and external communication are denied, not asked. \
          Report denials in the reply note.\n\n\
          ## Reply contract\n\
-         Return the `{role_name}` schema field by field: {fields}.{impl_cap}\n\n\
+         Return the `{role_name}` schema field by field: {fields}.{impl_cap}\n\
+         Alongside the StructuredOutput call, include one short plain-text summary line in your final message.\n\n\
          ## Style exemption\n\
          {STYLE_EXEMPTION}\n",
         role_name = role.name,

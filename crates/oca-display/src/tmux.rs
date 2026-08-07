@@ -9,6 +9,7 @@ use std::{
 use thiserror::Error;
 
 use crate::opencode_attach_argv;
+use oca_core::FollowBoundaryTerminal;
 
 /// A tmux window owned by one oca ref.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -139,6 +140,31 @@ impl TmuxClient {
                 source,
             })?;
         ensure_success("set-option", status)
+    }
+
+    /// Replaces the visible worker identity with its observed terminal marker.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invocation or non-zero-exit failure from tmux.
+    pub fn mark_terminal(
+        &self,
+        window: &TmuxWindow,
+        worker_identity: &str,
+        terminal: FollowBoundaryTerminal,
+    ) -> Result<(), TmuxError> {
+        let marker = match terminal {
+            FollowBoundaryTerminal::Done => "DONE",
+            FollowBoundaryTerminal::Partial => "PARTIAL",
+            FollowBoundaryTerminal::Blocked => "BLOCKED",
+            FollowBoundaryTerminal::Failed => "FAILED",
+            FollowBoundaryTerminal::Unclear => "UNCLEAR",
+        };
+        self.set_window_option(
+            window,
+            "@oca-identity",
+            &format!("{worker_identity} | {marker}"),
+        )
     }
 
     /// Closes exactly the ref-owned window rather than a fuzzy tmux target.
