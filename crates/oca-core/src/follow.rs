@@ -38,14 +38,25 @@ pub struct FollowMessage {
 
 impl FollowMessage {
     fn worker_reply(&self) -> WorkerReplyCandidate {
+        let has_structured = self
+            .structured
+            .as_ref()
+            .is_some_and(|value| !value.is_null());
         match worker_reply_payload(self.structured.as_ref(), &self.parts) {
             Ok(Some(reply)) => reply
                 .get("status")
                 .and_then(Value::as_str)
                 .and_then(parse_worker_state)
-                .map_or(WorkerReplyCandidate::Invalid, |state| {
-                    WorkerReplyCandidate::Valid(state, reply)
-                }),
+                .map_or_else(
+                    || {
+                        if has_structured {
+                            WorkerReplyCandidate::Absent
+                        } else {
+                            WorkerReplyCandidate::Invalid
+                        }
+                    },
+                    |state| WorkerReplyCandidate::Valid(state, reply),
+                ),
             Ok(None) => WorkerReplyCandidate::Absent,
             Err(_) => WorkerReplyCandidate::Invalid,
         }
@@ -78,10 +89,15 @@ impl std::error::Error for FencedReplyError {}
 /// Selects one worker reply payload from an assistant message.
 ///
 /// A non-null structured value is authoritative for schema-mode and legacy
-/// turns. Otherwise, text parts are joined in order and the last block whose
-/// opening and closing fences occupy their own lines is selected. Once a
-/// message carries such an opening fence, malformed JSON or a missing closing
-/// fence is an error rather than permission to borrow an older reply.
+/// turns. Otherwise, text parts are joined in order and the last top-level
+/// JSON-ish block whose opening and closing fences occupy their own lines is
+/// selected. A bare fenced block is also selected when its body looks like a
+/// status-bearing JSON contract; explicitly non-JSON fences are ignored.
+///
+/// The chain walker deliberately treats the transports asymmetrically: an
+/// invalid JSON-ish fence stops the walk because it is a live contract attempt,
+/// while an invalid structured value resumes the walk for legacy schema-mode
+/// tolerance. Do not harmonize those behaviors.
 pub fn worker_reply_payload(
     structured: Option<&Value>,
     parts: &[Value],
@@ -106,28 +122,116 @@ pub fn worker_reply_payload(
 
 fn last_fenced_json_block(text: &str) -> Result<Option<String>, FencedReplyError> {
     let mut selected = None;
-    let mut current = None::<Vec<&str>>;
+    let mut current = None::<OpenFence<'_>>;
 
     for line in text.lines() {
-        if line.trim() == "```json" {
-            current = Some(Vec::new());
-            selected = None;
-            continue;
-        }
-        if let Some(lines) = current.as_mut() {
-            if line.trim() == "```" {
-                selected = Some(lines.join("\n"));
+        if let Some(open) = current.as_mut() {
+            if is_closing_fence(line, open.marker, open.length) {
+                let block = open.lines.join("\n");
+                match open.kind {
+                    FenceKind::Jsonish => selected = Some(block),
+                    FenceKind::Bare if bare_block_is_contract_candidate(&block) => {
+                        selected = Some(block);
+                    }
+                    FenceKind::Bare | FenceKind::Other => {}
+                }
                 current = None;
             } else {
-                lines.push(line);
+                open.lines.push(line);
             }
+            continue;
+        }
+
+        if let Some(fence) = parse_fence_line(line) {
+            current = Some(OpenFence {
+                marker: fence.marker,
+                length: fence.length,
+                kind: fence.kind(),
+                lines: Vec::new(),
+            });
         }
     }
 
-    if current.is_some() {
-        return Err(FencedReplyError);
+    if let Some(open) = current {
+        let block = open.lines.join("\n");
+        if open.kind == FenceKind::Jsonish
+            || (open.kind == FenceKind::Bare && bare_block_is_contract_candidate(&block))
+        {
+            return Err(FencedReplyError);
+        }
     }
     Ok(selected)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FenceKind {
+    Jsonish,
+    Bare,
+    Other,
+}
+
+struct OpenFence<'a> {
+    marker: char,
+    length: usize,
+    kind: FenceKind,
+    lines: Vec<&'a str>,
+}
+
+struct FenceLine<'a> {
+    marker: char,
+    length: usize,
+    info: &'a str,
+}
+
+impl FenceLine<'_> {
+    fn kind(&self) -> FenceKind {
+        if self.length == 3
+            && self
+                .info
+                .split_whitespace()
+                .next()
+                .is_some_and(|tag| tag.eq_ignore_ascii_case("json"))
+        {
+            FenceKind::Jsonish
+        } else if self.info.is_empty() {
+            FenceKind::Bare
+        } else {
+            FenceKind::Other
+        }
+    }
+}
+
+fn parse_fence_line(line: &str) -> Option<FenceLine<'_>> {
+    let trimmed = line.trim();
+    let marker = trimmed.chars().next()?;
+    if !matches!(marker, '`' | '~') {
+        return None;
+    }
+    let length = trimmed
+        .chars()
+        .take_while(|character| *character == marker)
+        .count();
+    (length >= 3).then(|| FenceLine {
+        marker,
+        length,
+        info: trimmed[length..].trim(),
+    })
+}
+
+fn is_closing_fence(line: &str, marker: char, opening_length: usize) -> bool {
+    parse_fence_line(line).is_some_and(|fence| {
+        fence.marker == marker && fence.length >= opening_length && fence.info.is_empty()
+    })
+}
+
+fn bare_block_is_contract_candidate(block: &str) -> bool {
+    match serde_json::from_str::<Value>(block.trim()) {
+        Ok(value) => value.get("status").is_some(),
+        Err(_) => {
+            let trimmed = block.trim();
+            trimmed.starts_with('{') && trimmed.contains("\"status\"")
+        }
+    }
 }
 
 fn parse_worker_state(value: &str) -> Option<WorkerState> {
@@ -1041,6 +1145,124 @@ mod tests {
             max_reconnect_attempts: 1,
             max_reconnect_elapsed: Duration::ZERO,
             initial_backoff: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn fenced_reply_decision_table_covers_jsonish_bare_and_nested_blocks() {
+        struct Case {
+            name: &'static str,
+            text: &'static str,
+            expected: &'static str,
+            expected_file: Option<&'static str>,
+        }
+
+        let cases = [
+            Case {
+                name: "uppercase json",
+                text: "```JSON\n{\"status\":\"blocked\",\"files\":[\"uppercase.rs\"]}\n```",
+                expected: "Valid(blocked)",
+                expected_file: Some("uppercase.rs"),
+            },
+            Case {
+                name: "bare fence (json-ish body)",
+                text: "```\n{\"status\":\"partial\",\"files\":[\"bare.rs\"]}\n```",
+                expected: "Valid(partial)",
+                expected_file: Some("bare.rs"),
+            },
+            Case {
+                name: "bare fence (non-json body)",
+                text: "```\nprintf 'ordinary code sample'\n```",
+                expected: "Absent",
+                expected_file: None,
+            },
+            Case {
+                name: "trailing attrs",
+                text: "```json contract=worker\n{\"status\":\"done\",\"files\":[\"attrs.rs\"]}\n```",
+                expected: "Valid(done)",
+                expected_file: Some("attrs.rs"),
+            },
+            Case {
+                name: "tilde json",
+                text: "~~~JsOn\n{\"status\":\"partial\",\"files\":[\"tilde.rs\"]}\n~~~",
+                expected: "Valid(partial)",
+                expected_file: Some("tilde.rs"),
+            },
+            Case {
+                name: "indented valid",
+                text: "   ```json\n{\"status\":\"done\",\"files\":[\"indented.rs\"]}\n   ```",
+                expected: "Valid(done)",
+                expected_file: Some("indented.rs"),
+            },
+            Case {
+                name: "unclosed",
+                text: "```json\n{\"status\":\"done\",\"files\":[\"unclosed.rs\"]}",
+                expected: "Invalid",
+                expected_file: None,
+            },
+            Case {
+                name: "nested-in-text",
+                text: "~~~text\n```json\n{\"status\":\"done\",\"files\":[\"nested.rs\"]}\n```\n~~~",
+                expected: "Absent",
+                expected_file: None,
+            },
+            Case {
+                name: "example-before-real",
+                text: "````text\n```json\n{\"status\":\"done\",\"files\":[\"example.rs\"]}\n```\n````\n```json\n{\"status\":\"blocked\",\"files\":[\"real.rs\"]}\n```",
+                expected: "Valid(blocked)",
+                expected_file: Some("real.rs"),
+            },
+            Case {
+                name: "example-with-no-real",
+                text: "````text\n```json\n{\"status\":\"done\",\"files\":[\"example-only.rs\"]}\n```\n````",
+                expected: "Absent",
+                expected_file: None,
+            },
+            Case {
+                name: "valid-then-unclosed",
+                text: "```json\n{\"status\":\"done\",\"files\":[\"obsolete.rs\"]}\n```\n```JSON\n{\"status\":\"blocked\",\"files\":[\"unfinished.rs\"]}",
+                expected: "Invalid",
+                expected_file: None,
+            },
+        ];
+
+        assert_eq!(cases.len(), 11, "the reviewer decision table is exhaustive");
+        for case in cases {
+            let message = FollowMessage {
+                id: case.name.to_owned(),
+                session_id: "ses_target".to_owned(),
+                parent_id: Some("msg_this_dispatch".to_owned()),
+                role: "assistant".to_owned(),
+                completed: true,
+                structured: None,
+                parts: vec![serde_json::json!({"type": "text", "text": case.text})],
+                error: None,
+            };
+
+            let (actual, reply) = match message.worker_reply() {
+                WorkerReplyCandidate::Absent => ("Absent", None),
+                WorkerReplyCandidate::Invalid => ("Invalid", None),
+                WorkerReplyCandidate::Valid(WorkerState::Done, reply) => {
+                    ("Valid(done)", Some(reply))
+                }
+                WorkerReplyCandidate::Valid(WorkerState::Blocked, reply) => {
+                    ("Valid(blocked)", Some(reply))
+                }
+                WorkerReplyCandidate::Valid(WorkerState::Partial, reply) => {
+                    ("Valid(partial)", Some(reply))
+                }
+            };
+            assert_eq!(actual, case.expected, "decision row: {}", case.name);
+            assert_eq!(
+                reply
+                    .as_ref()
+                    .and_then(|value| value["files"].as_array())
+                    .and_then(|files| files.first())
+                    .and_then(Value::as_str),
+                case.expected_file,
+                "selected payload for decision row: {}",
+                case.name
+            );
         }
     }
 

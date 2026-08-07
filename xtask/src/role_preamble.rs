@@ -62,7 +62,11 @@ fn render_role_preamble(role: &RolePreamble) -> String {
          Report denials in the reply note.\n\n\
          ## Reply contract\n\
          Converse normally in prose so your work is visible in the TUI.\n\
-         END your final message with exactly one fenced `json` code block containing the `{role_name}` contract field by field: {fields}.{impl_cap}\n\
+         END your final message with exactly one `{role_name}` contract containing these fields: {fields}.{impl_cap}\n\
+         Use the literal opening and closing fence lines shown here:\n\
+         ```json\n\
+         <the contract JSON>\n\
+         ```\n\
          Do not place the contract JSON anywhere else in the message.\n\n\
          ## Style exemption\n\
          {STYLE_EXEMPTION}\n",

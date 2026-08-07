@@ -26,9 +26,10 @@ fn every_generated_preamble_has_the_ordered_clauses_and_verbatim_exemption() {
         assert!(
             preamble.contains("Converse normally in prose so your work is visible in the TUI.")
         );
-        assert!(
-            preamble.contains("END your final message with exactly one fenced `json` code block")
-        );
+        assert!(preamble.contains("END your final message with exactly one"));
+        assert!(preamble.contains(
+            "Use the literal opening and closing fence lines shown here:\n```json\n<the contract JSON>\n```\n"
+        ));
         assert!(preamble.contains("Do not place the contract JSON anywhere else"));
         assert_clause_order(preamble);
         assert!(preamble.contains(role.name()));

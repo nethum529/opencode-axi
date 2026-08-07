@@ -123,25 +123,31 @@ async fn last_fenced_block_in_the_newest_message_is_authoritative() {
 }
 
 #[tokio::test]
-async fn structured_reply_precedes_a_fenced_reply_in_the_same_message() {
-    let message = FollowMessage {
-        id: "msg_assistant".to_owned(),
-        session_id: "ses_target".to_owned(),
-        parent_id: Some("msg_this_dispatch".to_owned()),
-        role: "assistant".to_owned(),
-        completed: true,
-        structured: Some(serde_json::json!({
-            "status": "done",
-            "files": ["structured.rs"],
-            "note": "The legacy structured value remains authoritative while schema transport is enabled. A conflicting text fence must not replace this compatibility payload."
-        })),
-        parts: vec![serde_json::json!({
-            "type": "text",
-            "text": "Conflicting prose.\n```json\n{\"status\":\"blocked\",\"files\":[\"fenced.rs\"],\"note\":\"This fenced value deliberately conflicts with the structured reply and must lose because legacy structured transport has explicit precedence.\"}\n```"
-        })],
-        error: None,
+async fn invalid_structured_value_defers_to_an_older_valid_reply() {
+    let outcome = follow_fixture(include_str!(
+        "fixtures/follow_invalid_structured_then_older_valid.json"
+    ))
+    .await
+    .unwrap();
+
+    let FollowOutcome::Terminal(terminal) = outcome else {
+        panic!("legacy structured fallback fixture must classify as terminal");
     };
-    let outcome = follow_messages(vec![message]).await.unwrap();
+    assert_eq!(terminal.state, WorkerState::Partial);
+    assert_eq!(terminal.message.id, "msg_assistant_newer_garbage");
+    assert_eq!(
+        terminal.message.reply().unwrap()["files"],
+        serde_json::json!(["older-structured.rs"])
+    );
+}
+
+#[tokio::test]
+async fn newest_valid_structured_reply_precedes_fences() {
+    let outcome = follow_fixture(include_str!(
+        "fixtures/follow_valid_structured_precedes_fence.json"
+    ))
+    .await
+    .unwrap();
 
     let FollowOutcome::Terminal(terminal) = outcome else {
         panic!("structured fixture must classify as terminal");
@@ -150,6 +156,25 @@ async fn structured_reply_precedes_a_fenced_reply_in_the_same_message() {
     assert_eq!(
         terminal.message.reply().unwrap()["files"],
         serde_json::json!(["structured.rs"])
+    );
+}
+
+#[tokio::test]
+async fn rust_fence_in_an_intermediate_step_and_fenceless_final_defer_to_older_reply() {
+    let outcome = follow_fixture(include_str!(
+        "fixtures/follow_rust_fence_defers_to_older_reply.json"
+    ))
+    .await
+    .unwrap();
+
+    let FollowOutcome::Terminal(terminal) = outcome else {
+        panic!("ordinary code sample fixture must classify as terminal");
+    };
+    assert_eq!(terminal.state, WorkerState::Done);
+    assert_eq!(terminal.message.id, "msg_assistant_final");
+    assert_eq!(
+        terminal.message.reply().unwrap()["files"],
+        serde_json::json!(["older.rs"])
     );
 }
 

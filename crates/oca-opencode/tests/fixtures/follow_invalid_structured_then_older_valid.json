@@ -1,0 +1,35 @@
+[
+  {
+    "info": {
+      "id": "msg_assistant_older_valid",
+      "sessionID": "ses_target",
+      "role": "assistant",
+      "parentID": "msg_this_dispatch",
+      "time": { "created": 1, "completed": 9 },
+      "finish": "tool-calls",
+      "structured": {
+        "status": "partial",
+        "files": ["older-structured.rs"],
+        "note": "This older schema-mode reply is valid and must remain available when a newer legacy structured value is unrelated garbage rather than a worker contract."
+      }
+    },
+    "parts": []
+  },
+  {
+    "info": {
+      "id": "msg_assistant_newer_garbage",
+      "sessionID": "ses_target",
+      "role": "assistant",
+      "parentID": "msg_this_dispatch",
+      "time": { "created": 10, "completed": 20 },
+      "finish": "stop",
+      "structured": { "unrelated": "legacy schema output" }
+    },
+    "parts": [
+      {
+        "type": "text",
+        "text": "The newer legacy structured value is not a worker contract, so schema-mode tolerance resumes the chain walk without consulting this message's prose."
+      }
+    ]
+  }
+]
