@@ -13,6 +13,10 @@ const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 const HEALTH_PATH: &str = "/global/health";
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(20);
 const HEALTH_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(200);
+/// A socket timeout of zero is rejected by the platform rather than applied, so
+/// the last attempt of an exhausted budget keeps a floor that still reports the
+/// real connection failure.
+const MIN_HEALTH_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(1);
 const MAX_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Identity returned by a healthy `OpenCode` server.
@@ -73,7 +77,7 @@ where
     let started = Instant::now();
     loop {
         let remaining = budget.saturating_sub(started.elapsed());
-        let attempt_timeout = remaining.min(HEALTH_ATTEMPT_TIMEOUT);
+        let attempt_timeout = remaining.clamp(MIN_HEALTH_ATTEMPT_TIMEOUT, HEALTH_ATTEMPT_TIMEOUT);
         let error = match probe(attempt_timeout) {
             Ok(health) => return Ok(health),
             Err(error) => error,
@@ -163,8 +167,34 @@ fn decode_chunked(mut encoded: &[u8]) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ServerHealth, parse_response, wait_until_healthy};
-    use std::{cell::Cell, time::Duration};
+    use super::{ServerHealth, parse_response, probe, wait_until_healthy};
+    use std::{
+        cell::Cell,
+        net::TcpListener,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn exhausted_budget_reports_the_real_refusal_not_a_zero_timeout() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .map(|listener| listener.local_addr().expect("bound address").port())
+            .expect("a port nothing listens on");
+
+        let started = Instant::now();
+        let error = wait_until_healthy(Duration::from_millis(60), |attempt_timeout| {
+            probe(port, attempt_timeout)
+        })
+        .expect_err("a closed port never becomes healthy");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "readiness against a closed port must stay within its budget"
+        );
+        assert!(
+            !error.contains("0 duration"),
+            "readiness must not surface its own timeout arithmetic: {error}"
+        );
+    }
 
     #[test]
     fn parses_open_code_health_identity() {
