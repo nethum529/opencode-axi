@@ -1466,6 +1466,36 @@ mod tests {
     }
 
     #[test]
+    fn session_directory_prefers_the_worktree_over_the_repository_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RefStore::with_id_source(
+            RefStorePaths::in_directory(directory.path()),
+            Arc::new(SequenceIdSource::new(&["w00000", "w00001", "w00002"])),
+        );
+
+        let plain = finish(
+            store
+                .allocate(NewRef::for_session("session-plain").with_repo("/repo"))
+                .unwrap(),
+        );
+        assert_eq!(plain.session_directory(), Some("/repo"));
+
+        let worktree = finish(
+            store
+                .allocate(
+                    NewRef::for_session("session-worktree")
+                        .with_repo("/repo")
+                        .with_worktree_metadata("/repo/.oca/wt/w00001", "oca/w00001", "subject"),
+                )
+                .unwrap(),
+        );
+        assert_eq!(worktree.session_directory(), Some("/repo/.oca/wt/w00001"));
+
+        let unscoped = finish(store.allocate(NewRef::for_session("session-bare")).unwrap());
+        assert_eq!(unscoped.session_directory(), None);
+    }
+
+    #[test]
     fn insert_reserved_materializes_a_recovery_claim_with_full_durability() {
         let directory = tempfile::tempdir().unwrap();
         let store = RefStore::with_id_source(
