@@ -43,6 +43,31 @@ fn message_on_running_session_is_worker_busy_with_zero_requests() {
 }
 
 #[test]
+fn continuations_on_a_tooled_incompatible_alias_fail_with_zero_requests() {
+    for verb in ["m", "q"] {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
+        let port = listener.local_addr().expect("fake server address").port();
+        listener
+            .set_nonblocking(true)
+            .expect("listener becomes nonblocking");
+        let home = prepared_home_on_alias(port, RefState::Idle, "high", "flash");
+
+        let output = run_oca(home.path(), [verb, "w4f2a1", "continue"]);
+
+        assert_eq!(output.status.code(), Some(2), "`oca {verb}` exit");
+        let stderr = String::from_utf8(output.stderr).expect("stderr is utf-8");
+        assert!(
+            stderr.contains("code: model_unsupported_tooled"),
+            "`oca {verb}`: {stderr}"
+        );
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "`oca {verb}` must not send any HTTP request before rejecting the alias"
+        );
+    }
+}
+
+#[test]
 fn message_on_terminal_sessions_reuses_the_session_and_sends_full_turn_context() {
     for state in [
         RefState::Idle,
@@ -482,6 +507,15 @@ fn concurrent_messages_are_serialized_and_never_create_parallel_turns() {
 }
 
 fn prepared_home(port: u16, state: RefState, effort: &str) -> tempfile::TempDir {
+    prepared_home_on_alias(port, state, effort, "luna")
+}
+
+fn prepared_home_on_alias(
+    port: u16,
+    state: RefState,
+    effort: &str,
+    alias: &str,
+) -> tempfile::TempDir {
     let home = tempfile::tempdir().expect("temporary home");
     let state_directory = home.path().join(".oca");
     std::fs::create_dir(&state_directory).expect("state directory");
@@ -491,7 +525,7 @@ fn prepared_home(port: u16, state: RefState, effort: &str) -> tempfile::TempDir 
             id: "w4f2a1".to_owned(),
             session_id: "ses_prior_context".to_owned(),
             message_id: Some("msg_prior_turn".to_owned()),
-            alias: Some("luna".to_owned()),
+            alias: Some(alias.to_owned()),
             effort: Some(effort.to_owned()),
             role: Some("impl".to_owned()),
             cwd: Some(home.path().display().to_string()),
