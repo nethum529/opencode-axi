@@ -265,7 +265,7 @@ async fn subscribe_forwards_last_event_id_and_uses_the_sse_parser() {
     let client = OpenCodeClient::new(server.base_url.parse().expect("valid URL"));
 
     let mut subscription = client
-        .subscribe(Some("evt_41"))
+        .subscribe("/repo/worktree", Some("evt_41"))
         .await
         .expect("subscription opens");
     let event = subscription
@@ -277,7 +277,7 @@ async fn subscribe_forwards_last_event_id_and_uses_the_sse_parser() {
     assert_eq!(event.id.as_deref(), Some("evt_42"));
     assert_eq!(event.event.as_deref(), Some("session.idle"));
     let request = server.finish();
-    assert!(request.starts_with("GET /event HTTP/1.1\r\n"));
+    assert!(request.starts_with("GET /event?directory=%2Frepo%2Fworktree HTTP/1.1\r\n"));
     assert!(request.contains("last-event-id: evt_41\r\n"));
 }
 
@@ -318,7 +318,7 @@ async fn remaining_facade_methods_map_malformed_envelopes_to_protocol_mismatch()
     let server = FakeServer::once(response("200 OK", "application/json", "{}"));
     let client = OpenCodeClient::new(server.base_url.parse().expect("valid URL"));
     assert!(matches!(
-        client.subscribe(None).await,
+        client.subscribe("/repo", None).await,
         Err(OpenCodeError::ProtocolMismatch { .. })
     ));
     assert!(!server.finish().contains("last-event-id:"));

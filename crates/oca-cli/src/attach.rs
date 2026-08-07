@@ -39,8 +39,18 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
     }
     let message_id = record
         .message_id
+        .clone()
         .ok_or_else(|| format!("ref `{}` has no attributed message id", command.reference))?;
-    let reference = RefId::new(record.id)
+    let directory = record
+        .session_directory()
+        .ok_or_else(|| {
+            format!(
+                "ref `{}` has no stored session directory",
+                command.reference
+            )
+        })?
+        .to_owned();
+    let reference = RefId::new(&record.id)
         .map_err(|error| format!("ref `{}` is invalid: {error}", command.reference))?;
     let mode = match record.display.as_deref() {
         Some("herdr") => DisplayMode::Herdr,
@@ -67,6 +77,7 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
                 reference: &reference,
                 base_url: &base_url,
                 message_id: &message_id,
+                directory: &directory,
             };
             run_herdr_attach(command, home, &config, &refs, turn).await
         }
@@ -76,6 +87,7 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
                 reference: &reference,
                 base_url: &base_url,
                 message_id: &message_id,
+                directory: &directory,
             };
             run_tmux_attach(command, turn).await
         }
@@ -88,6 +100,7 @@ struct AttachTurn<'a> {
     reference: &'a RefId,
     base_url: &'a Url,
     message_id: &'a str,
+    directory: &'a str,
 }
 
 async fn run_herdr_attach(
@@ -142,6 +155,7 @@ async fn run_herdr_attach(
         let target = FollowTarget {
             session_id: command.session_id.clone(),
             message_id: turn.message_id.to_owned(),
+            directory: turn.directory.to_owned(),
         };
         follow_until_terminal::<_, EventJournal>(
             &OpenCodeClient::new(turn.base_url.clone()),
@@ -181,6 +195,7 @@ async fn run_tmux_attach(command: &AttachCommand, turn: AttachTurn<'_>) -> Resul
         let target = FollowTarget {
             session_id: command.session_id.clone(),
             message_id: turn.message_id.to_owned(),
+            directory: turn.directory.to_owned(),
         };
         follow_until_terminal::<_, EventJournal>(
             &OpenCodeClient::new(turn.base_url.clone()),

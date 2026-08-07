@@ -59,7 +59,10 @@ fn live_session_creation_http_prompt_terminal_sse_and_message_id_echo() {
 
     let (session_id, message_id, events, messages) = runtime.block_on(async {
         let session = create_session(&client, &server, &model, None).await;
-        let mut subscription = client.subscribe(None).await.expect("live SSE subscription");
+        let mut subscription = client
+            .subscribe(server.repo.path().to_str().unwrap(), None)
+            .await
+            .expect("live SSE subscription");
         let message_id = mint_message_id();
         client
             .prompt_async(
@@ -108,7 +111,10 @@ fn live_variant_is_accepted_on_both_prompt_endpoints_for_both_providers() {
         ] {
             let client = server.client();
             let session = create_session(&client, &server, &model, None).await;
-            let mut subscription = client.subscribe(None).await.expect("live SSE subscription");
+            let mut subscription = client
+                .subscribe(server.repo.path().to_str().unwrap(), None)
+                .await
+                .expect("live SSE subscription");
             let message_id = mint_message_id();
             client
                 .prompt_async(
@@ -289,7 +295,10 @@ fn live_permission_deny_returns_without_asking_or_hanging() {
         let model = deepseek_model("high");
         let client = server.client();
         let session = create_session(&client, &server, &model, Some(permission)).await;
-        let mut subscription = client.subscribe(None).await.expect("live SSE subscription");
+        let mut subscription = client
+            .subscribe(server.repo.path().to_str().unwrap(), None)
+            .await
+            .expect("live SSE subscription");
         let message_id = mint_message_id();
         let started = Instant::now();
         client
@@ -353,7 +362,10 @@ fn live_herdr_workspace_tab_agent_start_and_tui_boot_has_no_idle() {
         let model = deepseek_model("high");
         let client = server.client();
         let session = create_session(&client, &server, &model, None).await;
-        let mut subscription = client.subscribe(None).await.expect("live SSE subscription");
+        let mut subscription = client
+            .subscribe(server.repo.path().to_str().unwrap(), None)
+            .await
+            .expect("live SSE subscription");
         let workspace = herdr.workspace("oca").await.expect("herdr workspace");
         let tab = herdr
             .tab(&workspace, "oca-live-idle-boot", true, server.repo.path())
@@ -404,7 +416,10 @@ fn live_queue_runs_after_turn_and_abort_reaches_terminal_for_tab_close() {
             let model = deepseek_model("high");
             let client = server.client();
             let session = create_session(&client, &server, &model, None).await;
-            let mut events = client.subscribe(None).await.expect("queue SSE subscription");
+            let mut events = client
+                .subscribe(server.repo.path().to_str().unwrap(), None)
+                .await
+                .expect("queue SSE subscription");
             let first_message = mint_message_id();
             client
                 .prompt_async(
@@ -464,7 +479,10 @@ fn live_queue_runs_after_turn_and_abort_reaches_terminal_for_tab_close() {
         let model = deepseek_model("high");
         let client = server.client();
         let session = create_session(&client, &server, &model, None).await;
-        let events = client.subscribe(None).await.expect("abort SSE subscription");
+        let events = client
+            .subscribe(server.repo.path().to_str().unwrap(), None)
+            .await
+            .expect("abort SSE subscription");
         let message_id = mint_message_id();
         client
             .prompt_async(
@@ -645,7 +663,7 @@ fn live_last_event_id_replay_support_is_measured() {
         let client = server.client();
         let session = create_session(&client, &server, &model, None).await;
         let mut first = client
-            .subscribe(None)
+            .subscribe(server.repo.path().to_str().unwrap(), None)
             .await
             .expect("first SSE subscription");
         let message_id = mint_message_id();
@@ -675,7 +693,7 @@ fn live_last_event_id_replay_support_is_measured() {
             .map(String::as_str)
             .unwrap_or("oca-live-cursor-probe");
         let mut resumed = client
-            .subscribe(Some(cursor))
+            .subscribe(server.repo.path().to_str().unwrap(), Some(cursor))
             .await
             .expect("Last-Event-ID subscription accepted");
         let reconnect_events = collect_events_for(&mut resumed, Duration::from_secs(1)).await;

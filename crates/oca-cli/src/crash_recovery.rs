@@ -335,10 +335,11 @@ fn cleanup_pre_session_strand(
 
 async fn prompt_landed(home: &Path, intent: &Intent) -> Result<bool, OcaError> {
     let client = discovered_client(home, &intent.reference)?;
+    let directory = intent_session_directory(home, intent)?;
     // Subscribe first. A terminal event observed later is accepted only through
     // the follow tracker that matches the assistant's event-stream parentID.
     let _subscription = client
-        .subscribe(None)
+        .subscribe(&directory, None)
         .await
         .map_err(|error| transport_error(&intent.reference, error))?;
     let messages = client
@@ -350,6 +351,32 @@ async fn prompt_landed(home: &Path, intent: &Intent) -> Result<bool, OcaError> {
         .await
         .map_err(|error| transport_error(&intent.reference, error))?;
     Ok(user_prompt_matches(&messages, intent))
+}
+
+fn intent_session_directory(home: &Path, intent: &Intent) -> Result<String, OcaError> {
+    let refs = RefStore::with_paths(RefStorePaths::in_directory(home.join(".oca")));
+    if let Some(record) = refs
+        .resolve(&intent.reference)
+        .map_err(|error| recovery_error(&intent.reference, error))?
+    {
+        return record
+            .session_directory()
+            .map(str::to_owned)
+            .ok_or_else(|| recovery_protocol(&intent.reference, "ref has no session directory"));
+    }
+    let requested = intent.requested.as_ref().ok_or_else(|| {
+        recovery_protocol(
+            &intent.reference,
+            &format!("{} intent has no requested dispatch", intent.phase.as_str()),
+        )
+    })?;
+    if !requested.worktree {
+        return Ok(requested.repo.clone());
+    }
+    Err(recovery_protocol(
+        &intent.reference,
+        "worktree intent has no ref",
+    ))
 }
 
 async fn query_messages(home: &Path, intent: &Intent) -> Result<(), OcaError> {

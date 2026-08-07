@@ -327,13 +327,14 @@ impl OpenCodeClient {
             .await
     }
 
-    /// Opens the global SSE stream, optionally resuming after an event id.
+    /// Opens the directory-scoped SSE stream, optionally resuming after an event id.
     ///
     /// # Errors
     ///
     /// Returns an error when `OpenCode` rejects the subscription or does not return SSE.
     pub async fn subscribe(
         &self,
+        directory: &str,
         last_event_id: Option<&str>,
     ) -> Result<Subscription, OpenCodeError> {
         let url = self.endpoint("event");
@@ -341,6 +342,7 @@ impl OpenCodeClient {
             .generated
             .client()
             .get(url)
+            .query(&[("directory", directory)])
             .header("api-version", self.generated.api_version())
             .header(header::ACCEPT, "text/event-stream");
         if let Some(last_event_id) = last_event_id {

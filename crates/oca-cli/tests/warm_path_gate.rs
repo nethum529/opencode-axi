@@ -705,7 +705,7 @@ fn serve(
                     current.pre_ack_requests.push(path.clone());
                 }
 
-                if path == "/event" {
+                if path.starts_with("/event?directory=") {
                     let response = match stream_failure {
                         StreamFailure::DropReconciliation => ServerResponse::Normal {
                             status: "200 OK",
@@ -859,7 +859,7 @@ fn route(path: &str) -> &'static str {
         "agent.list"
     } else if path.starts_with("/session?") {
         "session.create"
-    } else if path == "/event" {
+    } else if path.starts_with("/event?directory=") {
         "event.subscribe"
     } else if path.ends_with("/prompt_async") {
         "session.prompt_async"

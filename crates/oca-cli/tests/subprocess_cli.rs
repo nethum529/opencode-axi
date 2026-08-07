@@ -193,7 +193,7 @@ impl FollowFixture {
         let recording = Recording {
             exchanges: vec![
                 RecordedExchange {
-                    request: HttpRequest::new("GET", "/event", no_headers(), []),
+                    request: HttpRequest::new("GET", "/event?directory=%2Frepo", no_headers(), []),
                     response: HttpResponse::new(
                         200,
                         [("content-type", "text/event-stream")],
@@ -211,7 +211,7 @@ impl FollowFixture {
         let recording = Recording {
             exchanges: vec![
                 RecordedExchange {
-                    request: HttpRequest::new("GET", "/event", no_headers(), []),
+                    request: HttpRequest::new("GET", "/event?directory=%2Frepo", no_headers(), []),
                     response: HttpResponse::new(
                         200,
                         [("content-type", "text/event-stream")],
@@ -266,7 +266,7 @@ fn prepared_home(port: u16) -> tempfile::TempDir {
             role: Some("impl".to_owned()),
             cwd: Some(home.path().display().to_string()),
             last_state: Some(oca_state::RefState::Running),
-            repo: None,
+            repo: Some("/repo".to_owned()),
             spawner_tag: None,
             worktree: None,
             branch: None,

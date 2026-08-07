@@ -434,7 +434,7 @@ fn concurrent_messages_are_serialized_and_never_create_parallel_turns() {
             .accept()
             .expect("confirmation subscription arrives");
         let subscription = read_request(&mut events);
-        assert_eq!(subscription.path, "/event");
+        assert_eq!(subscription.path, "/event?directory=%2Frepo");
         write_sse_headers(&mut events);
         let (mut stream, _) = listener.accept().expect("first message arrives");
         let first = read_request(&mut stream);
@@ -496,7 +496,7 @@ fn prepared_home(port: u16, state: RefState, effort: &str) -> tempfile::TempDir 
             role: Some("impl".to_owned()),
             cwd: Some(home.path().display().to_string()),
             last_state: Some(state),
-            repo: None,
+            repo: Some("/repo".to_owned()),
             spawner_tag: None,
             worktree: None,
             branch: None,
@@ -619,7 +619,7 @@ fn assert_success(output: &Output) {
 
 fn serve_confirmed_prompt(listener: &TcpListener) -> CapturedRequest {
     let (mut events, subscription) = accept_request(listener, "SSE subscription");
-    assert_eq!(subscription.path, "/event");
+    assert_eq!(subscription.path, "/event?directory=%2Frepo");
     write_sse_headers(&mut events);
 
     let (mut prompt_stream, request) = accept_request(listener, "prompt");
@@ -634,7 +634,7 @@ fn serve_confirmed_prompt(listener: &TcpListener) -> CapturedRequest {
 fn serve_poisoned_history_confirmed_prompt(listener: TcpListener) -> Vec<CapturedRequest> {
     let (mut events, _) = listener.accept().expect("fake accepts SSE subscription");
     let subscription = read_request(&mut events);
-    assert_eq!(subscription.path, "/event");
+    assert_eq!(subscription.path, "/event?directory=%2Frepo");
     write_sse_headers(&mut events);
 
     let prompt = serve_one_prompt(&listener, "204 No Content", "");
@@ -658,7 +658,7 @@ fn serve_poisoned_history_confirmed_prompt(listener: TcpListener) -> Vec<Capture
 fn serve_history_confirmed_prompt(listener: TcpListener) -> Vec<CapturedRequest> {
     let (mut events, _) = listener.accept().expect("fake accepts SSE subscription");
     let subscription = read_request(&mut events);
-    assert_eq!(subscription.path, "/event");
+    assert_eq!(subscription.path, "/event?directory=%2Frepo");
     write!(
         events,
         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"
@@ -694,7 +694,7 @@ fn serve_silently_dropped_prompt(listener: TcpListener) -> Vec<CapturedRequest> 
     let mut requests = Vec::new();
     let (mut events, _) = listener.accept().expect("fake accepts SSE subscription");
     requests.push(read_request(&mut events));
-    assert_eq!(requests[0].path, "/event");
+    assert_eq!(requests[0].path, "/event?directory=%2Frepo");
     write!(
         events,
         "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: 0\r\nconnection: close\r\n\r\n"

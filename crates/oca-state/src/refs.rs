@@ -71,6 +71,14 @@ pub struct RefRecord {
     pub tombstoned: bool,
 }
 
+impl RefRecord {
+    /// Returns the OpenCode project directory that owns this ref's session.
+    #[must_use]
+    pub fn session_directory(&self) -> Option<&str> {
+        self.worktree.as_deref().or(self.repo.as_deref())
+    }
+}
+
 /// Values used to create a new ref.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NewRef {
@@ -1455,6 +1463,36 @@ mod tests {
             store.allocate_reserved("w00000", NewRef::for_session("other")),
             Err(RefStoreError::RefAlreadyExists(id)) if id == "w00000"
         ));
+    }
+
+    #[test]
+    fn session_directory_prefers_the_worktree_over_the_repository_root() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = RefStore::with_id_source(
+            RefStorePaths::in_directory(directory.path()),
+            Arc::new(SequenceIdSource::new(&["w00000", "w00001", "w00002"])),
+        );
+
+        let plain = finish(
+            store
+                .allocate(NewRef::for_session("session-plain").with_repo("/repo"))
+                .unwrap(),
+        );
+        assert_eq!(plain.session_directory(), Some("/repo"));
+
+        let worktree = finish(
+            store
+                .allocate(
+                    NewRef::for_session("session-worktree")
+                        .with_repo("/repo")
+                        .with_worktree_metadata("/repo/.oca/wt/w00001", "oca/w00001", "subject"),
+                )
+                .unwrap(),
+        );
+        assert_eq!(worktree.session_directory(), Some("/repo/.oca/wt/w00001"));
+
+        let unscoped = finish(store.allocate(NewRef::for_session("session-bare")).unwrap());
+        assert_eq!(unscoped.session_directory(), None);
     }
 
     #[test]
