@@ -684,6 +684,7 @@ name = "oca-server"
 version = "0.1.0"
 dependencies = [
  "fs2",
+ "httparse",
  "oca-opencode",
  "oca-state",
  "serde",

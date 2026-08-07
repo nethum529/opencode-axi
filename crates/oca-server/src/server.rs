@@ -9,8 +9,7 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
-    thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use fs2::FileExt;
@@ -20,13 +19,16 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
 
+use crate::{ServerHealth, readiness};
+
 const SERVER_FILE: &str = "server.json";
 const SERVER_LOCK: &str = "server.lock";
 const SERVER_LOG: &str = "opencode.log";
 const LOOPBACK: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+const OCCUPANT_HEALTH_TIMEOUT: Duration = Duration::from_millis(200);
 static TEMP_FILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
-/// The durable hint pointing at an `OpenCode` server started by `oca`.
+/// The durable hint pointing at the healthy `OpenCode` server used by `oca`.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ServerRecord {
     pub port: u16,
@@ -137,6 +139,15 @@ pub trait ServerRuntime {
 
     fn port_is_available(&self, port: u16) -> bool;
 
+    /// Probes the OpenCode-specific health endpoint once within `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a concrete connection, HTTP, or response-contract failure.
+    fn probe_health(&self, port: u16, timeout: Duration) -> Result<ServerHealth, String> {
+        readiness::probe(port, timeout)
+    }
+
     /// Starts a loopback-only server and redirects its output to `log_path`.
     ///
     /// # Errors
@@ -144,12 +155,17 @@ pub trait ServerRuntime {
     /// Returns an error when the server process cannot be created.
     fn spawn(&self, port: u16, log_path: &Path) -> Result<(), String>;
 
-    /// Waits for a successful loopback connection, retaining the last failure.
+    /// Polls OpenCode health for at most the caller's configured startup budget.
     ///
     /// # Errors
     ///
     /// Returns the final concrete connection error when `timeout` expires.
-    fn wait_until_ready(&self, port: u16, timeout: Duration) -> Result<(), String>;
+    fn wait_until_ready(&self, port: u16, timeout: Duration) -> Result<(), String> {
+        readiness::wait_until_healthy(timeout, |attempt_timeout| {
+            self.probe_health(port, attempt_timeout)
+        })
+        .map(|_| ())
+    }
 
     fn warn(&self, message: &str);
 }
@@ -221,19 +237,6 @@ impl ServerRuntime for SystemRuntime {
             .spawn()
             .map(|_| ())
             .map_err(|error| error.to_string())
-    }
-
-    fn wait_until_ready(&self, port: u16, timeout: Duration) -> Result<(), String> {
-        let deadline = Instant::now() + timeout;
-        let address = SocketAddr::new(LOOPBACK, port);
-        loop {
-            match TcpStream::connect_timeout(&address, Duration::from_millis(50)) {
-                Ok(_) => return Ok(()),
-                Err(error) if Instant::now() >= deadline => return Err(error.to_string()),
-                Err(_) => {}
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
     }
 
     fn warn(&self, message: &str) {
@@ -420,6 +423,13 @@ impl ConnectOrStart {
         let mut diagnostics = Vec::new();
         for port in self.candidate_ports() {
             if !runtime.port_is_available(port) {
+                if port == self.primary_port
+                    && let Ok(health) = runtime.probe_health(port, OCCUPANT_HEALTH_TIMEOUT)
+                {
+                    let record = ServerRecord::new(port, health.version, environment_hash.clone());
+                    self.write_record(&record)?;
+                    return Ok(StartOutcome::Started(record));
+                }
                 diagnostics.push(StartupDiagnostic::new(
                     port,
                     StartupStage::Availability,
@@ -616,6 +626,7 @@ mod tests {
     use std::{
         cell::{Cell, RefCell},
         future::Future,
+        io::{Read, Write},
         net::TcpListener,
         path::Path,
         sync::{
@@ -631,6 +642,7 @@ mod tests {
         ConnectError, ConnectOrStart, OpenCodeRequest, RequestFailure, ServerRecord, ServerRuntime,
         StartupStage, SystemRuntime,
     };
+    use crate::ServerHealth;
 
     struct Runtime {
         requests: Cell<u8>,
@@ -651,12 +663,12 @@ mod tests {
             true
         }
 
-        fn spawn(&self, _port: u16, _log_path: &Path) -> Result<(), String> {
-            panic!("the warm path must not spawn")
+        fn probe_health(&self, _port: u16, _timeout: Duration) -> Result<ServerHealth, String> {
+            panic!("the warm path must not probe")
         }
 
-        fn wait_until_ready(&self, _port: u16, _timeout: Duration) -> Result<(), String> {
-            panic!("the warm path must not probe")
+        fn spawn(&self, _port: u16, _log_path: &Path) -> Result<(), String> {
+            panic!("the warm path must not spawn")
         }
 
         fn warn(&self, _message: &str) {}
@@ -870,7 +882,30 @@ mod tests {
     }
 
     #[test]
-    fn occupied_primary_port_falls_back_without_touching_the_existing_listener() {
+    fn healthy_open_code_on_occupied_canonical_port_is_adopted_without_spawn() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let runtime = ColdRuntime::new([]).with_healthy_occupants([4096]);
+        let mut request = ReadyRequest;
+
+        block_on(
+            ConnectOrStart::new(directory.path(), 4096, [4097], Duration::from_millis(1))
+                .connect_or_start(&runtime, &mut request),
+        )
+        .expect("healthy canonical occupant is adopted");
+
+        assert!(runtime.spawned.borrow().is_empty());
+        assert_eq!(runtime.health_probes.borrow().as_slice(), &[4096]);
+        assert_eq!(
+            ConnectOrStart::new(directory.path(), 4096, [4097], Duration::from_millis(1))
+                .read_record()
+                .expect("record read")
+                .expect("adopted record written"),
+            ServerRecord::new(4096, "1.18.10", "environment")
+        );
+    }
+
+    #[test]
+    fn non_open_code_occupant_on_primary_falls_back_to_replacement() {
         let directory = tempfile::tempdir().expect("temporary state directory");
         let runtime = ColdRuntime::new([4097]);
         let mut request = ReadyRequest;
@@ -882,6 +917,7 @@ mod tests {
         .expect("alternate port starts");
 
         assert_eq!(runtime.spawned.borrow().as_slice(), &[4097]);
+        assert_eq!(runtime.health_probes.borrow().as_slice(), &[4096, 4097]);
         assert_eq!(
             ConnectOrStart::new(directory.path(), 4096, [4097], Duration::from_millis(1))
                 .read_record()
@@ -889,6 +925,61 @@ mod tests {
                 .expect("record written")
                 .port,
             4097
+        );
+    }
+
+    #[test]
+    fn replacement_readiness_tolerates_refusal_before_first_real_request() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let runtime = DelayedReadinessRuntime::healthy_after(3);
+        let mut request = ReadyRequest;
+
+        block_on(
+            ConnectOrStart::new(directory.path(), 4096, [], Duration::from_millis(100))
+                .connect_or_start(&runtime, &mut request),
+        )
+        .expect("replacement becomes HTTP-ready within its startup budget");
+
+        assert_eq!(runtime.spawned.get(), 1);
+        assert_eq!(runtime.health_probes.get(), 3);
+        assert_eq!(
+            ConnectOrStart::new(directory.path(), 4096, [], Duration::from_millis(100))
+                .read_record()
+                .expect("record read")
+                .expect("ready replacement record")
+                .port,
+            4096
+        );
+    }
+
+    #[test]
+    fn replacement_that_never_listens_fails_within_bounded_readiness_budget() {
+        let directory = tempfile::tempdir().expect("temporary state directory");
+        let runtime = DelayedReadinessRuntime::never_healthy();
+        let mut request = ReadyRequest;
+        let started = std::time::Instant::now();
+
+        let error = block_on(
+            ConnectOrStart::new(directory.path(), 4096, [], Duration::from_millis(45))
+                .connect_or_start(&runtime, &mut request),
+        )
+        .expect_err("dead replacement must fail admission");
+
+        assert!(started.elapsed() < Duration::from_millis(250));
+        assert_eq!(runtime.spawned.get(), 1);
+        assert!(runtime.health_probes.get() >= 2);
+        let ConnectError::Startup(diagnostics) = error else {
+            panic!("dead replacement must retain startup diagnostics")
+        };
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].stage, StartupStage::Readiness);
+        assert!(diagnostics[0].reason.contains("connection refused"));
+        assert!(
+            ConnectOrStart::new(directory.path(), 4096, [], Duration::from_millis(45))
+                .read_record()
+                .expect("record read")
+                .is_none(),
+            "a dead replacement must never be published"
         );
     }
 
@@ -986,6 +1077,16 @@ mod tests {
             }
             let listener = TcpListener::bind(("127.0.0.1", port))
                 .expect("test server claims the released port");
+            let (mut stream, _) = listener.accept().expect("health probe connects");
+            let mut request = [0_u8; 1024];
+            let request_len = stream.read(&mut request).expect("health request read");
+            assert!(request[..request_len].starts_with(b"GET /global/health HTTP/1.1\r\n"));
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 36\r\nConnection: close\r\n\r\n{\"healthy\":true,\"version\":\"1.19.0\"}",
+                )
+                .expect("health response write");
+            drop(stream);
             let _ = release_rx.recv_timeout(Duration::from_secs(5));
             drop(listener);
         });
@@ -1088,6 +1189,8 @@ mod tests {
 
     struct ColdRuntime {
         available: Vec<u16>,
+        healthy_occupants: Vec<u16>,
+        health_probes: RefCell<Vec<u16>>,
         version: String,
         version_probes: Cell<u8>,
         spawned: RefCell<Vec<u16>>,
@@ -1102,11 +1205,18 @@ mod tests {
         fn with_version(available: impl IntoIterator<Item = u16>, version: &str) -> Self {
             Self {
                 available: available.into_iter().collect(),
+                healthy_occupants: Vec::new(),
+                health_probes: RefCell::new(Vec::new()),
                 version: version.to_owned(),
                 version_probes: Cell::new(0),
                 spawned: RefCell::new(Vec::new()),
                 warnings: RefCell::new(Vec::new()),
             }
+        }
+
+        fn with_healthy_occupants(mut self, ports: impl IntoIterator<Item = u16>) -> Self {
+            self.healthy_occupants = ports.into_iter().collect();
+            self
         }
     }
 
@@ -1124,6 +1234,17 @@ mod tests {
             self.available.contains(&port)
         }
 
+        fn probe_health(&self, port: u16, _timeout: Duration) -> Result<ServerHealth, String> {
+            self.health_probes.borrow_mut().push(port);
+            if self.healthy_occupants.contains(&port) || self.spawned.borrow().contains(&port) {
+                Ok(ServerHealth {
+                    version: self.version.clone(),
+                })
+            } else {
+                Err("occupant is not OpenCode".to_owned())
+            }
+        }
+
         fn spawn(&self, port: u16, log_path: &Path) -> Result<(), String> {
             assert_eq!(
                 log_path.file_name().and_then(|name| name.to_str()),
@@ -1133,13 +1254,67 @@ mod tests {
             Ok(())
         }
 
-        fn wait_until_ready(&self, _port: u16, _timeout: Duration) -> Result<(), String> {
-            Ok(())
-        }
-
         fn warn(&self, message: &str) {
             self.warnings.borrow_mut().push(message.to_owned());
         }
+    }
+
+    struct DelayedReadinessRuntime {
+        ready_after: Option<u8>,
+        health_probes: Cell<u8>,
+        spawned: Cell<u8>,
+    }
+
+    impl DelayedReadinessRuntime {
+        fn healthy_after(attempts: u8) -> Self {
+            Self {
+                ready_after: Some(attempts),
+                health_probes: Cell::new(0),
+                spawned: Cell::new(0),
+            }
+        }
+
+        fn never_healthy() -> Self {
+            Self {
+                ready_after: None,
+                health_probes: Cell::new(0),
+                spawned: Cell::new(0),
+            }
+        }
+    }
+
+    impl ServerRuntime for DelayedReadinessRuntime {
+        fn opencode_version(&self) -> Result<String, String> {
+            Ok("1.18.10".to_owned())
+        }
+
+        fn start_environment_hash(&self) -> String {
+            "environment".to_owned()
+        }
+
+        fn port_is_available(&self, _port: u16) -> bool {
+            true
+        }
+
+        fn probe_health(&self, _port: u16, _timeout: Duration) -> Result<ServerHealth, String> {
+            assert_eq!(self.spawned.get(), 1, "health is polled only after spawn");
+            let attempt = self.health_probes.get() + 1;
+            self.health_probes.set(attempt);
+            if self.ready_after.is_some_and(|ready| attempt >= ready) {
+                Ok(ServerHealth {
+                    version: "1.18.10".to_owned(),
+                })
+            } else {
+                Err("health connection failed: connection refused".to_owned())
+            }
+        }
+
+        fn spawn(&self, _port: u16, _log_path: &Path) -> Result<(), String> {
+            self.spawned.set(self.spawned.get() + 1);
+            Ok(())
+        }
+
+        fn warn(&self, _message: &str) {}
     }
 
     #[derive(Default)]
@@ -1161,16 +1336,18 @@ mod tests {
             true
         }
 
+        fn probe_health(&self, _port: u16, _timeout: Duration) -> Result<ServerHealth, String> {
+            Ok(ServerHealth {
+                version: "1.18.10".to_owned(),
+            })
+        }
+
         fn spawn(&self, port: u16, _log_path: &Path) -> Result<(), String> {
             self.spawned.fetch_add(1, Ordering::SeqCst);
             self.listeners
                 .lock()
                 .expect("listener lock")
                 .push(TcpListener::bind(("127.0.0.1", port)).map_err(|error| error.to_string())?);
-            Ok(())
-        }
-
-        fn wait_until_ready(&self, _port: u16, _timeout: Duration) -> Result<(), String> {
             Ok(())
         }
 
@@ -1255,11 +1432,11 @@ mod tests {
             panic!("a live post-lock record must be adopted")
         }
 
-        fn spawn(&self, _port: u16, _log_path: &Path) -> Result<(), String> {
+        fn probe_health(&self, _port: u16, _timeout: Duration) -> Result<ServerHealth, String> {
             panic!("a live post-lock record must be adopted")
         }
 
-        fn wait_until_ready(&self, _port: u16, _timeout: Duration) -> Result<(), String> {
+        fn spawn(&self, _port: u16, _log_path: &Path) -> Result<(), String> {
             panic!("a live post-lock record must be adopted")
         }
 
@@ -1352,17 +1529,19 @@ mod tests {
             port != 4098
         }
 
-        fn spawn(&self, port: u16, _log_path: &Path) -> Result<(), String> {
-            if port == 4096 {
-                Err("permission denied".to_owned())
+        fn probe_health(&self, port: u16, _timeout: Duration) -> Result<ServerHealth, String> {
+            if port == 4097 && !self.alternate_succeeds {
+                Err("final connect error: refused".to_owned())
             } else {
-                Ok(())
+                Ok(ServerHealth {
+                    version: "1.18.10".to_owned(),
+                })
             }
         }
 
-        fn wait_until_ready(&self, port: u16, _timeout: Duration) -> Result<(), String> {
-            if port == 4097 && !self.alternate_succeeds {
-                Err("final connect error: refused".to_owned())
+        fn spawn(&self, port: u16, _log_path: &Path) -> Result<(), String> {
+            if port == 4096 {
+                Err("permission denied".to_owned())
             } else {
                 Ok(())
             }
@@ -1411,12 +1590,12 @@ mod tests {
             self.inner.port_is_available(port)
         }
 
-        fn spawn(&self, port: u16, log_path: &Path) -> Result<(), String> {
-            self.inner.spawn(port, log_path)
+        fn probe_health(&self, port: u16, timeout: Duration) -> Result<ServerHealth, String> {
+            self.inner.probe_health(port, timeout)
         }
 
-        fn wait_until_ready(&self, port: u16, timeout: Duration) -> Result<(), String> {
-            self.inner.wait_until_ready(port, timeout)
+        fn spawn(&self, port: u16, log_path: &Path) -> Result<(), String> {
+            self.inner.spawn(port, log_path)
         }
 
         fn warn(&self, message: &str) {
@@ -1519,12 +1698,12 @@ mod tests {
             true
         }
 
-        fn spawn(&self, _port: u16, _log_path: &Path) -> Result<(), String> {
-            panic!("a warm record must not spawn")
+        fn probe_health(&self, _port: u16, _timeout: Duration) -> Result<ServerHealth, String> {
+            panic!("a warm record must not probe")
         }
 
-        fn wait_until_ready(&self, _port: u16, _timeout: Duration) -> Result<(), String> {
-            panic!("a warm record must not probe")
+        fn spawn(&self, _port: u16, _log_path: &Path) -> Result<(), String> {
+            panic!("a warm record must not spawn")
         }
 
         fn warn(&self, message: &str) {
