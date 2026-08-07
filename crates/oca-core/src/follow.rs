@@ -131,6 +131,18 @@ impl FollowOutcome {
     }
 }
 
+/// Outcomes for consumers that need only the attributed live turn boundary.
+///
+/// Unlike [`FollowOutcome`], a terminal boundary does not decode the worker's
+/// structured status. This is intended for display-lifetime ownership, where
+/// the target assistant completing before `session.idle` is sufficient.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FollowBoundaryOutcome {
+    Terminal,
+    Timeout,
+    ServerUnreachable,
+}
+
 /// A transport failure classified at the facade boundary.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum FollowTransportError {
@@ -276,6 +288,39 @@ where
     follow_until_terminal_from_cursor(transport, target, timeout, journal, None).await
 }
 
+/// Follows the live event stream until an attributed completed assistant
+/// message is followed by the target session's idle boundary.
+///
+/// History seeds attribution but cannot terminate this follow on its own. The
+/// worker's structured reply is deliberately not decoded, keeping display
+/// lifetime independent from multi-step reply classification.
+pub async fn follow_until_terminal_boundary<T, J>(
+    transport: &T,
+    target: &FollowTarget,
+    timeout: Option<Duration>,
+    journal: Option<&mut J>,
+) -> Result<FollowBoundaryOutcome, FollowError>
+where
+    T: FollowTransport,
+    J: EventJournalWriter,
+{
+    let outcome = follow_with_policy_and_cursor(
+        transport,
+        target,
+        timeout,
+        journal,
+        FollowPolicy::default(),
+        None,
+        FollowMode::LiveBoundary,
+    )
+    .await?;
+    Ok(match outcome {
+        RawFollowOutcome::Terminal(_) => FollowBoundaryOutcome::Terminal,
+        RawFollowOutcome::Timeout => FollowBoundaryOutcome::Timeout,
+        RawFollowOutcome::ServerUnreachable => FollowBoundaryOutcome::ServerUnreachable,
+    })
+}
+
 /// Follows one dispatch while resuming the event stream after a durable cursor.
 pub async fn follow_until_terminal_from_cursor<T, J>(
     transport: &T,
@@ -288,15 +333,18 @@ where
     T: FollowTransport,
     J: EventJournalWriter,
 {
-    follow_with_policy_and_cursor(
-        transport,
-        target,
-        timeout,
-        journal,
-        FollowPolicy::default(),
-        initial_cursor,
+    classify_outcome(
+        follow_with_policy_and_cursor(
+            transport,
+            target,
+            timeout,
+            journal,
+            FollowPolicy::default(),
+            initial_cursor,
+            FollowMode::Classified,
+        )
+        .await?,
     )
-    .await
 }
 
 /// Policy-injected form used for deterministic reconnect tests.
@@ -311,7 +359,46 @@ where
     T: FollowTransport,
     J: EventJournalWriter,
 {
-    follow_with_policy_and_cursor(transport, target, timeout, journal, policy, None).await
+    classify_outcome(
+        follow_with_policy_and_cursor(
+            transport,
+            target,
+            timeout,
+            journal,
+            policy,
+            None,
+            FollowMode::Classified,
+        )
+        .await?,
+    )
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FollowMode {
+    Classified,
+    LiveBoundary,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FollowRun {
+    mode: FollowMode,
+    has_explicit_timeout: bool,
+}
+
+enum RawFollowOutcome {
+    Terminal(FollowMessage),
+    Timeout,
+    ServerUnreachable,
+}
+
+fn classify_outcome(outcome: RawFollowOutcome) -> Result<FollowOutcome, FollowError> {
+    Ok(match outcome {
+        RawFollowOutcome::Terminal(message) => {
+            FollowOutcome::Terminal(terminal_from_message(message)?)
+        }
+        RawFollowOutcome::Timeout => FollowOutcome::Timeout,
+        RawFollowOutcome::ServerUnreachable => FollowOutcome::ServerUnreachable,
+    })
 }
 
 async fn follow_with_policy_and_cursor<T, J>(
@@ -321,7 +408,8 @@ async fn follow_with_policy_and_cursor<T, J>(
     journal: Option<&mut J>,
     policy: FollowPolicy,
     initial_cursor: Option<&str>,
-) -> Result<FollowOutcome, FollowError>
+    mode: FollowMode,
+) -> Result<RawFollowOutcome, FollowError>
 where
     T: FollowTransport,
     J: EventJournalWriter,
@@ -335,15 +423,18 @@ where
         policy,
         Arc::clone(&connection_failed),
         initial_cursor.map(str::to_owned),
-        has_explicit_timeout,
+        FollowRun {
+            mode,
+            has_explicit_timeout,
+        },
     );
     match timeout {
         Some(timeout) => match tokio::time::timeout(timeout, follow).await {
             Ok(result) => result,
             Err(_) if connection_failed.load(Ordering::Relaxed) => {
-                Ok(FollowOutcome::ServerUnreachable)
+                Ok(RawFollowOutcome::ServerUnreachable)
             }
-            Err(_) => Ok(FollowOutcome::Timeout),
+            Err(_) => Ok(RawFollowOutcome::Timeout),
         },
         None => follow.await,
     }
@@ -356,8 +447,8 @@ async fn follow_inner<T, J>(
     policy: FollowPolicy,
     connection_failed: Arc<AtomicBool>,
     initial_cursor: Option<String>,
-    has_explicit_timeout: bool,
-) -> Result<FollowOutcome, FollowError>
+    run: FollowRun,
+) -> Result<RawFollowOutcome, FollowError>
 where
     T: FollowTransport,
     J: EventJournalWriter,
@@ -372,7 +463,7 @@ where
         }
         Err(FollowTransportError::Unreachable { .. }) => {
             connection_failed.store(true, Ordering::Relaxed);
-            return Ok(FollowOutcome::ServerUnreachable);
+            return Ok(RawFollowOutcome::ServerUnreachable);
         }
         Err(error) => return Err(protocol_error(error)),
     };
@@ -384,13 +475,16 @@ where
         }
         Err(FollowTransportError::Unreachable { .. }) => {
             connection_failed.store(true, Ordering::Relaxed);
-            return Ok(FollowOutcome::ServerUnreachable);
+            return Ok(RawFollowOutcome::ServerUnreachable);
         }
         Err(FollowTransportError::HistoryRejected { .. }) => Vec::new(),
         Err(error) => return Err(protocol_error(error)),
     };
-    if let Some(terminal) = tracker.reconcile(messages)? {
-        return Ok(FollowOutcome::Terminal(terminal));
+    let reconciled = tracker.reconcile(messages, run.mode == FollowMode::Classified);
+    if run.mode == FollowMode::Classified
+        && let Some(message) = reconciled
+    {
+        return Ok(RawFollowOutcome::Terminal(message));
     }
 
     let mut reconnect_started = None;
@@ -421,8 +515,8 @@ where
                         .append(&event)
                         .map_err(|message| FollowError::Journal { message })?;
                 }
-                if let Some(terminal) = tracker.observe(&event)? {
-                    return Ok(FollowOutcome::Terminal(terminal));
+                if let Some(message) = tracker.observe(&event) {
+                    return Ok(RawFollowOutcome::Terminal(message));
                 }
             }
             stream_end @ (Ok(None) | Err(FollowTransportError::Unreachable { .. })) => {
@@ -436,8 +530,12 @@ where
                     match transport.messages(&target.session_id).await {
                         Ok(messages) => {
                             connection_failed.store(false, Ordering::Relaxed);
-                            if let Some(terminal) = tracker.reconcile(messages)? {
-                                return Ok(FollowOutcome::Terminal(terminal));
+                            let reconciled =
+                                tracker.reconcile(messages, run.mode == FollowMode::Classified);
+                            if run.mode == FollowMode::Classified
+                                && let Some(message) = reconciled
+                            {
+                                return Ok(RawFollowOutcome::Terminal(message));
                             }
                         }
                         Err(FollowTransportError::Unreachable { .. }) => {
@@ -451,8 +549,8 @@ where
                 if reconnect_attempts >= policy.max_reconnect_attempts
                     || reconnect_since.elapsed() >= policy.max_reconnect_elapsed
                 {
-                    if has_explicit_timeout && connection_failed.load(Ordering::Relaxed) {
-                        return Ok(FollowOutcome::ServerUnreachable);
+                    if run.has_explicit_timeout && connection_failed.load(Ordering::Relaxed) {
+                        return Ok(RawFollowOutcome::ServerUnreachable);
                     }
                     reconnect_started = Some(tokio::time::Instant::now());
                     reconnect_attempts = 0;
@@ -470,7 +568,7 @@ where
                 {
                     Ok(reconnected) => {
                         subscription = reconnected;
-                        if has_explicit_timeout {
+                        if run.has_explicit_timeout {
                             reconnect_started = None;
                             reconnect_attempts = 0;
                         }
@@ -536,16 +634,20 @@ impl<'a> TurnTracker<'a> {
     fn reconcile(
         &mut self,
         messages: Vec<FollowMessage>,
-    ) -> Result<Option<FollowTerminal>, FollowError> {
+        stop_at_first: bool,
+    ) -> Option<FollowMessage> {
         for message in messages {
             if self.is_attributed(&message) && message.completed {
-                return terminal_from_message(message).map(Some);
+                self.attributed = Some(message);
+                if stop_at_first {
+                    break;
+                }
             }
         }
-        Ok(None)
+        self.attributed.clone()
     }
 
-    fn observe(&mut self, event: &OcaEvent) -> Result<Option<FollowTerminal>, FollowError> {
+    fn observe(&mut self, event: &OcaEvent) -> Option<FollowMessage> {
         if let Some(message) = event.message.as_ref()
             && self.is_attributed(message)
             && message.completed
@@ -555,9 +657,9 @@ impl<'a> TurnTracker<'a> {
         if event.is_session_idle()
             && let Some(message) = self.attributed.take()
         {
-            return terminal_from_message(message).map(Some);
+            return Some(message);
         }
-        Ok(None)
+        None
     }
 
     fn is_attributed(&self, message: &FollowMessage) -> bool {
@@ -838,6 +940,56 @@ mod tests {
                 "session.idle"
             ],
             "the foreign idle must not end the follow on the incomplete snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_boundary_ignores_classifiable_history_and_waits_for_idle() {
+        let final_step = FollowMessage {
+            id: "assistant-final-step".to_owned(),
+            session_id: "ses_target".to_owned(),
+            parent_id: Some("msg_this_dispatch".to_owned()),
+            role: "assistant".to_owned(),
+            completed: true,
+            structured: None,
+            parts: vec![serde_json::json!({"type":"step-finish"})],
+            error: None,
+        };
+        let transport = ScriptedTransport {
+            subscriptions: Mutex::new(VecDeque::from([subscription([
+                Ok(Some(event("evt-busy", "session.busy", None))),
+                Ok(Some(event(
+                    "evt-final-step",
+                    "message.updated",
+                    Some(final_step),
+                ))),
+                Ok(Some(event("evt-still-busy", "session.busy", None))),
+                Ok(Some(event("evt-idle", "session.idle", None))),
+            ])])),
+            reconciliations: Mutex::new(VecDeque::from([Ok(vec![message(
+                "msg_this_dispatch",
+                "done",
+                true,
+            )])])),
+            cursors: Mutex::new(Vec::new()),
+        };
+        let mut journal = Journal::default();
+
+        let outcome =
+            follow_until_terminal_boundary(&transport, &target(), None, Some(&mut journal))
+                .await
+                .unwrap();
+
+        assert_eq!(outcome, FollowBoundaryOutcome::Terminal);
+        assert_eq!(
+            journal.0,
+            [
+                "session.busy",
+                "message.updated",
+                "session.busy",
+                "session.idle"
+            ],
+            "history and completed steps must not end the live display follow before idle"
         );
     }
 
@@ -1333,11 +1485,13 @@ mod tests {
                     initial_backoff: Duration::from_secs(1),
                 },
                 Some("evt-before-clean-eof"),
+                FollowMode::Classified,
             ),
         )
         .await
         .expect("the clean-stream regression test has a bounded wait")
         .unwrap();
+        let outcome = classify_outcome(outcome).unwrap();
 
         assert_eq!(outcome, FollowOutcome::Timeout);
         assert!(started.elapsed() >= requested_timeout);

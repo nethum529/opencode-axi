@@ -2,7 +2,9 @@
 
 use std::{path::Path, time::Duration};
 
-use oca_core::{DisplayMode, FollowOutcome, FollowTarget, RefId, follow_until_terminal};
+use oca_core::{
+    DisplayMode, FollowBoundaryOutcome, FollowTarget, RefId, follow_until_terminal_boundary,
+};
 use oca_display::{HerdrClient, TmuxClient};
 use oca_opencode::OpenCodeClient;
 use oca_server::ConnectOrStart;
@@ -129,7 +131,7 @@ async fn run_herdr_attach(
         .await
         .map_err(|error| error.to_string())?;
 
-    let attach_result = async {
+    let launch_result = async {
         herdr
             .agent_start(
                 &tab,
@@ -147,8 +149,17 @@ async fn run_herdr_attach(
             &command.reference,
             RefPatch::default().with_herdr_tab(tab.as_str()),
         )
-        .map_err(|error| format!("could not record herdr tab: {error}"))?;
+        .map_err(|error| format!("could not record herdr tab: {error}"))
+    }
+    .await;
+    if let Err(error) = launch_result {
+        // Before the tab id is durable, `oca k` cannot clean it up. A launch
+        // or persistence failure therefore retains best-effort local cleanup.
+        let _ = herdr.close_tab(&tab).await;
+        return Err(error);
+    }
 
+    let follow_result = async {
         let mut journal =
             EventJournal::create(turn.state_directory, turn.reference, turn.message_id)
                 .map_err(|error| format!("could not create event journal: {error}"))?;
@@ -157,7 +168,7 @@ async fn run_herdr_attach(
             message_id: turn.message_id.to_owned(),
             directory: turn.directory.to_owned(),
         };
-        follow_until_terminal::<_, EventJournal>(
+        follow_until_terminal_boundary::<_, EventJournal>(
             &OpenCodeClient::new(turn.base_url.clone()),
             &target,
             None,
@@ -168,18 +179,15 @@ async fn run_herdr_attach(
     }
     .await;
 
-    match attach_result {
-        Ok(FollowOutcome::Terminal(_)) if config.herdr.close_on_done => herdr
+    match follow_result {
+        Ok(FollowBoundaryOutcome::Terminal) if config.herdr.close_on_done => herdr
             .close_tab(&tab)
             .await
             .map_err(|error| error.to_string()),
         Ok(_) => Ok(()),
-        Err(error) => {
-            // A tab created before a launch or persistence failure would
-            // otherwise be orphaned. Cleanup remains best effort.
-            let _ = herdr.close_tab(&tab).await;
-            Err(error)
-        }
+        // The persisted tab remains explicitly killable when following fails;
+        // absence of a terminal boundary must never close a live worker tab.
+        Err(error) => Err(error),
     }
 }
 
@@ -197,7 +205,7 @@ async fn run_tmux_attach(command: &AttachCommand, turn: AttachTurn<'_>) -> Resul
             message_id: turn.message_id.to_owned(),
             directory: turn.directory.to_owned(),
         };
-        follow_until_terminal::<_, EventJournal>(
+        follow_until_terminal_boundary::<_, EventJournal>(
             &OpenCodeClient::new(turn.base_url.clone()),
             &target,
             None,
@@ -209,7 +217,7 @@ async fn run_tmux_attach(command: &AttachCommand, turn: AttachTurn<'_>) -> Resul
     .await;
 
     match follow_result {
-        Ok(FollowOutcome::Terminal(_)) => tmux
+        Ok(FollowBoundaryOutcome::Terminal) => tmux
             .close_window(&window)
             .map_err(|error| error.to_string()),
         Ok(_) => Ok(()),
