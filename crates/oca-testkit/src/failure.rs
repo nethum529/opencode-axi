@@ -18,6 +18,8 @@ pub enum FailureAction {
     Respond(HttpResponse),
     /// Return headers and the configured chunks, then close before the terminal chunk.
     RespondThenDrop(HttpResponse),
+    /// Return valid configured chunks followed by an invalid chunk-size line.
+    RespondThenGarble(HttpResponse),
     /// Return a session-history user message derived from the most recently
     /// captured asynchronous prompt. This preserves caller-minted message IDs.
     EchoPrompt { session_id: String },
@@ -123,6 +125,13 @@ impl FailureHttpServer {
                         return Err(error);
                     }
                 }
+                FailureAction::RespondThenGarble(response) => {
+                    if let Err(error) = write_garbled_response(&mut stream, &response)
+                        && !is_peer_disconnect(&error)
+                    {
+                        return Err(error);
+                    }
+                }
                 FailureAction::EchoPrompt { session_id } => {
                     let response = prompt_echo_response(&requests, &session_id)?;
                     if let Err(error) = write_http_response(&mut stream, &response)
@@ -219,4 +228,15 @@ fn write_incomplete_response(
             .map_err(ReplayHttpServerError::Io)?;
     }
     stream.flush().map_err(ReplayHttpServerError::Io)
+}
+
+fn write_garbled_response(
+    stream: &mut std::net::TcpStream,
+    response: &HttpResponse,
+) -> Result<(), ReplayHttpServerError> {
+    write_incomplete_response(stream, response)?;
+    stream
+        .write_all(b"not-a-chunk\r\n")
+        .and_then(|()| stream.flush())
+        .map_err(ReplayHttpServerError::Io)
 }

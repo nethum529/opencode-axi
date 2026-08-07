@@ -439,7 +439,7 @@ fn killed_running_phase_persists_production_intent_before_ref_materialization() 
 fn mid_sse_cut_keeps_the_admitted_prompt_exactly_once() {
     let (home, server) = fixture([
         respond(200, "application/json", br#"{"id":"ses_stream_cut"}"#),
-        FailureAction::RespondThenDrop(HttpResponse::new(
+        FailureAction::RespondThenGarble(HttpResponse::new(
             200,
             [("content-type", "text/event-stream")],
             [b": connected\n\n".to_vec()],

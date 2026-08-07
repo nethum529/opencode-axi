@@ -178,6 +178,8 @@ fn is_transport_loss(error: &reqwest::Error) -> bool {
 
     let mut source = error.source();
     while let Some(cause) = source {
+        // Abrupt HTTP body loss may be wrapped as an I/O EOF (for example,
+        // between chunk-size lines).
         if let Some(error) = cause.downcast_ref::<io::Error>()
             && matches!(
                 error.kind(),
@@ -187,6 +189,7 @@ fn is_transport_loss(error: &reqwest::Error) -> bool {
                     | io::ErrorKind::NotConnected
                     | io::ErrorKind::BrokenPipe
                     | io::ErrorKind::TimedOut
+                    | io::ErrorKind::UnexpectedEof
             )
         {
             return true;
