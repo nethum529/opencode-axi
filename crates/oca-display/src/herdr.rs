@@ -47,12 +47,12 @@ impl TabId {
     }
 }
 
-/// A herdr agent terminal identifier.
+/// The pane identifier where herdr started an agent.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AgentId(String);
 
 impl AgentId {
-    /// Returns the terminal identifier assigned by herdr.
+    /// Returns the pane identifier accepted by herdr's agent operations.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -216,10 +216,11 @@ impl HerdrClient {
                 }),
             )
             .await?;
-        Ok(AgentId(started.agent.terminal_id))
+        let _terminal_id = started.agent.terminal_id;
+        Ok(AgentId(tab.root_pane_id.clone()))
     }
 
-    /// Renames one running agent by its stable terminal identifier.
+    /// Renames one running agent by the pane where it was started.
     ///
     /// # Errors
     ///

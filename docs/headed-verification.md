@@ -22,9 +22,15 @@ required CI evidence; the live probe validates only the installed OpenCode/herdr
    prompt or turn and the worker's model string. A zero-token empty conversation is a failure.
 6. When that history request returns a non-200 response, assert `oca events <ref>` contains
    `oca.history.unreadable` and `oca f <ref>` prints the unreadable-history warning.
-7. Assert the tab remains open through intermediate completed steps and closes only at the terminal
-   idle boundary (or explicit `oca k` when configured not to auto-close).
+7. Assert the tab remains open through intermediate completed steps. The shared
+   `[herdr].close_on_done` policy applies to both backends: when `true`, herdr closes its tab and
+   tmux kills its window only for a `done` terminal state; `partial`, `blocked`, `failed`, and
+   `unclear` stay open with their marker visible. When `false`, every terminal state stays open on
+   both backends. `oca k <ref>` is the intended reaper for retained displays, so a tab strip that
+   accumulates non-done workers is expected captain-action state, not a leak.
 8. At the terminal idle boundary, assert the oca-owned surface exposes the outcome before any
-   configured close: herdr renames the compact slug with `-done` or `-fail` (truncating the base so
-   the full slug remains at most 32 characters), while tmux resets `@oca-identity` to the full
-   identity followed by ` | DONE` or ` | FAILED`.
+   configured close. Herdr renames the compact slug with `-done`, `-part`, `-blkd`, `-fail`, or
+   `-uncl` (truncating the base to 27 characters so the full slug remains at most 32 characters).
+   Tmux resets `@oca-identity` to the full identity followed by ` | DONE`, ` | PARTIAL`,
+   ` | BLOCKED`, ` | FAILED`, or ` | UNCLEAR`. A marker-write failure must remain visible in
+   `oca events <ref>` as `oca.display.unmarked` even though the detached helper's stderr is hidden.

@@ -6,6 +6,7 @@ use oca_state::{OcaConfig, RefRecord};
 use serde_json::json;
 
 pub(crate) const HISTORY_UNREADABLE_EVENT: &str = "oca.history.unreadable";
+pub(crate) const DISPLAY_UNMARKED_EVENT: &str = "oca.display.unmarked";
 
 const COMPOSER_GUARD: &str = "DO NOT TYPE: composer unbound";
 const HISTORY_IDENTITY_WARNING: &str = "HISTORY UNREADABLE";
@@ -95,6 +96,28 @@ pub(crate) fn journal_history_diagnostic<J: EventJournalWriter>(
     })
 }
 
+/// Records that a headed terminal reached a known state but its visible marker failed.
+pub(crate) fn journal_unmarked_display<J: EventJournalWriter>(
+    journal: &mut J,
+    session_id: &str,
+    backend: &str,
+    error: &str,
+) -> Result<(), String> {
+    journal.append(&OcaEvent {
+        id: None,
+        cursor: None,
+        kind: DISPLAY_UNMARKED_EVENT.to_owned(),
+        session_id: Some(session_id.to_owned()),
+        payload: Some(json!({
+            "backend": backend,
+            "condition": "terminal marker write failed",
+            "error": error,
+        })),
+        message: None,
+        known: true,
+    })
+}
+
 /// Builds the worker identity shown separately from the task-derived display label.
 pub(crate) fn worker_identity(
     reference: &str,
@@ -146,7 +169,10 @@ pub(crate) fn herdr_agent_name(reference: &str, record: &RefRecord, config: &Oca
 pub(crate) fn terminal_agent_name(base: &str, terminal: FollowBoundaryTerminal) -> String {
     let suffix = match terminal {
         FollowBoundaryTerminal::Done => "-done",
+        FollowBoundaryTerminal::Partial => "-part",
+        FollowBoundaryTerminal::Blocked => "-blkd",
         FollowBoundaryTerminal::Failed => "-fail",
+        FollowBoundaryTerminal::Unclear => "-uncl",
     };
     let mut name = base.to_owned();
     name.truncate(32 - suffix.len());
@@ -245,22 +271,17 @@ mod tests {
         let base = "w6h6mn-impl-review-an-extremely-";
         assert_eq!(base.len(), 32);
 
-        assert_eq!(
-            terminal_agent_name(base, FollowBoundaryTerminal::Done),
-            "w6h6mn-impl-review-an-extre-done"
-        );
-        assert_eq!(
-            terminal_agent_name(base, FollowBoundaryTerminal::Failed),
-            "w6h6mn-impl-review-an-extre-fail"
-        );
-        assert_eq!(
-            terminal_agent_name(base, FollowBoundaryTerminal::Done).len(),
-            32
-        );
-        assert_eq!(
-            terminal_agent_name(base, FollowBoundaryTerminal::Failed).len(),
-            32
-        );
+        for (terminal, suffix) in [
+            (FollowBoundaryTerminal::Done, "-done"),
+            (FollowBoundaryTerminal::Partial, "-part"),
+            (FollowBoundaryTerminal::Blocked, "-blkd"),
+            (FollowBoundaryTerminal::Failed, "-fail"),
+            (FollowBoundaryTerminal::Unclear, "-uncl"),
+        ] {
+            let name = terminal_agent_name(base, terminal);
+            assert_eq!(name, format!("w6h6mn-impl-review-an-extre{suffix}"));
+            assert_eq!(name.len(), 32);
+        }
     }
 
     #[test]

@@ -130,6 +130,37 @@ fn resets_the_identity_to_failed_for_an_errored_terminal_boundary() {
 }
 
 #[test]
+fn resets_the_identity_for_each_reply_backed_non_done_marker() {
+    let fixture = Fixture::new(0);
+    let client = TmuxClient::new(fixture.executable.as_os_str());
+    let window = client
+        .new_window(
+            "wabc12",
+            "fixParser",
+            WORKER_IDENTITY,
+            "http://127.0.0.1:4096/",
+            "ses_target",
+            &fixture.cwd,
+        )
+        .unwrap();
+
+    for (terminal, expected) in [
+        (FollowBoundaryTerminal::Partial, "PARTIAL"),
+        (FollowBoundaryTerminal::Blocked, "BLOCKED"),
+        (FollowBoundaryTerminal::Unclear, "UNCLEAR"),
+    ] {
+        client
+            .mark_terminal(&window, WORKER_IDENTITY, terminal)
+            .unwrap();
+        let calls = fixture.calls();
+        assert_eq!(
+            calls[calls.len() - 2],
+            format!("{WORKER_IDENTITY} | {expected}")
+        );
+    }
+}
+
+#[test]
 fn a_fake_tmux_failure_is_typed() {
     let fixture = Fixture::new(7);
     let error = TmuxClient::new(fixture.executable.as_os_str())

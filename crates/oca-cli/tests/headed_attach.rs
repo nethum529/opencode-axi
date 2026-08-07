@@ -191,7 +191,7 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
             "ses_headed_background"
         ])
     );
-    assert_eq!(calls[4]["params"]["target"], "term1");
+    assert_eq!(calls[4]["params"]["target"], "p1");
     assert!(
         calls[4]["params"]["name"]
             .as_str()
@@ -560,7 +560,7 @@ fn headed_attach_records_and_closes_the_tab_after_terminal_state() {
             .all(|argument| argument != "--read-only"),
         "T03 passed, so headed attach must remain shared-input"
     );
-    assert_eq!(calls[4]["params"]["target"], "term1");
+    assert_eq!(calls[4]["params"]["target"], "p1");
     assert_eq!(calls[4]["params"]["name"], "wabc12-impl-flash-high-done");
     assert_eq!(calls[5]["params"]["tab_id"], "t1");
 
@@ -602,7 +602,7 @@ fn terminal_rename_remains_visible_when_close_on_done_is_false() {
     opencode.join().unwrap();
     let calls = calls.lock().unwrap();
     assert_eq!(calls[4]["method"], "agent.rename");
-    assert_eq!(calls[4]["params"]["target"], "term1");
+    assert_eq!(calls[4]["params"]["target"], "p1");
     assert_eq!(calls[4]["params"]["name"], "wabc12-impl-flash-high-fail");
     assert!(
         calls.iter().all(|call| call["method"] != "tab.close"),
@@ -617,6 +617,40 @@ fn terminal_rename_remains_visible_when_close_on_done_is_false() {
             .as_deref(),
         Some("t1"),
         "terminal rename must not disturb the persisted tab id mapping"
+    );
+}
+
+#[test]
+fn blocked_reply_gets_blocked_marker_and_stays_open_with_close_on_done_enabled() {
+    let home = tempfile::tempdir().unwrap();
+    let socket = home.path().join("fake-herdr.sock");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let herdr = spawn_herdr_lifecycle(&socket, 1, false, Arc::clone(&calls));
+    let (port, opencode) = spawn_attach_opencode_state("blocked");
+    prepare_attach_home(home.path(), &socket, port, "herdr");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["__attach", "wabc12", "ses_target", "/worker", "sayHi"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "attach failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    herdr.join().unwrap();
+    opencode.join().unwrap();
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls[4]["method"], "agent.rename");
+    assert_eq!(calls[4]["params"]["target"], "p1");
+    assert_eq!(calls[4]["params"]["name"], "wabc12-impl-flash-high-blkd");
+    assert!(
+        calls.iter().all(|call| call["method"] != "tab.close"),
+        "close_on_done=true must retain a blocked worker for captain action"
     );
 }
 
@@ -659,6 +693,25 @@ fn a_failed_terminal_rename_still_closes_the_tab_it_could_not_mark() {
         ],
         "a marker oca could not publish must never strand the tab it was closing"
     );
+    drop(calls);
+
+    let events = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["events", "wabc12", "--json"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert!(events.status.success());
+    let page: Value = serde_json::from_slice(&events.stdout).unwrap();
+    let unmarked = page["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["kind"] == "oca.display.unmarked")
+        .expect("a marker failure must remain diagnosable after detached stderr is discarded");
+    let data: Value = serde_json::from_str(unmarked["data"].as_str().unwrap()).unwrap();
+    assert_eq!(data["backend"], "herdr");
+    assert_eq!(data["condition"], "terminal marker write failed");
 }
 
 #[test]
@@ -938,6 +991,53 @@ fn no_herdr_inside_tmux_creates_and_cleans_up_a_task_named_window() {
             ),
             "kill-window -t @42".to_owned(),
         ]
+    );
+}
+
+#[test]
+fn tmux_close_on_done_false_keeps_a_done_window_with_its_marker() {
+    let home = tempfile::tempdir().unwrap();
+    let missing_socket = home.path().join("missing-herdr.sock");
+    let tmux = FakeTmux::new(home.path());
+    let (port, opencode) = spawn_tmux_foreground_opencode();
+    prepare_dispatch_home(home.path(), &missing_socket, port);
+    fs::write(
+        home.path().join(".oca/config.toml"),
+        format!(
+            "[herdr]\nsocket = {}\nclose_on_done = false\n",
+            serde_json::to_string(&missing_socket.display().to_string()).unwrap()
+        ),
+    )
+    .unwrap();
+    let path = prepend_path(home.path());
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["luna:h", "keep", "done", "inside", "tmux"])
+        .env("HOME", home.path())
+        .env("TMUX", "fake-client")
+        .env("PATH", path)
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "dispatch failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let record = only_ref(home.path());
+    opencode.join().unwrap();
+    let calls = tmux.wait_for_calls(6);
+    assert_eq!(
+        calls.last().unwrap(),
+        &format!(
+            "set-option -w -t @42 @oca-identity {} | impl | openai/gpt-5.6-luna | high | DO NOT TYPE: composer unbound | DONE",
+            record.id
+        )
+    );
+    assert!(
+        calls.iter().all(|call| call != "kill-window -t @42"),
+        "close_on_done=false must retain even a done tmux window"
     );
 }
 
@@ -1480,6 +1580,10 @@ fn read_unix_request(stream: &UnixStream) -> Value {
 }
 
 fn spawn_attach_opencode(failed: bool) -> (u16, thread::JoinHandle<()>) {
+    spawn_attach_opencode_state(if failed { "failed" } else { "done" })
+}
+
+fn spawn_attach_opencode_state(state: &'static str) -> (u16, thread::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
@@ -1488,10 +1592,10 @@ fn spawn_attach_opencode(failed: bool) -> (u16, thread::JoinHandle<()>) {
             read_http_request(&mut probe).path,
             "/session/ses_target/message"
         );
-        let terminal_body = if failed {
+        let terminal_body = if state == "failed" {
             failed_terminal_messages("msg_dispatch")
         } else {
-            terminal_messages("msg_dispatch")
+            terminal_messages_with_status("msg_dispatch", state)
         };
         write_http_response(&mut probe, "200 OK", "application/json", &terminal_body);
 
@@ -2139,6 +2243,10 @@ fn spawn_tmux_foreground_opencode() -> (u16, thread::JoinHandle<()>) {
 }
 
 fn terminal_messages(parent_id: &str) -> String {
+    terminal_messages_with_status(parent_id, "done")
+}
+
+fn terminal_messages_with_status(parent_id: &str, status: &str) -> String {
     json!([{
         "info": {
             "id": "msg_assistant",
@@ -2148,7 +2256,7 @@ fn terminal_messages(parent_id: &str) -> String {
             "time": {"created":1,"completed":2},
             // Long enough to clear T27a's per-role reply floor, so this fixture
             // stays valid once the floor lands on the integration branch.
-            "structured": {"status":"done","files":[],"note":"Implemented the requested change and verified it end to end against the fake server fixture. All assertions pass, no regressions were observed, and the worker finished with no outstanding follow-up work."}
+            "structured": {"status":status,"files":[],"note":"Implemented the requested change and verified it end to end against the fake server fixture. All assertions pass, no regressions were observed, and the worker finished with no outstanding follow-up work."}
         },
         "parts": []
     }])

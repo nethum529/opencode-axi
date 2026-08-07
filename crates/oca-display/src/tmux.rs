@@ -155,7 +155,10 @@ impl TmuxClient {
     ) -> Result<(), TmuxError> {
         let marker = match terminal {
             FollowBoundaryTerminal::Done => "DONE",
+            FollowBoundaryTerminal::Partial => "PARTIAL",
+            FollowBoundaryTerminal::Blocked => "BLOCKED",
             FollowBoundaryTerminal::Failed => "FAILED",
+            FollowBoundaryTerminal::Unclear => "UNCLEAR",
         };
         self.set_window_option(
             window,
