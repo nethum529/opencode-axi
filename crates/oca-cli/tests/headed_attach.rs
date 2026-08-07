@@ -84,6 +84,22 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
     assert_eq!(event_page["total"], 1);
     assert_eq!(event_page["events"][0]["kind"], "session.busy");
 
+    assert_eq!(
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|call| call["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "workspace.list",
+            "workspace.create",
+            "tab.create",
+            "agent.start",
+        ],
+        "a completed structured intermediate step must not close the tab before idle"
+    );
+
     // Prove the journal is readable while the detached helper still owns the
     // live stream; only now may the fake worker emit its terminal boundary.
     release_terminal.store(true, Ordering::SeqCst);
@@ -115,6 +131,26 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
     assert_eq!(dispatched_message_id, message_id);
     assert_eq!(requests[4].body, Value::Null);
     assert_eq!(requests[6].body, Value::Null);
+
+    let final_events = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["events", reference, "--json"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+    assert!(final_events.status.success());
+    let final_page: Value = serde_json::from_slice(&final_events.stdout).unwrap();
+    assert_eq!(final_page["total"], 3);
+    assert_eq!(
+        final_page["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|event| event["kind"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["session.busy", "message.updated", "session.idle"],
+        "the detached helper must journal through the live terminal boundary"
+    );
 
     let calls = calls.lock().unwrap();
     assert_eq!(
@@ -493,6 +529,53 @@ fn headed_attach_records_and_closes_the_tab_after_terminal_state() {
     let record = ref_store(home.path()).resolve("wabc12").unwrap().unwrap();
     assert_eq!(record.display.as_deref(), Some("herdr"));
     assert_eq!(record.herdr_tab.as_deref(), Some("t1"));
+}
+
+#[test]
+fn a_follow_failure_keeps_the_persisted_tab_open_for_an_explicit_kill() {
+    let home = tempfile::tempdir().unwrap();
+    let socket = home.path().join("fake-herdr.sock");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let herdr = spawn_herdr_recording_calls_after_agent_start(&socket, Arc::clone(&calls));
+    let (port, opencode) = spawn_failing_history_opencode();
+    prepare_attach_home(home.path(), &socket, port, "herdr");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["__attach", "wabc12", "ses_target", "/worker"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+
+    let warning = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        warning.contains("could not follow worker terminal state"),
+        "the helper must have failed while following, not earlier: {warning}"
+    );
+    herdr.join().unwrap();
+    opencode.join().unwrap();
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "workspace.list",
+            "workspace.create",
+            "tab.create",
+            "agent.start",
+        ],
+        "the worker outlives its follower, so only a terminal boundary or `oca k` may close its tab"
+    );
+
+    let record = ref_store(home.path()).resolve("wabc12").unwrap().unwrap();
+    assert_eq!(
+        record.herdr_tab.as_deref(),
+        Some("t1"),
+        "`oca k` needs the persisted tab id to close a tab the follower abandoned"
+    );
 }
 
 #[test]
@@ -891,6 +974,62 @@ fn spawn_herdr_until_agent_start(
     })
 }
 
+/// Serves the launch sequence, then keeps answering so that any further call
+/// is recorded instead of being silently refused by a closed listener.
+fn spawn_herdr_recording_calls_after_agent_start(
+    socket: &Path,
+    calls: Arc<Mutex<Vec<Value>>>,
+) -> thread::JoinHandle<()> {
+    let listener = UnixListener::bind(socket).unwrap();
+    thread::spawn(move || {
+        accept_discovery_probe(&listener);
+        for index in 0..4 {
+            let mut stream = accept_unix_with_timeout(&listener);
+            let request = read_unix_request(&stream);
+            let request_id = request["id"].as_str().unwrap();
+            let result = match index {
+                0 => json!({"type":"workspace_list","workspaces":[]}),
+                1 => json!({
+                    "type":"workspace_created",
+                    "workspace":{"workspace_id":"w1","label":"oca"}
+                }),
+                2 => json!({
+                    "type":"tab_created",
+                    "tab":{"tab_id":"t1"},
+                    "root_pane":{"pane_id":"p1"}
+                }),
+                3 => json!({
+                    "type":"agent_started",
+                    "agent":{"terminal_id":"term1"}
+                }),
+                _ => unreachable!(),
+            };
+            writeln!(stream, "{}", json!({"id":request_id,"result":result})).unwrap();
+            calls.lock().unwrap().push(request);
+        }
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let request = read_unix_request(&stream);
+            let request_id = request["id"].as_str().unwrap();
+            writeln!(
+                stream,
+                "{}",
+                json!({"id":request_id,"result":{"type":"ok"}})
+            )
+            .unwrap();
+            calls.lock().unwrap().push(request);
+        }
+    })
+}
+
 fn spawn_herdr_with_attached_process(
     socket: &Path,
     fake_opencode: PathBuf,
@@ -1179,7 +1318,17 @@ fn spawn_attach_opencode() -> (u16, thread::JoinHandle<()>) {
             read_http_request(&mut event).path,
             "/event?directory=%2Fworker"
         );
-        write_http_response(&mut event, "200 OK", "text/event-stream", "");
+        let idle = json!({
+            "id": "evt_target_idle",
+            "type": "session.idle",
+            "properties": {"sessionID": "ses_target"}
+        });
+        write_http_response(
+            &mut event,
+            "200 OK",
+            "text/event-stream",
+            &format!("id: evt_target_idle\ndata: {idle}\n\n"),
+        );
 
         let (mut messages, _) = listener.accept().unwrap();
         assert_eq!(
@@ -1191,6 +1340,32 @@ fn spawn_attach_opencode() -> (u16, thread::JoinHandle<()>) {
             "200 OK",
             "application/json",
             &terminal_messages("msg_dispatch"),
+        );
+    });
+    (port, server)
+}
+
+fn spawn_failing_history_opencode() -> (u16, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut event, _) = listener.accept().unwrap();
+        assert_eq!(
+            read_http_request(&mut event).path,
+            "/event?directory=%2Fworker"
+        );
+        write_http_response(&mut event, "200 OK", "text/event-stream", "");
+
+        let (mut messages, _) = listener.accept().unwrap();
+        assert_eq!(
+            read_http_request(&mut messages).path,
+            "/session/ses_target/message"
+        );
+        write_http_response(
+            &mut messages,
+            "500 Internal Server Error",
+            "application/json",
+            &json!({"error": "history unavailable"}).to_string(),
         );
     });
     (port, server)
@@ -1210,6 +1385,7 @@ fn spawn_headed_background_opencode() -> (u16, thread::JoinHandle<Vec<HttpReques
         let mut message_id = None::<String>;
         let mut prompt_text = None::<String>;
         let mut event_subscriptions = 0;
+        let mut message_reads = 0;
         let mut event_handler = None;
 
         while requests.len() < 7 && started.elapsed() < Duration::from_secs(5) {
@@ -1271,11 +1447,18 @@ fn spawn_headed_background_opencode() -> (u16, thread::JoinHandle<Vec<HttpReques
                     .map(ToOwned::to_owned);
                 write_http_response(&mut stream, "204 No Content", "text/plain", "");
             } else if request.path == "/session/ses_headed_background/message" {
-                let body = user_messages(
-                    "ses_headed_background",
-                    message_id.as_deref().expect("prompt precedes messages"),
-                    prompt_text.as_deref().expect("prompt text was captured"),
-                );
+                message_reads += 1;
+                let body = if message_reads == 1 {
+                    user_messages(
+                        "ses_headed_background",
+                        message_id.as_deref().expect("prompt precedes messages"),
+                        prompt_text.as_deref().expect("prompt text was captured"),
+                    )
+                } else {
+                    running_multistep_messages(
+                        message_id.as_deref().expect("prompt precedes messages"),
+                    )
+                };
                 write_http_response(&mut stream, "200 OK", "application/json", &body);
             } else {
                 panic!("unexpected OpenCode request path: {}", request.path);
@@ -1478,6 +1661,25 @@ fn user_messages(session_id: &str, message_id: &str, prompt_text: &str) -> Strin
     .to_string()
 }
 
+fn running_multistep_messages(parent_id: &str) -> String {
+    json!([{
+        "info": {
+            "id": "msg_headed_intermediate",
+            "sessionID": "ses_headed_background",
+            "role": "assistant",
+            "parentID": parent_id,
+            "time": {"created": 2, "completed": 3},
+            "structured": {
+                "status": "done",
+                "files": [],
+                "note": "This structured payload belongs to an earlier tool-using assistant step while the worker remains busy. It must not be treated as the live display terminal boundary before the session idle event."
+            }
+        },
+        "parts": [{"type": "tool", "tool": "write"}]
+    }])
+    .to_string()
+}
+
 fn terminal_sse(parent_id: &str) -> String {
     let message = json!({
         "id": "evt_headed_message",
@@ -1489,12 +1691,7 @@ fn terminal_sse(parent_id: &str) -> String {
                 "sessionID": "ses_headed_background",
                 "role": "assistant",
                 "parentID": parent_id,
-                "time": {"created": 2, "completed": 3},
-                "structured": {
-                    "status": "done",
-                    "files": [],
-                    "note": "The headed background prompt landed in the authoritative server session, emitted an attributed terminal event, and completed through the detached production attach helper."
-                }
+                "time": {"created": 4, "completed": 5}
             }
         }
     });
