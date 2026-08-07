@@ -53,6 +53,8 @@ pub struct ModelDefinition {
     pub provider: String,
     pub model: String,
     pub ladder: Vec<String>,
+    /// Whether this catalog entry cannot be used by a dispatch that sends tools.
+    pub tooled_incompatible: bool,
 }
 
 pub type ModelEntry = ModelDefinition;
@@ -68,11 +70,18 @@ impl ModelDefinition {
             provider: provider.into(),
             model: model.into(),
             ladder: ladder.into_iter().map(Into::into).collect(),
+            tooled_incompatible: false,
         }
     }
 
     pub fn ladder(&self) -> impl Iterator<Item = &str> {
         self.ladder.iter().map(String::as_str)
+    }
+
+    #[must_use]
+    pub fn with_tooled_incompatible(mut self, value: bool) -> Self {
+        self.tooled_incompatible = value;
+        self
     }
 }
 
@@ -88,6 +97,7 @@ pub struct DefaultModelDefinition {
     pub model: &'static str,
     pub ladder: &'static [&'static str],
     pub synonyms: &'static [&'static str],
+    pub tooled_incompatible: bool,
 }
 
 /// The model aliases available before a user supplies configuration.
@@ -98,6 +108,7 @@ pub const DEFAULT_MODEL_DEFINITIONS: &[DefaultModelDefinition] = &[
         model: "gpt-5.6-luna",
         ladder: &["low", "medium", "high", "xhigh", "max"],
         synonyms: &[],
+        tooled_incompatible: false,
     },
     DefaultModelDefinition {
         alias: "sol",
@@ -105,6 +116,7 @@ pub const DEFAULT_MODEL_DEFINITIONS: &[DefaultModelDefinition] = &[
         model: "gpt-5.6-sol",
         ladder: &["low", "medium", "high", "xhigh", "max"],
         synonyms: &[],
+        tooled_incompatible: false,
     },
     DefaultModelDefinition {
         alias: "terra",
@@ -112,6 +124,7 @@ pub const DEFAULT_MODEL_DEFINITIONS: &[DefaultModelDefinition] = &[
         model: "gpt-5.6-terra",
         ladder: &["low", "medium", "high", "xhigh", "max"],
         synonyms: &[],
+        tooled_incompatible: false,
     },
     DefaultModelDefinition {
         alias: "flash",
@@ -119,6 +132,7 @@ pub const DEFAULT_MODEL_DEFINITIONS: &[DefaultModelDefinition] = &[
         model: "deepseek-v4-flash-free",
         ladder: &["high", "max"],
         synonyms: &["deepseek"],
+        tooled_incompatible: true,
     },
 ];
 
@@ -129,6 +143,7 @@ impl From<&DefaultModelDefinition> for ModelDefinition {
             definition.model,
             definition.ladder.iter().copied(),
         )
+        .with_tooled_incompatible(definition.tooled_incompatible)
     }
 }
 
@@ -302,6 +317,26 @@ pub struct ResolvedModel {
     pub model: String,
     pub effort: String,
     pub variant: String,
+    pub tooled_incompatible: bool,
+}
+
+impl ResolvedModel {
+    /// Reject this model before a dispatch opens a session or sends a prompt.
+    ///
+    /// The marker comes from the catalog entry rather than from a model-name
+    /// check, so a user configuration that replaces an alias gets normal
+    /// `ModelDefinition::new` behavior and is not blocked by the compiled
+    /// default's provider limitation.
+    pub fn validate_tooled(&self) -> Result<(), OcaError> {
+        if !self.tooled_incompatible {
+            return Ok(());
+        }
+
+        Err(OcaError::new(ErrorCode::ModelUnsupportedTooled).with_error(format!(
+            "{}: every variant is a thinking variant and the provider rejects tool use (tool_choice) in thinking mode; this alias cannot run tooled dispatches",
+            self.model
+        )))
+    }
 }
 
 /// Resolve an alias and its effort without opening a socket or consulting any
@@ -346,6 +381,7 @@ where
         model: definition.model.clone(),
         effort: requested_effort.to_string(),
         variant,
+        tooled_incompatible: definition.tooled_incompatible,
     })
 }
 

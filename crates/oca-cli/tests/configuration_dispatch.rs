@@ -57,6 +57,7 @@ efforts = ["max"]
     assert_eq!(dispatch.model.model, "override-model");
     assert_eq!(dispatch.model.effort, "max");
     assert_eq!(dispatch.model.variant, "max");
+    assert!(!dispatch.model.tooled_incompatible);
 
     let error = parse_from_home(["oca", "flash:high", "do", "the", "work"], home.path())
         .expect_err("the override removes high from flash's effort ladder");
@@ -67,7 +68,14 @@ efforts = ["max"]
 fn absent_configuration_preserves_default_dispatch() {
     let home = tempfile::tempdir().expect("temporary home");
 
+    let error = parse_from_home(["oca", "flash:high", "do the work"], home.path())
+        .expect_err("the compiled flash entry remains blocked for tooled dispatch");
+    assert_eq!(error.code(), ErrorCode::ModelUnsupportedTooled.as_str());
+
     for definition in DEFAULT_MODEL_DEFINITIONS {
+        if definition.tooled_incompatible {
+            continue;
+        }
         for effort in definition.ladder {
             let request = format!("{}:{effort}", definition.alias);
             let Command::Dispatch(dispatch) =

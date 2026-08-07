@@ -1,14 +1,14 @@
 //! Typed, durable access to the configuration that belongs to `oca`.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
     sync::OnceLock,
 };
 
-use oca_core::{DEFAULT_MODEL_DEFINITIONS, ModelCatalog, ModelDefinition};
+use oca_core::{DEFAULT_MODEL_DEFINITIONS, ModelCatalog, ModelDefinition, normalize_alias};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -210,11 +210,27 @@ impl OcaConfig {
     pub fn model_catalog(&self) -> ModelCatalog {
         let mut catalog = ModelCatalog::default();
         catalog.clear_synonyms();
+        let overridden_aliases = toml::from_str::<toml::Table>(&self.source)
+            .ok()
+            .and_then(|document| {
+                document
+                    .get("models")
+                    .and_then(toml::Value::as_table)
+                    .cloned()
+            })
+            .map(|models| models.keys().map(normalize_alias).collect::<BTreeSet<_>>())
+            .unwrap_or_default();
 
         for (alias, model) in &self.models {
+            let tooled_incompatible = !overridden_aliases.contains(&normalize_alias(alias))
+                && DEFAULT_MODEL_DEFINITIONS
+                    .iter()
+                    .find(|definition| normalize_alias(definition.alias) == normalize_alias(alias))
+                    .is_some_and(|definition| definition.tooled_incompatible);
             catalog.insert(
                 alias,
-                ModelDefinition::new(&model.provider, &model.model, &model.efforts),
+                ModelDefinition::new(&model.provider, &model.model, &model.efforts)
+                    .with_tooled_incompatible(tooled_incompatible),
             );
             for synonym in &model.synonyms {
                 catalog.insert_synonym(synonym, alias);

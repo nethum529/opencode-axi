@@ -37,10 +37,11 @@ const SPEC_LADDERS: [(&str, &str, &str, &[&str]); 4] = [
 /// spec-cli-surface.md, "Codes": code identifier and its frozen exit number.
 /// `herdr_unavailable` is omitted: it carries no exit number because it never
 /// fails a dispatch.
-const SPEC_CODES: [(&str, i32); 27] = [
+const SPEC_CODES: [(&str, i32); 28] = [
     ("effort_required", 2),
     ("effort_unsupported", 2),
     ("effort_conflict", 2),
+    ("model_unsupported_tooled", 2),
     ("invalid_model", 2),
     ("invalid_usage", 2),
     ("ref_not_found", 1),
