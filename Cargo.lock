@@ -663,7 +663,6 @@ dependencies = [
 name = "oca-opencode"
 version = "0.1.0"
 dependencies = [
- "hyper",
  "oca-core",
  "openapiv3",
  "prettyplease",
