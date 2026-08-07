@@ -73,8 +73,13 @@ pub async fn execute_message(
     let config = load_config(home)?;
     let context = ControlContext::from_record(&record, &config, command.effort.as_deref())?;
     let client = discovered_client(home, &config, &command.reference)?;
+    let directory = record.session_directory().ok_or_else(|| {
+        OcaError::new(ErrorCode::ProtocolMismatch)
+            .with_ref(&command.reference)
+            .with_error("the ref has no stored session directory")
+    })?;
     let mut subscription = client
-        .subscribe(None)
+        .subscribe(directory, None)
         .await
         .map(DispatchSubscription::new)
         .map_err(|error| open_code_error(error).with_ref(&command.reference))?;

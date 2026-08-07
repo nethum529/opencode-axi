@@ -540,8 +540,21 @@ impl ForegroundBackend for ProductionBackend {
     }
 
     async fn subscribe(&mut self) -> Result<Self::Subscription, OcaError> {
+        let directory = if self.worktree.is_some() {
+            self.dispatch_cwd
+                .as_deref()
+                .ok_or_else(|| {
+                    OcaError::new(ErrorCode::ProtocolMismatch).with_error(
+                        "OpenCode subscription opened before the session directory was set",
+                    )
+                })?
+                .display()
+                .to_string()
+        } else {
+            self.scope.repo.clone()
+        };
         self.client()?
-            .subscribe(None)
+            .subscribe(&directory, None)
             .await
             .map(DispatchSubscription::new)
             .map_err(open_code_error)

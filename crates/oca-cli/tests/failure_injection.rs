@@ -160,6 +160,7 @@ fn post_transmit_pre_response_cut_never_replays_and_persists_unknown_ref() {
         "the explicit resend command must be named"
     );
     assert_eq!(routes(&recovery_requests), ["event", "messages"]);
+    assert_eq!(request_directory(&recovery_requests[0].path), home.path());
     assert!(
         !routes(&recovery_requests).contains(&"prompt_async"),
         "fresh reconciliation must never resend the uncertain prompt"
@@ -545,7 +546,7 @@ fn every_429_is_terminal_rate_limited_with_retry_metadata_and_no_replay() {
             role: Some("impl".to_owned()),
             cwd: Some(home.path().display().to_string()),
             last_state: Some(RefState::Running),
-            repo: None,
+            repo: Some(home.path().display().to_string()),
             spawner_tag: None,
             worktree: None,
             branch: None,
@@ -851,6 +852,16 @@ fn routes(requests: &[oca_testkit::HttpRequest]) -> Vec<&'static str> {
             }
         })
         .collect()
+}
+
+fn request_directory(path: &str) -> std::path::PathBuf {
+    url::Url::parse(&format!("http://localhost{path}"))
+        .unwrap()
+        .query_pairs()
+        .find_map(|(key, value)| {
+            (key == "directory").then(|| std::path::PathBuf::from(value.as_ref()))
+        })
+        .expect("directory query")
 }
 
 fn stored_refs(home: &tempfile::TempDir) -> Vec<RefRecord> {

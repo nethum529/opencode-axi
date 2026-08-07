@@ -101,6 +101,14 @@ pub async fn execute_follow(
     let target = FollowTarget {
         session_id: record.session_id.clone(),
         message_id,
+        directory: record
+            .session_directory()
+            .ok_or_else(|| {
+                OcaError::new(ErrorCode::ProtocolMismatch)
+                    .with_ref(&command.reference)
+                    .with_error("the ref has no stored session directory")
+            })?
+            .to_owned(),
     };
     let timeout = command.timeout_seconds.map(Duration::from_secs);
     let outcome = follow_until_terminal_from_cursor(

@@ -20,6 +20,7 @@ use crate::{FollowExit, WorkerState};
 pub struct FollowTarget {
     pub session_id: String,
     pub message_id: String,
+    pub directory: String,
 }
 
 /// A projected assistant message used for terminal attribution and reply decoding.
@@ -192,6 +193,7 @@ pub trait FollowTransport: Sync {
 
     fn subscribe(
         &self,
+        directory: &str,
         last_event_id: Option<&str>,
     ) -> impl Future<Output = Result<Self::Subscription, FollowTransportError>> + Send;
 
@@ -360,7 +362,10 @@ where
     T: FollowTransport,
     J: EventJournalWriter,
 {
-    let mut subscription = match transport.subscribe(initial_cursor.as_deref()).await {
+    let mut subscription = match transport
+        .subscribe(&target.directory, initial_cursor.as_deref())
+        .await
+    {
         Ok(subscription) => {
             connection_failed.store(false, Ordering::Relaxed);
             subscription
@@ -459,7 +464,10 @@ where
                 let delay = reconnect_delay(policy, reconnect_attempts, reconnect_elapsed);
                 tokio::time::sleep(delay).await;
                 reconnect_attempts += 1;
-                match transport.subscribe(last_event_id.as_deref()).await {
+                match transport
+                    .subscribe(&target.directory, last_event_id.as_deref())
+                    .await
+                {
                     Ok(reconnected) => {
                         subscription = reconnected;
                         if has_explicit_timeout {
@@ -584,7 +592,7 @@ mod tests {
     struct ScriptedTransport {
         subscriptions: Mutex<VecDeque<Result<ScriptedSubscription, FollowTransportError>>>,
         reconciliations: Mutex<VecDeque<Result<Vec<FollowMessage>, FollowTransportError>>>,
-        cursors: Mutex<Vec<Option<String>>>,
+        cursors: Mutex<Vec<(String, Option<String>)>>,
     }
 
     struct ScriptedSubscription {
@@ -609,12 +617,13 @@ mod tests {
 
         async fn subscribe(
             &self,
+            directory: &str,
             last_event_id: Option<&str>,
         ) -> Result<Self::Subscription, FollowTransportError> {
             self.cursors
                 .lock()
                 .unwrap()
-                .push(last_event_id.map(str::to_owned));
+                .push((directory.to_owned(), last_event_id.map(str::to_owned)));
             self.subscriptions.lock().unwrap().pop_front().unwrap()
         }
 
@@ -653,6 +662,7 @@ mod tests {
 
         async fn subscribe(
             &self,
+            _directory: &str,
             _last_event_id: Option<&str>,
         ) -> Result<Self::Subscription, FollowTransportError> {
             self.subscriptions.fetch_add(1, AtomicOrdering::Relaxed);
@@ -689,6 +699,7 @@ mod tests {
         FollowTarget {
             session_id: "ses_target".to_owned(),
             message_id: "msg_this_dispatch".to_owned(),
+            directory: "/repo".to_owned(),
         }
     }
 
@@ -940,7 +951,10 @@ mod tests {
         assert_eq!(outcome.exit(), FollowExit::Blocked);
         assert_eq!(
             *transport.cursors.lock().unwrap(),
-            [None, Some("evt-1".to_owned())]
+            [
+                ("/repo".to_owned(), None),
+                ("/repo".to_owned(), Some("evt-1".to_owned()))
+            ]
         );
         assert!(transport.reconciliations.lock().unwrap().is_empty());
     }
@@ -974,7 +988,7 @@ mod tests {
         assert_eq!(outcome.exit(), FollowExit::Success);
         assert_eq!(
             transport.cursors.lock().unwrap().as_slice(),
-            [Some("evt-before-crash".to_owned())]
+            [("/repo".to_owned(), Some("evt-before-crash".to_owned()))]
         );
     }
 
@@ -999,7 +1013,10 @@ mod tests {
 
         assert_eq!(outcome.exit(), FollowExit::Success);
         assert!(transport.reconciliations.lock().unwrap().is_empty());
-        assert_eq!(*transport.cursors.lock().unwrap(), [None]);
+        assert_eq!(
+            *transport.cursors.lock().unwrap(),
+            [("/repo".to_owned(), None)]
+        );
     }
 
     #[tokio::test]
@@ -1082,9 +1099,9 @@ mod tests {
         assert_eq!(
             transport.cursors.lock().unwrap().as_slice(),
             [
-                None,
-                Some("evt-progress-1".to_owned()),
-                Some("evt-progress-2".to_owned())
+                ("/repo".to_owned(), None),
+                ("/repo".to_owned(), Some("evt-progress-1".to_owned())),
+                ("/repo".to_owned(), Some("evt-progress-2".to_owned()))
             ],
             "every reconnect must resume from the last observed cursor"
         );
@@ -1203,7 +1220,11 @@ mod tests {
         assert_eq!(outcome.exit(), FollowExit::Blocked);
         assert_eq!(
             transport.cursors.lock().unwrap().as_slice(),
-            [None, None, None]
+            [
+                ("/repo".to_owned(), None),
+                ("/repo".to_owned(), None),
+                ("/repo".to_owned(), None)
+            ]
         );
     }
 
@@ -1250,7 +1271,11 @@ mod tests {
         );
         assert_eq!(
             transport.cursors.lock().unwrap().as_slice(),
-            [None, None, None],
+            [
+                ("/repo".to_owned(), None),
+                ("/repo".to_owned(), None),
+                ("/repo".to_owned(), None)
+            ],
             "the follow loop must reconnect past its old cumulative attempt cap"
         );
     }

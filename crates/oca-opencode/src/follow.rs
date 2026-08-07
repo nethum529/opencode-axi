@@ -150,9 +150,10 @@ impl FollowTransport for OpenCodeClient {
 
     async fn subscribe(
         &self,
+        directory: &str,
         last_event_id: Option<&str>,
     ) -> Result<Self::Subscription, FollowTransportError> {
-        OpenCodeClient::subscribe(self, last_event_id)
+        OpenCodeClient::subscribe(self, directory, last_event_id)
             .await
             .map_err(map_client_error)
     }

@@ -97,16 +97,18 @@ fn headed_background_dispatch_lands_prompt_before_real_detached_attach_and_event
         [
             requests[0].path.as_str(),
             requests[1].path.as_str(),
-            "/event",
+            requests[2].path.as_str(),
             "/session/ses_headed_background/prompt_async",
             "/session/ses_headed_background/message",
-            "/event",
+            requests[5].path.as_str(),
             "/session/ses_headed_background/message",
         ],
         "headed background admission must confirm the user message before spawning the helper"
     );
     assert!(requests[0].path.starts_with("/agent?directory="));
     assert!(requests[1].path.starts_with("/session?directory="));
+    assert!(requests[2].path.starts_with("/event?directory="));
+    assert!(requests[5].path.starts_with("/event?directory="));
     let dispatched_message_id = requests[3].body["messageID"]
         .as_str()
         .expect("prompt carries a caller message id");
@@ -340,7 +342,7 @@ fn headed_background_sse_confirms_prompt_when_history_rejects_its_stored_record(
     assert_eq!(
         requests
             .iter()
-            .filter(|request| request.path == "/event")
+            .filter(|request| request.path.starts_with("/event?directory="))
             .count(),
         2,
         "the admission stream must be followed by the detached event stream"
@@ -1019,7 +1021,7 @@ fn spawn_background_abort_opencode(tab_closed: Arc<AtomicBool>) -> (u16, thread:
                         "application/json",
                         r#"{"id":"ses_target"}"#,
                     );
-                } else if request.path == "/event" {
+                } else if request.path.starts_with("/event?directory=") {
                     let index = event_count.fetch_add(1, Ordering::SeqCst);
                     if index == 0 {
                         write_http_response(&mut stream, "200 OK", "text/event-stream", "");
@@ -1173,7 +1175,10 @@ fn spawn_attach_opencode() -> (u16, thread::JoinHandle<()>) {
     let port = listener.local_addr().unwrap().port();
     let server = thread::spawn(move || {
         let (mut event, _) = listener.accept().unwrap();
-        assert_eq!(read_http_request(&mut event).path, "/event");
+        assert_eq!(
+            read_http_request(&mut event).path,
+            "/event?directory=%2Fworker"
+        );
         write_http_response(&mut event, "200 OK", "text/event-stream", "");
 
         let (mut messages, _) = listener.accept().unwrap();
@@ -1236,7 +1241,7 @@ fn spawn_headed_background_opencode() -> (u16, thread::JoinHandle<Vec<HttpReques
                     "application/json",
                     r#"{"id":"ses_headed_background"}"#,
                 );
-            } else if request.path == "/event" {
+            } else if request.path.starts_with("/event?directory=") {
                 if event_subscriptions == 0 {
                     write_http_response(&mut stream, "200 OK", "text/event-stream", "");
                 } else {
@@ -1331,7 +1336,7 @@ fn spawn_poisoned_history_opencode() -> (u16, thread::JoinHandle<Vec<HttpRequest
                     "application/json",
                     r#"{"id":"ses_poisoned"}"#,
                 );
-            } else if request.path == "/event" {
+            } else if request.path.starts_with("/event?directory=") {
                 if event_subscriptions == 0 {
                     let message_id = Arc::clone(&message_id);
                     let history_reads = Arc::clone(&history_reads);
@@ -1434,7 +1439,7 @@ fn spawn_unconfirmed_prompt_opencode(
                     "application/json",
                     r#"{"id":"ses_unconfirmed"}"#,
                 );
-            } else if request.path == "/event" {
+            } else if request.path.starts_with("/event?directory=") {
                 write_http_response(&mut stream, "200 OK", "text/event-stream", "");
             } else if request.path == "/session/ses_unconfirmed/prompt_async" {
                 write_http_response(&mut stream, "204 No Content", "text/plain", "");
@@ -1608,7 +1613,7 @@ fn spawn_foreground_opencode() -> (u16, thread::JoinHandle<()>) {
                     );
                 }
                 2 => {
-                    assert_eq!(request.path, "/event");
+                    assert!(request.path.starts_with("/event?directory="));
                     write_http_response(
                         &mut stream,
                         "200 OK",
@@ -1688,7 +1693,7 @@ fn spawn_tmux_foreground_opencode() -> (u16, thread::JoinHandle<()>) {
                     "application/json",
                     r#"{"id":"ses_target"}"#,
                 );
-            } else if request.path == "/event" {
+            } else if request.path.starts_with("/event?directory=") {
                 write_http_response(
                     &mut stream,
                     "200 OK",
@@ -1761,7 +1766,7 @@ fn prepare_attach_home(home: &Path, socket: &Path, port: u16, display: &str) {
             role: Some("impl".to_owned()),
             cwd: Some("/worker".to_owned()),
             last_state: Some(RefState::Running),
-            repo: None,
+            repo: Some("/worker".to_owned()),
             spawner_tag: None,
             worktree: None,
             branch: None,

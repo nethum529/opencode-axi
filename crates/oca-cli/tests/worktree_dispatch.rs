@@ -17,6 +17,40 @@ struct CapturedRequest {
 }
 
 #[test]
+fn worktree_dispatch_confirms_from_directory_scoped_events_when_history_is_poisoned() {
+    let repository = TestRepository::new();
+    let home = tempfile::tempdir().expect("temporary home");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
+    let port = listener.local_addr().unwrap().port();
+    prepare_home(home.path(), port);
+    let server = thread::spawn(move || serve_directory_scoped_worktree(listener));
+
+    let output = run_oca(
+        home.path(),
+        repository.path(),
+        [
+            "luna:h",
+            "-w",
+            "--headless",
+            "prove",
+            "directory-scoped",
+            "event",
+            "confirmation",
+        ],
+    );
+    server.join().expect("fake server completes");
+
+    assert_success(&output);
+    let record = only_stored_ref(home.path());
+    assert_eq!(record["last_state"], "done");
+    let worktree = PathBuf::from(record["worktree"].as_str().unwrap());
+    assert_eq!(
+        std::fs::read(worktree.join("worker.txt")).unwrap(),
+        b"done\n"
+    );
+}
+
+#[test]
 fn partial_dispatch_and_second_oca_m_create_two_original_prompt_commits() {
     let repository = TestRepository::new();
     let home = tempfile::tempdir().expect("temporary home");
@@ -291,6 +325,106 @@ enum InvalidReply {
 enum ReviewReply {
     Valid,
     FloorInvalid,
+}
+
+fn serve_directory_scoped_worktree(listener: TcpListener) {
+    let (mut stream, _) = listener.accept().expect("agent request arrives");
+    let request = read_request(&mut stream);
+    let worktree = session_directory(&request.path);
+    assert!(worktree.join(".git").exists());
+    write_response(
+        &mut stream,
+        "200 OK",
+        "application/json",
+        r#"[{"name":"impl"}]"#,
+    );
+
+    let (mut stream, _) = listener.accept().expect("session request arrives");
+    let request = read_request(&mut stream);
+    assert_eq!(session_directory(&request.path), worktree);
+    write_response(
+        &mut stream,
+        "200 OK",
+        "application/json",
+        r#"{"id":"ses_directory_scoped"}"#,
+    );
+
+    let (mut events, _) = listener.accept().expect("event subscription arrives");
+    let subscription = read_request(&mut events);
+    let subscription_directory = url::Url::parse(&format!("http://localhost{}", subscription.path))
+        .unwrap()
+        .query_pairs()
+        .find_map(|(key, value)| (key == "directory").then(|| PathBuf::from(value.as_ref())));
+    write!(
+        events,
+        "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n"
+    )
+    .unwrap();
+    events.flush().unwrap();
+
+    let (mut stream, _) = listener.accept().expect("prompt request arrives");
+    let prompt = read_request(&mut stream);
+    assert_eq!(prompt.path, "/session/ses_directory_scoped/prompt_async");
+    let message_id = prompt.body["messageID"].as_str().unwrap().to_owned();
+    std::fs::write(worktree.join("worker.txt"), "done\n").unwrap();
+    write_response(&mut stream, "204 No Content", "text/plain", "");
+
+    let (mut stream, history) = accept_request(&listener, "history fallback");
+    assert_eq!(history.path, "/session/ses_directory_scoped/message");
+    write_response(
+        &mut stream,
+        "400 Bad Request",
+        "application/json",
+        r#"{"error":"Expected OutputFormatJsonSchema, got retryCount"}"#,
+    );
+
+    if subscription_directory.as_deref() == Some(worktree.as_path()) {
+        let user = json!({
+            "type":"message.updated",
+            "properties":{"info":{
+                "id":message_id,
+                "sessionID":"ses_directory_scoped",
+                "role":"user"
+            }}
+        });
+        let assistant = json!({
+            "type":"message.updated",
+            "properties":{"info":{
+                "id":"msg_directory_scoped_reply",
+                "sessionID":"ses_directory_scoped",
+                "parentID":message_id,
+                "role":"assistant",
+                "time":{"created":1,"completed":2},
+                "structured":{
+                    "status":"done",
+                    "files":["worker.txt"],
+                    "note":"Implemented directory-scoped event confirmation in the isolated worktree while preserving exact dispatch attribution and the existing admission sequence. Verified the completed worker output is durable, correctly scoped, and ready for review."
+                }
+            }}
+        });
+        let idle = json!({
+            "type":"session.idle",
+            "properties":{"sessionID":"ses_directory_scoped"}
+        });
+        write!(events, "id: evt_user\ndata: {user}\n\n").unwrap();
+        events.flush().unwrap();
+        thread::sleep(Duration::from_millis(100));
+        write!(
+            events,
+            "id: evt_reply\ndata: {assistant}\n\nid: evt_idle\ndata: {idle}\n\n"
+        )
+        .unwrap();
+        events.flush().unwrap();
+
+        let (mut stream, reconciliation) = accept_request(&listener, "pre-follow reconciliation");
+        assert_eq!(reconciliation.path, "/session/ses_directory_scoped/message");
+        write_response(
+            &mut stream,
+            "400 Bad Request",
+            "application/json",
+            r#"{"error":"Expected OutputFormatJsonSchema, got retryCount"}"#,
+        );
+    }
 }
 
 fn serve_partial_then_review(listener: TcpListener, review: ReviewReply) {
@@ -695,6 +829,20 @@ fn session_directory(path: &str) -> PathBuf {
         .query_pairs()
         .find_map(|(key, value)| (key == "directory").then(|| PathBuf::from(value.as_ref())))
         .expect("session directory query")
+}
+
+fn accept_request(listener: &TcpListener, label: &str) -> (TcpStream, CapturedRequest) {
+    loop {
+        let (mut stream, _) = listener
+            .accept()
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
+        let mut first = [0_u8; 1];
+        if stream.peek(&mut first).unwrap_or(0) == 0 {
+            continue;
+        }
+        let request = read_request(&mut stream);
+        return (stream, request);
+    }
 }
 
 fn read_request(stream: &mut TcpStream) -> CapturedRequest {

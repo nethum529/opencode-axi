@@ -71,6 +71,14 @@ pub struct RefRecord {
     pub tombstoned: bool,
 }
 
+impl RefRecord {
+    /// Returns the OpenCode project directory that owns this ref's session.
+    #[must_use]
+    pub fn session_directory(&self) -> Option<&str> {
+        self.worktree.as_deref().or(self.repo.as_deref())
+    }
+}
+
 /// Values used to create a new ref.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct NewRef {

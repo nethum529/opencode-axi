@@ -26,6 +26,15 @@ fn end_to_end_foreground_has_one_turn_one_terminal_and_one_golden_final_result()
     let server = thread::spawn(move || serve_foreground(listener));
 
     let home = tempfile::tempdir().expect("temporary home");
+    assert!(
+        Command::new("git")
+            .args(["-C", home.path().to_str().unwrap(), "init", "--quiet"])
+            .status()
+            .expect("git init runs")
+            .success()
+    );
+    let nested = home.path().join("nested");
+    std::fs::create_dir(&nested).expect("nested dispatch directory");
     let state = home.path().join(".oca");
     std::fs::create_dir(&state).expect("state directory");
     std::fs::write(
@@ -42,7 +51,7 @@ fn end_to_end_foreground_has_one_turn_one_terminal_and_one_golden_final_result()
     let output = Command::new(env!("CARGO_BIN_EXE_oca"))
         .args(["luna:h", "--headless", "implement", "the", "ticket"])
         .env("HOME", home.path())
-        .current_dir(home.path())
+        .current_dir(&nested)
         .output()
         .expect("oca runs");
     let trace = server.join().expect("fake server completes");
@@ -67,6 +76,9 @@ fn end_to_end_foreground_has_one_turn_one_terminal_and_one_golden_final_result()
             "messages"
         ]
     );
+    assert_eq!(request_directory(&trace[0].path), nested);
+    assert_eq!(request_directory(&trace[1].path), nested);
+    assert_eq!(request_directory(&trace[2].path), home.path());
 
     let create = &trace[1].body;
     let permission = create["permission"].as_array().expect("permission ruleset");
@@ -102,7 +114,8 @@ fn end_to_end_foreground_has_one_turn_one_terminal_and_one_golden_final_result()
     assert_eq!(refs[0]["alias"], "luna");
     assert_eq!(refs[0]["effort"], "high");
     assert_eq!(refs[0]["role"], "impl");
-    assert_eq!(refs[0]["cwd"], home.path().display().to_string());
+    assert_eq!(refs[0]["cwd"], nested.display().to_string());
+    assert_eq!(refs[0]["repo"], home.path().display().to_string());
     assert_eq!(refs[0]["last_state"], "done");
     assert!(
         IntentStore::in_directory(&state).list().unwrap().is_empty(),
@@ -167,6 +180,9 @@ fn foreground_uses_terminal_sse_when_session_history_is_poisoned() {
         ],
         "prompt confirmation and one-shot reconciliation may read poisoned history, but terminal SSE must avoid another read"
     );
+    for request in &trace[..3] {
+        assert_eq!(request_directory(&request.path), home.path());
+    }
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
     assert!(stdout.contains("state: completed"));
     assert!(stdout.contains("outcome: success"));
@@ -195,7 +211,7 @@ fn serve_poisoned_foreground(listener: TcpListener) -> Vec<CapturedRequest> {
                 "application/json",
                 r#"{"id":"ses_poisoned_foreground"}"#,
             );
-        } else if request.path == "/event" {
+        } else if request.path.starts_with("/event?directory=") {
             let event_message_id = Arc::clone(&message_id);
             let event_history_reads = Arc::clone(&history_reads);
             event_handler = Some(thread::spawn(move || {
@@ -288,6 +304,16 @@ fn wait_until(timeout: Duration, condition: impl Fn() -> bool) {
     }
 }
 
+fn request_directory(path: &str) -> std::path::PathBuf {
+    url::Url::parse(&format!("http://localhost{path}"))
+        .unwrap()
+        .query_pairs()
+        .find_map(|(key, value)| {
+            (key == "directory").then(|| std::path::PathBuf::from(value.as_ref()))
+        })
+        .expect("directory query")
+}
+
 fn serve_foreground(listener: TcpListener) -> Vec<CapturedRequest> {
     let mut captured = Vec::new();
     let mut message_id = None;
@@ -314,7 +340,7 @@ fn serve_foreground(listener: TcpListener) -> Vec<CapturedRequest> {
                 );
             }
             2 => {
-                assert_eq!(request.path, "/event");
+                assert!(request.path.starts_with("/event?directory="));
                 let event = concat!(
                     "id: evt_terminal\n",
                     "event: session.idle\n",
@@ -369,7 +395,7 @@ fn route(path: &str) -> &'static str {
         "agents"
     } else if path.starts_with("/session?") {
         "session"
-    } else if path == "/event" {
+    } else if path.starts_with("/event?directory=") {
         "event"
     } else if path.ends_with("/prompt_async") {
         "prompt_async"

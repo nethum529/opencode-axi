@@ -146,7 +146,7 @@ fn serve_background_then_follow(listener: TcpListener) -> Vec<CapturedRequest> {
                 );
             }
             2 | 5 => {
-                assert_eq!(request.path, "/event");
+                assert!(request.path.starts_with("/event?directory="));
                 write_response(&mut stream, "200 OK", "text/event-stream", "");
             }
             3 => {
@@ -197,7 +197,7 @@ fn route(path: &str) -> &'static str {
         "agents"
     } else if path.starts_with("/session?") {
         "session"
-    } else if path == "/event" {
+    } else if path.starts_with("/event?directory=") {
         // Request order distinguishes dispatch ownership from follow ownership.
         "event"
     } else if path.ends_with("/prompt_async") {
