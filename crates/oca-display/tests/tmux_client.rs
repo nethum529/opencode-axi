@@ -3,7 +3,7 @@
 use std::{
     fs,
     os::unix::fs::PermissionsExt,
-    sync::{Mutex, MutexGuard},
+    sync::{Mutex, MutexGuard, PoisonError},
 };
 
 use oca_display::{TmuxClient, TmuxError};
@@ -74,7 +74,11 @@ impl Fixture {
         // A sibling test can otherwise fork while this fixture is writing its
         // script. The child inherits the write descriptor and Linux can reject
         // the script exec with ETXTBSY (errno 26).
-        let lock = TMUX_FIXTURE_LOCK.lock().unwrap();
+        // A failing sibling test poisons the lock; take it anyway so the
+        // failure reports once instead of twice.
+        let lock = TMUX_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("tmux");
         let cwd = temp.path().join("worker");
