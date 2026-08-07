@@ -47,6 +47,7 @@ pub enum ErrorCode {
     EffortMissing,
     EffortConflict,
     EffortUnsupported,
+    ModelUnsupportedTooled,
     UnknownRef,
     SessionNotFound,
     WorkerBusy,
@@ -81,6 +82,7 @@ impl ErrorCode {
             Self::EffortMissing,
             Self::EffortConflict,
             Self::EffortUnsupported,
+            Self::ModelUnsupportedTooled,
             Self::UnknownRef,
             Self::SessionNotFound,
             Self::WorkerBusy,
@@ -114,6 +116,7 @@ impl ErrorCode {
             Self::EffortMissing => "effort_required",
             Self::EffortConflict => "effort_conflict",
             Self::EffortUnsupported => "effort_unsupported",
+            Self::ModelUnsupportedTooled => "model_unsupported_tooled",
             Self::UnknownRef => "ref_not_found",
             Self::SessionNotFound => "session_not_found",
             Self::WorkerBusy => "worker_busy",
@@ -147,6 +150,7 @@ impl ErrorCode {
             "effort_required" => Some(Self::EffortMissing),
             "effort_conflict" => Some(Self::EffortConflict),
             "effort_unsupported" => Some(Self::EffortUnsupported),
+            "model_unsupported_tooled" => Some(Self::ModelUnsupportedTooled),
             "ref_not_found" => Some(Self::UnknownRef),
             "session_not_found" => Some(Self::SessionNotFound),
             "worker_busy" => Some(Self::WorkerBusy),
@@ -181,6 +185,7 @@ impl ErrorCode {
             Self::EffortMissing => "Missing effort",
             Self::EffortConflict => "Conflicting effort values",
             Self::EffortUnsupported => "Unsupported effort",
+            Self::ModelUnsupportedTooled => "Model cannot run tooled dispatch",
             Self::UnknownRef => "Unknown ref",
             Self::SessionNotFound => "Session not found",
             Self::WorkerBusy => "Worker is busy",
@@ -214,6 +219,9 @@ impl ErrorCode {
             Self::EffortMissing => "Specify an effort after the alias",
             Self::EffortConflict => "Specify effort only once",
             Self::EffortUnsupported => "Choose an effort supported by this alias",
+            Self::ModelUnsupportedTooled => {
+                "Choose another model alias or configure a model that supports tool use"
+            }
             Self::UnknownRef => "Run `oca ls` to list refs",
             Self::SessionNotFound => "Start a new session or verify the ref",
             Self::WorkerBusy => "Use `oca q <ref>` to queue a message",
@@ -248,6 +256,7 @@ impl ErrorCode {
             | Self::EffortMissing
             | Self::EffortConflict
             | Self::EffortUnsupported
+            | Self::ModelUnsupportedTooled
             | Self::ProtectedBranch => exit::USAGE,
             Self::ServerUnavailable | Self::ServerStartTimeout | Self::ServerUnreachable => {
                 exit::SERVER_UNREACHABLE
@@ -652,6 +661,12 @@ mod tests {
                 "effort_unsupported",
                 "Unsupported effort",
                 "Choose an effort supported by this alias",
+                2,
+            ),
+            (
+                "model_unsupported_tooled",
+                "Model cannot run tooled dispatch",
+                "Choose another model alias or configure a model that supports tool use",
                 2,
             ),
             (

@@ -25,7 +25,8 @@ fn headed_tmux_background_journals_events_while_detached_stream_is_live() {
     init_repository(home.path());
     let tmux = FakeTmux::new(home.path());
     let server = FakeOpenCode::spawn();
-    prepare_home(home.path(), server.port);
+    let port = server.port;
+    prepare_home(home.path(), port);
 
     let output = Command::new(env!("CARGO_BIN_EXE_oca"))
         .args([
@@ -107,14 +108,13 @@ fn headed_tmux_background_journals_events_while_detached_stream_is_live() {
         ]
     );
     assert_eq!(
-        tmux.wait_for_calls(2),
+        tmux.wait_for_calls(3),
         [
             format!(
-                "new-window -d -n oca-{reference} | impl | openai/gpt-5.6-luna | high | DO NOT TYPE: composer unbound -- opencode --session ses_tmux_journal"
+                "new-window -d -P -F #{{window_id}} -n journalHeaded -- sh -c printf '%s\\n' \"$1\"; shift; exec \"$@\" oca-headed-attach {reference} | impl | openai/gpt-5.6-luna | high | DO NOT TYPE: composer unbound opencode attach http://127.0.0.1:{port}/ --session ses_tmux_journal"
             ),
-            format!(
-                "kill-window -t =oca-{reference} | impl | openai/gpt-5.6-luna | high | DO NOT TYPE: composer unbound"
-            ),
+            format!("set-option -w -t @42 @oca-ref {reference}"),
+            "kill-window -t @42".to_owned(),
         ]
     );
 }
@@ -489,7 +489,10 @@ impl FakeTmux {
         let log = directory.join("tmux-calls");
         fs::write(
             &executable,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = new-window ]; then printf '@42\\n'; fi\n",
+                log.display()
+            ),
         )
         .expect("fake tmux writes");
         let mut permissions = fs::metadata(&executable)

@@ -50,6 +50,7 @@ fn prompt_request() -> PromptRequest {
             model: "gpt-5.6-luna".to_owned(),
             effort: "high".to_owned(),
             variant: "high".to_owned(),
+            tooled_incompatible: false,
         },
         variant: "high".to_owned(),
         role: "worker".to_owned(),

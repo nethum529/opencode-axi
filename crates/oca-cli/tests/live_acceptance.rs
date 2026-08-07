@@ -24,8 +24,8 @@ use std::{
 };
 
 use oca_core::{
-    MessageIdGenerator, ModelCatalog, RANDOM_SUFFIX_WIDTH, ResolvedModel, WorkerPolicy,
-    resolve_model,
+    DEFAULT_MODEL_DEFINITIONS, MessageIdGenerator, ModelCatalog, RANDOM_SUFFIX_WIDTH,
+    ResolvedModel, WorkerPolicy, resolve_model,
 };
 use oca_display::HerdrClient;
 use oca_opencode::{
@@ -280,6 +280,78 @@ fn live_json_schema_output_enforcement_returns_conforming_reply() {
 }
 
 #[test]
+#[ignore = "requires OCA_LIVE=1 and one tooled structured turn per shipped default alias"]
+fn live_unmarked_default_aliases_complete_one_tooled_structured_turn() {
+    let _guard = live_guard();
+    let server = LiveServer::start(false);
+    let runtime = runtime();
+    let schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["status", "note"],
+        "properties": {
+            "status": { "type": "string", "enum": ["done"] },
+            "note": { "type": "string", "minLength": 1 }
+        }
+    });
+
+    runtime.block_on(async {
+        for definition in DEFAULT_MODEL_DEFINITIONS
+            .iter()
+            .filter(|definition| !definition.tooled_incompatible)
+        {
+            let effort = definition
+                .ladder
+                .first()
+                .expect("a shipped default alias has at least one effort");
+            let model = resolve_model(definition.alias, *effort, ModelCatalog::default())
+                .unwrap_or_else(|error| panic!("{}:{} failed local resolution: {error}", definition.alias, effort));
+            let client = server.client();
+            let session = create_session(&client, &server, &model, None).await;
+            let mut subscription = client
+                .subscribe(server.repo.path().to_str().unwrap(), None)
+                .await
+                .unwrap_or_else(|error| panic!("{} subscribe failed: {error}", definition.alias));
+            let message_id = mint_message_id();
+            client
+                .prompt_async(
+                    &session.id,
+                    prompt(
+                        &server,
+                        &model,
+                        &model.variant,
+                        &message_id,
+                        "Use one harmless read-only repository inspection tool, then return a structured JSON result with status done and a short note. Do not write files.",
+                        Some(schema.clone()),
+                    ),
+                )
+                .await
+                .unwrap_or_else(|error| panic!("{} tooled prompt failed: {error}", definition.alias));
+            events_through_idle(&mut subscription, &session.id, LIVE_TIMEOUT).await;
+            let messages = client
+                .messages(&session.id)
+                .await
+                .unwrap_or_else(|error| panic!("{} message history failed: {error}", definition.alias));
+            let structured = messages
+                .iter()
+                .rev()
+                .find(|message| {
+                    message.info["role"].as_str() == Some("assistant")
+                        && message.info["structured"].is_object()
+                })
+                .map(|message| &message.info["structured"])
+                .unwrap_or_else(|| panic!("{} produced no structured assistant reply", definition.alias));
+            assert_eq!(structured["status"], "done", "{} status", definition.alias);
+            assert!(structured["note"].as_str().is_some(), "{} note", definition.alias);
+            eprintln!(
+                "LIVE tooled catalog smoke: alias={} provider={} model={} effort={} structured=true",
+                definition.alias, model.provider, model.model, effort
+            );
+        }
+    });
+}
+
+#[test]
 #[ignore = "requires OCA_LIVE=1 and drives a denied real tool call"]
 fn live_permission_deny_returns_without_asking_or_hanging() {
     let _guard = live_guard();
@@ -374,6 +446,7 @@ fn live_herdr_workspace_tab_agent_start_and_tui_boot_has_no_idle() {
         let launch = herdr
             .agent_start(
                 &tab,
+                "oca-live-idle-boot",
                 vec![
                     "opencode".to_owned(),
                     "attach".to_owned(),
@@ -511,6 +584,7 @@ fn live_queue_runs_after_turn_and_abort_reaches_terminal_for_tab_close() {
         if let Err(error) = herdr
             .agent_start(
                 &tab,
+                "oca-live-abort",
                 vec![
                     "opencode".to_owned(),
                     "attach".to_owned(),

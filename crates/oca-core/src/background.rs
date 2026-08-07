@@ -156,10 +156,12 @@ mod tests {
             _reference: &str,
             _session_id: &str,
             _cwd: &Path,
+            display_name: &str,
             _display: DisplayMode,
         ) -> Result<(), OcaError> {
             self.calls.push("spawn");
             assert_eq!(self.calls[self.calls.len() - 2], "ack");
+            assert_eq!(display_name, "doWork");
             Ok(())
         }
 
@@ -219,6 +221,24 @@ mod tests {
         assert_eq!(outcome.session_id, "ses_background");
         assert_eq!(outcome.message_id, "msg_f9a4a7a00001AAAAAAAAAAAAAA");
         assert_eq!(subscription_drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn tooled_incompatible_background_model_fails_before_provider_access() {
+        let subscription_drops = Arc::new(AtomicUsize::new(0));
+        let mut backend = FakeBackend::new(Arc::clone(&subscription_drops));
+        let mut request = request();
+        request.model = resolve_model("flash", "high", ModelCatalog::default()).unwrap();
+
+        let error = block_on(run_background(&mut backend, request))
+            .expect_err("the default flash model must be rejected locally");
+
+        assert_eq!(error.code_kind(), crate::ErrorCode::ModelUnsupportedTooled);
+        assert!(
+            backend.calls.is_empty(),
+            "blocked dispatch must be side-effect free"
+        );
+        assert_eq!(subscription_drops.load(Ordering::SeqCst), 0);
     }
 
     fn request() -> BackgroundRequest {

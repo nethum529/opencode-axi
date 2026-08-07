@@ -5,7 +5,7 @@ use std::{path::Path, time::Duration};
 use oca_core::{
     DisplayMode, FollowBoundaryOutcome, FollowTarget, RefId, follow_until_terminal_boundary,
 };
-use oca_display::{HerdrClient, TmuxClient};
+use oca_display::{HerdrClient, TmuxClient, opencode_attach_argv};
 use oca_opencode::OpenCodeClient;
 use oca_server::ConnectOrStart;
 use oca_state::{EventJournal, OcaConfig, RefPatch, RefStore, RefStorePaths};
@@ -13,7 +13,9 @@ use url::Url;
 
 use crate::{
     AttachCommand,
-    attach_diagnostics::{HistoryProbe, journal_history_diagnostic, probe_history, tab_label},
+    attach_diagnostics::{
+        HistoryProbe, journal_history_diagnostic, probe_history, worker_identity,
+    },
 };
 
 /// Runs the hidden, detached headed attach helper.
@@ -76,7 +78,7 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
         .map_err(|error| format!("invalid OpenCode server URL: {error}"))?;
     let client = OpenCodeClient::new(base_url.clone());
     let history = probe_history(&client, &command.session_id).await;
-    let label = tab_label(&command.reference, &record, &config, &history);
+    let identity = worker_identity(&command.reference, &record, &config, &history);
 
     match mode {
         DisplayMode::Herdr => {
@@ -86,7 +88,7 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
                 base_url: &base_url,
                 message_id: &message_id,
                 directory: &directory,
-                label: &label,
+                worker_identity: &identity,
                 client: &client,
                 history: &history,
             };
@@ -99,7 +101,7 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
                 base_url: &base_url,
                 message_id: &message_id,
                 directory: &directory,
-                label: &label,
+                worker_identity: &identity,
                 client: &client,
                 history: &history,
             };
@@ -115,7 +117,7 @@ struct AttachTurn<'a> {
     base_url: &'a Url,
     message_id: &'a str,
     directory: &'a str,
-    label: &'a str,
+    worker_identity: &'a str,
     client: &'a OpenCodeClient,
     history: &'a HistoryProbe,
 }
@@ -142,21 +144,17 @@ async fn run_herdr_attach(
         .await
         .map_err(|error| error.to_string())?;
     let tab = herdr
-        .tab(&workspace, turn.label, true, &command.cwd)
+        .tab(&workspace, &command.display_name, true, &command.cwd)
         .await
         .map_err(|error| error.to_string())?;
 
     let launch_result = async {
+        eprintln!("headed worker identity: {}", turn.worker_identity);
         herdr
             .agent_start(
                 &tab,
-                vec![
-                    "opencode".to_owned(),
-                    "attach".to_owned(),
-                    turn.base_url.to_string(),
-                    "--session".to_owned(),
-                    command.session_id.clone(),
-                ],
+                turn.worker_identity,
+                opencode_attach_argv(turn.base_url.as_str(), &command.session_id),
             )
             .await
             .map_err(|error| error.to_string())?;
@@ -211,7 +209,14 @@ async fn run_herdr_attach(
 async fn run_tmux_attach(command: &AttachCommand, turn: AttachTurn<'_>) -> Result<(), String> {
     let tmux = TmuxClient::default();
     let window = tmux
-        .new_window(turn.label, &command.session_id, &command.cwd)
+        .new_window(
+            &command.reference,
+            &command.display_name,
+            turn.worker_identity,
+            turn.base_url.as_str(),
+            &command.session_id,
+            &command.cwd,
+        )
         .map_err(|error| error.to_string())?;
     let follow_result = async {
         let mut journal =

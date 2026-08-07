@@ -8,8 +8,8 @@ use serde_json::json;
 pub(crate) const HISTORY_UNREADABLE_EVENT: &str = "oca.history.unreadable";
 
 const COMPOSER_GUARD: &str = "DO NOT TYPE: composer unbound";
-const HISTORY_LABEL_WARNING: &str = "HISTORY UNREADABLE";
-const RETRY_POISONING_LABEL_SUFFIX: &str = ": retryCount poisoning";
+const HISTORY_IDENTITY_WARNING: &str = "HISTORY UNREADABLE";
+const RETRY_POISONING_IDENTITY_SUFFIX: &str = ": retryCount poisoning";
 
 /// Only the schema rejection behind the upstream poisoning answers with 400. Any
 /// other status is a different failure and must not be attributed to it.
@@ -95,8 +95,8 @@ pub(crate) fn journal_history_diagnostic<J: EventJournalWriter>(
     })
 }
 
-/// Builds the tab label that is authoritative when OpenCode's composer is not.
-pub(crate) fn tab_label(
+/// Builds the worker identity shown separately from the task-derived display label.
+pub(crate) fn worker_identity(
     reference: &str,
     record: &RefRecord,
     config: &OcaConfig,
@@ -114,15 +114,15 @@ pub(crate) fn tab_label(
             )
         },
     );
-    let mut label = format!("{reference} | {agent} | {model} | {variant} | {COMPOSER_GUARD}");
+    let mut identity = format!("{reference} | {agent} | {model} | {variant} | {COMPOSER_GUARD}");
     if let Some(status) = probe.status() {
-        label.push_str(" | ");
-        label.push_str(HISTORY_LABEL_WARNING);
+        identity.push_str(" | ");
+        identity.push_str(HISTORY_IDENTITY_WARNING);
         if status == RETRY_POISONING_STATUS {
-            label.push_str(RETRY_POISONING_LABEL_SUFFIX);
+            identity.push_str(RETRY_POISONING_IDENTITY_SUFFIX);
         }
     }
-    label
+    identity
 }
 
 #[cfg(test)]
@@ -132,8 +132,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn label_names_the_worker_binding_and_guards_the_unbound_composer() {
-        let label = tab_label(
+    fn identity_names_the_worker_binding_and_guards_the_unbound_composer() {
+        let identity = worker_identity(
             "wabc12",
             &record("flash", "high", "impl"),
             &OcaConfig::default(),
@@ -141,34 +141,34 @@ mod tests {
         );
 
         assert_eq!(
-            label,
+            identity,
             "wabc12 | impl | opencode/deepseek-v4-flash-free | high | DO NOT TYPE: composer unbound"
         );
     }
 
     #[test]
-    fn unreadable_history_is_visible_in_the_same_tab_label() {
-        let label = tab_label(
+    fn unreadable_history_is_visible_in_the_worker_identity() {
+        let identity = worker_identity(
             "wabc12",
             &record("flash", "high", "impl"),
             &OcaConfig::default(),
             &HistoryProbe::Unreadable { status: 400 },
         );
 
-        assert!(label.contains("HISTORY UNREADABLE: retryCount poisoning"));
+        assert!(identity.contains("HISTORY UNREADABLE: retryCount poisoning"));
     }
 
     #[test]
     fn a_history_failure_other_than_the_schema_rejection_is_not_blamed_on_retry_count() {
         let probe = HistoryProbe::Unreadable { status: 503 };
-        let label = tab_label(
+        let identity = worker_identity(
             "wabc12",
             &record("flash", "high", "impl"),
             &OcaConfig::default(),
             &probe,
         );
 
-        assert!(label.ends_with("| HISTORY UNREADABLE"));
+        assert!(identity.ends_with("| HISTORY UNREADABLE"));
         let warning = probe.warning().expect("a rejected read warns");
         assert!(warning.contains("(HTTP 503)"));
         assert!(!warning.contains("retryCount"));

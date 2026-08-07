@@ -2,6 +2,7 @@ use std::fmt;
 
 pub mod background;
 pub mod display;
+pub mod display_name;
 pub mod error;
 pub mod follow;
 pub mod foreground;
@@ -13,6 +14,7 @@ pub mod resolver;
 
 pub use background::{BackgroundOutcome, BackgroundRequest, run_background};
 pub use display::DisplayMode;
+pub use display_name::task_display_name;
 pub use error::{
     ERROR_ENVELOPE_SCHEMA, ErrorCode, ErrorEnvelope, FollowExit, OcaError, error_envelope_schema,
     exit, parse_error_envelope, validate_error_envelope,
@@ -136,6 +138,42 @@ mod tests {
         assert_eq!(flash.provider, "opencode");
         assert_eq!(flash.model, "deepseek-v4-flash-free");
         assert_eq!(flash.variant, "max");
+        assert!(flash.tooled_incompatible);
+        assert!(
+            !catalog
+                .get("luna")
+                .expect("luna is in the default catalog")
+                .tooled_incompatible
+        );
+    }
+
+    #[test]
+    fn marked_models_explain_and_reject_only_tooled_dispatches() {
+        let catalog = ModelCatalog::default();
+        let flash = resolve_model("deepseek", "high", &catalog).expect("flash resolves");
+
+        let error = flash
+            .validate_tooled()
+            .expect_err("the compiled flash alias must reject tooled dispatches");
+        assert_eq!(error.code(), "model_unsupported_tooled");
+        assert_eq!(
+            error.error(),
+            "deepseek-v4-flash-free: every variant is a thinking variant and the provider rejects tool use (tool_choice) in thinking mode; this alias cannot run tooled dispatches"
+        );
+
+        let custom = resolve_model("custom", "high", {
+            let mut catalog = ModelCatalog::new();
+            catalog.insert(
+                "custom",
+                ModelDefinition::new("example", "custom-model", ["high"]),
+            );
+            catalog
+        })
+        .expect("custom models are not marked by default");
+        assert!(!custom.tooled_incompatible);
+        custom
+            .validate_tooled()
+            .expect("unmarked models remain valid for tooled dispatches");
     }
 
     #[test]

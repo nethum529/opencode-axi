@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::{
     DisplayMode, OcaError, PermissionProfile, ReplyContract, ResolvedModel, RoleReply,
-    WorkerPolicy, decode_role_reply, validate_reply_floor,
+    WorkerPolicy, decode_role_reply, task_display_name, validate_reply_floor,
 };
 
 /// A fully locally-resolved foreground dispatch.
@@ -137,6 +137,7 @@ pub trait ForegroundBackend {
         reference: &str,
         session_id: &str,
         cwd: &std::path::Path,
+        display_name: &str,
         display: DisplayMode,
     ) -> Result<(), OcaError>;
 
@@ -227,6 +228,8 @@ pub(crate) async fn start_dispatch<B>(
 where
     B: ForegroundBackend,
 {
+    request.model.validate_tooled()?;
+
     // Preparation happens once, outside the recovery paths below: those re-call
     // create_session only. The worktree backend's create_session records the
     // session again on recovery, which is safe because that step patches an
@@ -288,10 +291,17 @@ where
 
     let pending = backend.write_ref(&session_id, &message_id, &request)?;
     let reference = backend.acknowledge(pending, &request.model, request.json)?;
+    let display_name = task_display_name(&request.prompt, &reference);
 
     // The helper cannot be spawned until the acknowledgement is emitted and
     // flushed by the backend's acknowledgement boundary.
-    backend.spawn_attach(&reference, &session_id, &request.cwd, request.display)?;
+    backend.spawn_attach(
+        &reference,
+        &session_id,
+        &request.cwd,
+        &display_name,
+        request.display,
+    )?;
 
     Ok(StartedDispatch {
         request,
@@ -428,6 +438,7 @@ mod tests {
             _reference: &str,
             _session_id: &str,
             _cwd: &std::path::Path,
+            _display_name: &str,
             _display: DisplayMode,
         ) -> Result<(), OcaError> {
             Ok(())
@@ -604,10 +615,12 @@ mod tests {
             _reference: &str,
             _session_id: &str,
             _cwd: &std::path::Path,
+            display_name: &str,
             _display: DisplayMode,
         ) -> Result<(), OcaError> {
             self.calls.push("spawn");
             assert_eq!(self.calls[self.calls.len() - 2], "ack");
+            assert_eq!(display_name, "doWork");
             Ok(())
         }
 
@@ -650,8 +663,8 @@ mod tests {
     }
 
     #[test]
-    fn every_alias_subscribes_before_prompt_and_carries_its_role_policy() {
-        for (alias, effort) in [("luna", "h"), ("sol", "h"), ("terra", "h"), ("flash", "h")] {
+    fn every_supported_alias_subscribes_before_prompt_and_carries_its_role_policy() {
+        for (alias, effort) in [("luna", "h"), ("sol", "h"), ("terra", "h")] {
             let mut backend = FakeBackend::normal();
             block_on(run_foreground(&mut backend, request(alias, effort)))
                 .unwrap_or_else(|error| panic!("{alias} dispatch failed: {error}"));
@@ -678,6 +691,19 @@ mod tests {
             assert_eq!(prompt.model.alias, alias);
             assert_eq!(prompt.permission.0.len(), 5);
         }
+    }
+
+    #[test]
+    fn tooled_incompatible_model_fails_before_backend_preparation_or_provider_access() {
+        let mut backend = FakeBackend::normal();
+        let error = block_on(run_foreground(&mut backend, request("flash", "h")))
+            .expect_err("the default flash model must be rejected locally");
+
+        assert_eq!(error.code_kind(), ErrorCode::ModelUnsupportedTooled);
+        assert!(
+            backend.calls.is_empty(),
+            "blocked dispatch must be side-effect free"
+        );
     }
 
     #[test]

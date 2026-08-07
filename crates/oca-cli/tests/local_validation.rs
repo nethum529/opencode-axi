@@ -57,7 +57,7 @@ fn expanded_malformed_ref_matrix_fails_at_the_parser_boundary() {
         for reference in malformed {
             let arguments = match verb {
                 "m" | "q" => vec!["oca", verb, reference, "message"],
-                "__attach" => vec!["oca", verb, reference, "ses_1", "/repo"],
+                "__attach" => vec!["oca", verb, reference, "ses_1", "/repo", "fixParser"],
                 _ => vec!["oca", verb, reference],
             };
             let error = parse_from(arguments)
@@ -95,7 +95,7 @@ fn canonical_ref_syntax_passes_local_validation_on_every_ref_taking_verb() {
         for arguments in [
             vec!["oca", "events", reference],
             vec!["oca", "events", reference, "--since", "7"],
-            vec!["oca", "__attach", reference, "ses_1", "/repo"],
+            vec!["oca", "__attach", reference, "ses_1", "/repo", "fixParser"],
         ] {
             parse_from(arguments).unwrap_or_else(|error| {
                 panic!("canonical ref must pass local validation: {error}")

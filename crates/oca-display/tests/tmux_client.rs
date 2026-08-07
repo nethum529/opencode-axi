@@ -9,6 +9,8 @@ use std::{
 use oca_display::{TmuxClient, TmuxError};
 
 static TMUX_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+const WORKER_IDENTITY: &str =
+    "wabc12 | impl's agent | openai/gpt-5.6 | high | DO NOT TYPE: composer unbound";
 
 #[test]
 fn creates_and_closes_only_the_ref_owned_window_against_a_fake_tmux() {
@@ -16,27 +18,52 @@ fn creates_and_closes_only_the_ref_owned_window_against_a_fake_tmux() {
     let client = TmuxClient::new(fixture.executable.as_os_str());
 
     let window = client
-        .new_window("wabc12", "ses_target", &fixture.cwd)
+        .new_window(
+            "wabc12",
+            "fixParser",
+            WORKER_IDENTITY,
+            "http://127.0.0.1:4096/",
+            "ses_target",
+            &fixture.cwd,
+        )
         .unwrap();
     client.close_window(&window).unwrap();
 
-    assert_eq!(window.name(), "oca-wabc12");
+    assert_eq!(window.name(), "fixParser");
+    assert_eq!(window.id(), "@42");
     assert_eq!(
         fixture.calls(),
         [
             format!("cwd={}", fixture.cwd.display()),
             "new-window".to_owned(),
             "-d".to_owned(),
+            "-P".to_owned(),
+            "-F".to_owned(),
+            "#{window_id}".to_owned(),
             "-n".to_owned(),
-            "oca-wabc12".to_owned(),
+            "fixParser".to_owned(),
             "--".to_owned(),
+            "sh".to_owned(),
+            "-c".to_owned(),
+            r#"printf '%s\n' "$1"; shift; exec "$@""#.to_owned(),
+            "oca-headed-attach".to_owned(),
+            WORKER_IDENTITY.to_owned(),
             "opencode".to_owned(),
+            "attach".to_owned(),
+            "http://127.0.0.1:4096/".to_owned(),
             "--session".to_owned(),
             "ses_target".to_owned(),
             "--call--".to_owned(),
+            "set-option".to_owned(),
+            "-w".to_owned(),
+            "-t".to_owned(),
+            "@42".to_owned(),
+            "@oca-ref".to_owned(),
+            "wabc12".to_owned(),
+            "--call--".to_owned(),
             "kill-window".to_owned(),
             "-t".to_owned(),
-            "=oca-wabc12".to_owned(),
+            "@42".to_owned(),
             "--call--".to_owned(),
         ]
     );
@@ -46,7 +73,14 @@ fn creates_and_closes_only_the_ref_owned_window_against_a_fake_tmux() {
 fn a_fake_tmux_failure_is_typed() {
     let fixture = Fixture::new(7);
     let error = TmuxClient::new(fixture.executable.as_os_str())
-        .new_window("wabc12", "ses_target", &fixture.cwd)
+        .new_window(
+            "wabc12",
+            "fixParser",
+            WORKER_IDENTITY,
+            "http://127.0.0.1:4096/",
+            "ses_target",
+            &fixture.cwd,
+        )
         .unwrap_err();
 
     assert!(
@@ -61,6 +95,31 @@ fn a_fake_tmux_failure_is_typed() {
     );
 }
 
+#[test]
+fn a_window_id_tmux_never_prints_is_typed() {
+    let fixture = Fixture::with_window_id(0, "window one");
+    let error = TmuxClient::new(fixture.executable.as_os_str())
+        .new_window(
+            "wabc12",
+            "fixParser",
+            WORKER_IDENTITY,
+            "http://127.0.0.1:4096/",
+            "ses_target",
+            &fixture.cwd,
+        )
+        .unwrap_err();
+
+    assert!(
+        matches!(&error, TmuxError::InvalidWindowId { output } if output == "window one"),
+        "{error}"
+    );
+    assert!(
+        !fixture.calls().iter().any(|call| call == "kill-window"),
+        "an unusable window id leaves nothing to close: {:?}",
+        fixture.calls()
+    );
+}
+
 struct Fixture {
     _lock: MutexGuard<'static, ()>,
     _temp: tempfile::TempDir,
@@ -71,6 +130,10 @@ struct Fixture {
 
 impl Fixture {
     fn new(exit_code: u8) -> Self {
+        Self::with_window_id(exit_code, "@42")
+    }
+
+    fn with_window_id(exit_code: u8, window_id: &str) -> Self {
         // A sibling test can otherwise fork while this fixture is writing its
         // script. The child inherits the write descriptor and Linux can reject
         // the script exec with ETXTBSY (errno 26).
@@ -87,7 +150,7 @@ impl Fixture {
         fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = new-window ]; then printf 'cwd=%s\\n' \"$PWD\" >> '{}'; fi\nprintf '%s\\n' \"$@\" >> '{}'\nprintf '%s\\n' --call-- >> '{}'\nexit {exit_code}\n",
+                "#!/bin/sh\nif [ \"$1\" = new-window ]; then printf 'cwd=%s\\n' \"$PWD\" >> '{}'; printf '{window_id}\\n'; fi\nprintf '%s\\n' \"$@\" >> '{}'\nprintf '%s\\n' --call-- >> '{}'\nexit {exit_code}\n",
                 log.display(),
                 log.display(),
                 log.display(),

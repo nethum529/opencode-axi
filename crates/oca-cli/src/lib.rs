@@ -248,8 +248,8 @@ const DISPATCH_EXAMPLES: &[&[&str]] = &[
     &["oca", "luna:h", "implement", "the", "ticket"],
     &["oca", "sol", "-e", "x", "review", "the", "diff"],
     &["oca", "terra:medium", "summarize", "the", "change"],
-    &["oca", "flash:max", "run", "the", "tests"],
-    &["oca", "deepseek:h", "check", "the", "parser"],
+    &["oca", "terra:max", "run", "the", "tests"],
+    &["oca", "luna:h", "check", "the", "parser"],
     &["oca", "luna:h", "-b", "dispatch", "in", "background"],
     &["oca", "--json", "luna:h", "--", "--literal", "prompt"],
 ];
@@ -305,7 +305,7 @@ const DISPATCH_FLAGS: &[FlagGrammar] = &[
         kind: AgentFlag::Headless,
         spellings: &["--headless"],
         value: FlagValueForm::None,
-        argv_examples: &[&["oca", "flash:h", "--headless", "run", "without", "a", "tui"]],
+        argv_examples: &[&["oca", "terra:h", "--headless", "run", "without", "a", "tui"]],
     },
 ];
 
@@ -636,6 +636,7 @@ pub struct AttachCommand {
     pub reference: String,
     pub session_id: String,
     pub cwd: PathBuf,
+    pub display_name: String,
 }
 
 /// Parse an argv sequence, including its executable name.
@@ -802,6 +803,7 @@ fn parse_dispatch(
         EffortInput::both(inline_effort, flagged_effort),
         catalog,
     )?;
+    model.validate_tooled()?;
     if prompt.is_empty() {
         return Err(usage("a prompt is required"));
     }
@@ -973,15 +975,17 @@ fn parse_attach(arguments: &[String]) -> Result<AttachCommand, OcaError> {
     let (reference, tail) = required_reference(arguments)?;
     let (session_id, tail) = required_first(tail, "session id")?;
     let (cwd, tail) = required_first(tail, "cwd")?;
+    let (display_name, tail) = required_first(tail, "display name")?;
     if !tail.is_empty() {
         return Err(usage(
-            "`__attach` accepts exactly a ref, session id, and cwd",
+            "`__attach` accepts exactly a ref, session id, cwd, and display name",
         ));
     }
     Ok(AttachCommand {
         reference: reference.to_owned(),
         session_id: session_id.to_owned(),
         cwd: cwd.into(),
+        display_name: display_name.to_owned(),
     })
 }
 
@@ -1122,11 +1126,12 @@ mod tests {
     #[test]
     fn attach_is_parseable_but_not_an_agent_surface_command() {
         assert_eq!(
-            parse_from(["oca", "__attach", "wabc12", "ses_1", "/repo"]).unwrap(),
+            parse_from(["oca", "__attach", "wabc12", "ses_1", "/repo", "fixParser"]).unwrap(),
             Command::Attach(AttachCommand {
                 reference: "wabc12".to_owned(),
                 session_id: "ses_1".to_owned(),
                 cwd: "/repo".into(),
+                display_name: "fixParser".to_owned(),
             }),
         );
     }
@@ -1185,6 +1190,19 @@ mod tests {
         };
         assert!(command.background);
         assert_eq!(command.prompt, "implement this");
+    }
+
+    #[test]
+    fn default_flash_dispatch_fails_before_a_prompt_can_reach_the_provider() {
+        let error = parse_from(["oca", "flash:high", "implement", "this"])
+            .expect_err("the default flash alias cannot run tooled dispatches");
+
+        assert_eq!(error.code_kind(), ErrorCode::ModelUnsupportedTooled);
+        assert_eq!(
+            error.error(),
+            "deepseek-v4-flash-free: every variant is a thinking variant and the provider rejects tool use (tool_choice) in thinking mode; this alias cannot run tooled dispatches"
+        );
+        assert!(error.help().contains("another model alias"));
     }
 
     #[test]
