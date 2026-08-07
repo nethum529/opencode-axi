@@ -532,6 +532,53 @@ fn headed_attach_records_and_closes_the_tab_after_terminal_state() {
 }
 
 #[test]
+fn a_follow_failure_keeps_the_persisted_tab_open_for_an_explicit_kill() {
+    let home = tempfile::tempdir().unwrap();
+    let socket = home.path().join("fake-herdr.sock");
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let herdr = spawn_herdr_recording_calls_after_agent_start(&socket, Arc::clone(&calls));
+    let (port, opencode) = spawn_failing_history_opencode();
+    prepare_attach_home(home.path(), &socket, port, "herdr");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_oca"))
+        .args(["__attach", "wabc12", "ses_target", "/worker"])
+        .env("HOME", home.path())
+        .current_dir(home.path())
+        .output()
+        .unwrap();
+
+    let warning = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        warning.contains("could not follow worker terminal state"),
+        "the helper must have failed while following, not earlier: {warning}"
+    );
+    herdr.join().unwrap();
+    opencode.join().unwrap();
+
+    let calls = calls.lock().unwrap();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "workspace.list",
+            "workspace.create",
+            "tab.create",
+            "agent.start",
+        ],
+        "the worker outlives its follower, so only a terminal boundary or `oca k` may close its tab"
+    );
+
+    let record = ref_store(home.path()).resolve("wabc12").unwrap().unwrap();
+    assert_eq!(
+        record.herdr_tab.as_deref(),
+        Some("t1"),
+        "`oca k` needs the persisted tab id to close a tab the follower abandoned"
+    );
+}
+
+#[test]
 fn background_spawn_then_kill_closes_the_tab_and_exits_its_tui_process() {
     let home = tempfile::tempdir().unwrap();
     let socket = home.path().join("fake-herdr.sock");
@@ -927,6 +974,62 @@ fn spawn_herdr_until_agent_start(
     })
 }
 
+/// Serves the launch sequence, then keeps answering so that any further call
+/// is recorded instead of being silently refused by a closed listener.
+fn spawn_herdr_recording_calls_after_agent_start(
+    socket: &Path,
+    calls: Arc<Mutex<Vec<Value>>>,
+) -> thread::JoinHandle<()> {
+    let listener = UnixListener::bind(socket).unwrap();
+    thread::spawn(move || {
+        accept_discovery_probe(&listener);
+        for index in 0..4 {
+            let mut stream = accept_unix_with_timeout(&listener);
+            let request = read_unix_request(&stream);
+            let request_id = request["id"].as_str().unwrap();
+            let result = match index {
+                0 => json!({"type":"workspace_list","workspaces":[]}),
+                1 => json!({
+                    "type":"workspace_created",
+                    "workspace":{"workspace_id":"w1","label":"oca"}
+                }),
+                2 => json!({
+                    "type":"tab_created",
+                    "tab":{"tab_id":"t1"},
+                    "root_pane":{"pane_id":"p1"}
+                }),
+                3 => json!({
+                    "type":"agent_started",
+                    "agent":{"terminal_id":"term1"}
+                }),
+                _ => unreachable!(),
+            };
+            writeln!(stream, "{}", json!({"id":request_id,"result":result})).unwrap();
+            calls.lock().unwrap().push(request);
+        }
+        listener.set_nonblocking(true).unwrap();
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < deadline {
+            let Ok((mut stream, _)) = listener.accept() else {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let request = read_unix_request(&stream);
+            let request_id = request["id"].as_str().unwrap();
+            writeln!(
+                stream,
+                "{}",
+                json!({"id":request_id,"result":{"type":"ok"}})
+            )
+            .unwrap();
+            calls.lock().unwrap().push(request);
+        }
+    })
+}
+
 fn spawn_herdr_with_attached_process(
     socket: &Path,
     fake_opencode: PathBuf,
@@ -1237,6 +1340,32 @@ fn spawn_attach_opencode() -> (u16, thread::JoinHandle<()>) {
             "200 OK",
             "application/json",
             &terminal_messages("msg_dispatch"),
+        );
+    });
+    (port, server)
+}
+
+fn spawn_failing_history_opencode() -> (u16, thread::JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut event, _) = listener.accept().unwrap();
+        assert_eq!(
+            read_http_request(&mut event).path,
+            "/event?directory=%2Fworker"
+        );
+        write_http_response(&mut event, "200 OK", "text/event-stream", "");
+
+        let (mut messages, _) = listener.accept().unwrap();
+        assert_eq!(
+            read_http_request(&mut messages).path,
+            "/session/ses_target/message"
+        );
+        write_http_response(
+            &mut messages,
+            "500 Internal Server Error",
+            "application/json",
+            &json!({"error": "history unavailable"}).to_string(),
         );
     });
     (port, server)
