@@ -16,27 +16,46 @@ fn creates_and_closes_only_the_ref_owned_window_against_a_fake_tmux() {
     let client = TmuxClient::new(fixture.executable.as_os_str());
 
     let window = client
-        .new_window("wabc12", "ses_target", &fixture.cwd)
+        .new_window(
+            "wabc12",
+            "fixParser",
+            "http://127.0.0.1:4096/",
+            "ses_target",
+            &fixture.cwd,
+        )
         .unwrap();
     client.close_window(&window).unwrap();
 
-    assert_eq!(window.name(), "oca-wabc12");
+    assert_eq!(window.name(), "fixParser");
+    assert_eq!(window.id(), "@42");
     assert_eq!(
         fixture.calls(),
         [
             format!("cwd={}", fixture.cwd.display()),
             "new-window".to_owned(),
             "-d".to_owned(),
+            "-P".to_owned(),
+            "-F".to_owned(),
+            "#{window_id}".to_owned(),
             "-n".to_owned(),
-            "oca-wabc12".to_owned(),
+            "fixParser".to_owned(),
             "--".to_owned(),
             "opencode".to_owned(),
+            "attach".to_owned(),
+            "http://127.0.0.1:4096/".to_owned(),
             "--session".to_owned(),
             "ses_target".to_owned(),
             "--call--".to_owned(),
+            "set-option".to_owned(),
+            "-w".to_owned(),
+            "-t".to_owned(),
+            "@42".to_owned(),
+            "@oca-ref".to_owned(),
+            "wabc12".to_owned(),
+            "--call--".to_owned(),
             "kill-window".to_owned(),
             "-t".to_owned(),
-            "=oca-wabc12".to_owned(),
+            "@42".to_owned(),
             "--call--".to_owned(),
         ]
     );
@@ -46,7 +65,13 @@ fn creates_and_closes_only_the_ref_owned_window_against_a_fake_tmux() {
 fn a_fake_tmux_failure_is_typed() {
     let fixture = Fixture::new(7);
     let error = TmuxClient::new(fixture.executable.as_os_str())
-        .new_window("wabc12", "ses_target", &fixture.cwd)
+        .new_window(
+            "wabc12",
+            "fixParser",
+            "http://127.0.0.1:4096/",
+            "ses_target",
+            &fixture.cwd,
+        )
         .unwrap_err();
 
     assert!(
@@ -87,7 +112,7 @@ impl Fixture {
         fs::write(
             &executable,
             format!(
-                "#!/bin/sh\nif [ \"$1\" = new-window ]; then printf 'cwd=%s\\n' \"$PWD\" >> '{}'; fi\nprintf '%s\\n' \"$@\" >> '{}'\nprintf '%s\\n' --call-- >> '{}'\nexit {exit_code}\n",
+                "#!/bin/sh\nif [ \"$1\" = new-window ]; then printf 'cwd=%s\\n' \"$PWD\" >> '{}'; printf '@42\\n'; fi\nprintf '%s\\n' \"$@\" >> '{}'\nprintf '%s\\n' --call-- >> '{}'\nexit {exit_code}\n",
                 log.display(),
                 log.display(),
                 log.display(),

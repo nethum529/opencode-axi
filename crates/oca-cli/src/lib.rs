@@ -635,6 +635,7 @@ pub struct AttachCommand {
     pub reference: String,
     pub session_id: String,
     pub cwd: PathBuf,
+    pub display_name: String,
 }
 
 /// Parse an argv sequence, including its executable name.
@@ -972,15 +973,17 @@ fn parse_attach(arguments: &[String]) -> Result<AttachCommand, OcaError> {
     let (reference, tail) = required_reference(arguments)?;
     let (session_id, tail) = required_first(tail, "session id")?;
     let (cwd, tail) = required_first(tail, "cwd")?;
+    let (display_name, tail) = required_first(tail, "display name")?;
     if !tail.is_empty() {
         return Err(usage(
-            "`__attach` accepts exactly a ref, session id, and cwd",
+            "`__attach` accepts exactly a ref, session id, cwd, and display name",
         ));
     }
     Ok(AttachCommand {
         reference: reference.to_owned(),
         session_id: session_id.to_owned(),
         cwd: cwd.into(),
+        display_name: display_name.to_owned(),
     })
 }
 
@@ -1121,11 +1124,12 @@ mod tests {
     #[test]
     fn attach_is_parseable_but_not_an_agent_surface_command() {
         assert_eq!(
-            parse_from(["oca", "__attach", "wabc12", "ses_1", "/repo"]).unwrap(),
+            parse_from(["oca", "__attach", "wabc12", "ses_1", "/repo", "fixParser",]).unwrap(),
             Command::Attach(AttachCommand {
                 reference: "wabc12".to_owned(),
                 session_id: "ses_1".to_owned(),
                 cwd: "/repo".into(),
+                display_name: "fixParser".to_owned(),
             }),
         );
     }

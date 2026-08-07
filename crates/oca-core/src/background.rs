@@ -156,10 +156,12 @@ mod tests {
             _reference: &str,
             _session_id: &str,
             _cwd: &Path,
+            display_name: &str,
             _display: DisplayMode,
         ) -> Result<(), OcaError> {
             self.calls.push("spawn");
             assert_eq!(self.calls[self.calls.len() - 2], "ack");
+            assert_eq!(display_name, "doWork");
             Ok(())
         }
 

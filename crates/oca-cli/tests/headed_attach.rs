@@ -470,7 +470,7 @@ fn headed_attach_records_and_closes_the_tab_after_terminal_state() {
     prepare_attach_home(home.path(), &socket, port, "herdr");
 
     let output = Command::new(env!("CARGO_BIN_EXE_oca"))
-        .args(["__attach", "wabc12", "ses_target", "/worker"])
+        .args(["__attach", "wabc12", "ses_target", "/worker", "sayHi"])
         .env("HOME", home.path())
         .current_dir(home.path())
         .output()
@@ -502,7 +502,7 @@ fn headed_attach_records_and_closes_the_tab_after_terminal_state() {
     );
     assert_eq!(calls[1]["params"]["label"], "oca");
     assert_eq!(calls[1]["params"]["focus"], false);
-    assert_eq!(calls[2]["params"]["label"], "wabc12");
+    assert_eq!(calls[2]["params"]["label"], "sayHi");
     assert_eq!(calls[2]["params"]["cwd"], "/worker");
     assert_eq!(calls[2]["params"]["focus"], false);
     assert_eq!(calls[3]["params"]["name"], "opencode");
@@ -541,7 +541,7 @@ fn a_follow_failure_keeps_the_persisted_tab_open_for_an_explicit_kill() {
     prepare_attach_home(home.path(), &socket, port, "herdr");
 
     let output = Command::new(env!("CARGO_BIN_EXE_oca"))
-        .args(["__attach", "wabc12", "ses_target", "/worker"])
+        .args(["__attach", "wabc12", "ses_target", "/worker", "fixParser"])
         .env("HOME", home.path())
         .current_dir(home.path())
         .output()
@@ -576,6 +576,7 @@ fn a_follow_failure_keeps_the_persisted_tab_open_for_an_explicit_kill() {
         Some("t1"),
         "`oca k` needs the persisted tab id to close a tab the follower abandoned"
     );
+    assert_eq!(calls[2]["params"]["label"], "fixParser");
 }
 
 #[test]
@@ -650,6 +651,7 @@ fn background_spawn_then_kill_closes_the_tab_and_exits_its_tui_process() {
         ]
     );
     assert_eq!(calls[4]["params"]["tab_id"], "spawned-t1");
+    assert_eq!(calls[2]["params"]["label"], "keepRunning");
     assert_eq!(
         fs::read_to_string(home.path().join("attached-opencode-args"))
             .unwrap()
@@ -665,7 +667,7 @@ fn a_headless_ref_ends_the_attach_helper_quietly() {
     prepare_attach_home(home.path(), &socket, 1, "headless");
 
     let output = Command::new(env!("CARGO_BIN_EXE_oca"))
-        .args(["__attach", "wabc12", "ses_target", "/worker"])
+        .args(["__attach", "wabc12", "ses_target", "/worker", "wabc12"])
         .env("HOME", home.path())
         .current_dir(home.path())
         .output()
@@ -745,7 +747,7 @@ fn no_herdr_and_no_tmux_is_a_silent_headless_http_dispatch() {
 }
 
 #[test]
-fn no_herdr_inside_tmux_creates_and_cleans_up_a_ref_named_window() {
+fn no_herdr_inside_tmux_creates_and_cleans_up_a_task_named_window() {
     let home = tempfile::tempdir().unwrap();
     let missing_socket = home.path().join("missing-herdr.sock");
     let tmux = FakeTmux::new(home.path());
@@ -770,15 +772,15 @@ fn no_herdr_inside_tmux_creates_and_cleans_up_a_ref_named_window() {
     let record = only_ref(home.path());
     assert_eq!(record.display.as_deref(), Some("tmux"));
     opencode.join().unwrap();
-    let calls = tmux.wait_for_calls(2);
+    let calls = tmux.wait_for_calls(3);
     assert_eq!(
         calls,
         [
             format!(
-                "new-window -d -n oca-{} -- opencode --session ses_target",
-                record.id
+                "new-window -d -P -F #{{window_id}} -n finishInside -- opencode attach http://127.0.0.1:{port}/ --session ses_target"
             ),
-            format!("kill-window -t =oca-{}", record.id),
+            format!("set-option -w -t @42 @oca-ref {}", record.id),
+            "kill-window -t @42".to_owned(),
         ]
     );
 }
@@ -2097,7 +2099,10 @@ impl FakeTmux {
         let log = directory.join("tmux-calls");
         fs::write(
             &executable,
-            format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n", log.display()),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nif [ \"$1\" = new-window ]; then printf '@42\\n'; fi\n",
+                log.display()
+            ),
         )
         .unwrap();
         let mut permissions = fs::metadata(&executable).unwrap().permissions();

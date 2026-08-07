@@ -723,6 +723,7 @@ impl ForegroundBackend for ProductionBackend {
         reference: &str,
         session_id: &str,
         cwd: &Path,
+        display_name: &str,
         display: DisplayMode,
     ) -> Result<(), OcaError> {
         if display == DisplayMode::Headless {
@@ -735,6 +736,7 @@ impl ForegroundBackend for ProductionBackend {
             .arg(reference)
             .arg(session_id)
             .arg(cwd)
+            .arg(display_name)
             .current_dir(cwd)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
