@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 fs2 = "0.4"
+httparse = "1"
 oca-opencode = { path = "../oca-opencode" }
 oca-state = { path = "../oca-state" }
 serde = { version = "1", features = ["derive"] }

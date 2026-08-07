@@ -110,13 +110,22 @@ pub(crate) fn create_session_error(error: ConnectError<CreateSessionError>) -> O
 }
 
 fn startup_error(diagnostics: Vec<oca_server::StartupDiagnostic>) -> OcaError {
+    let code = if diagnostics.iter().any(|diagnostic| {
+        matches!(
+            diagnostic.stage,
+            oca_server::StartupStage::Spawn | oca_server::StartupStage::Readiness
+        )
+    }) {
+        ErrorCode::ServerUnreachable
+    } else {
+        ErrorCode::ServerStartTimeout
+    };
     let detail = diagnostics
         .into_iter()
         .map(|diagnostic| diagnostic.to_string())
         .collect::<Vec<_>>()
         .join("; ");
-    OcaError::new(ErrorCode::ServerStartTimeout)
-        .with_error(format!("OpenCode could not be started: {detail}"))
+    OcaError::new(code).with_error(format!("OpenCode could not be started: {detail}"))
 }
 
 fn discovery_error(error: std::io::Error) -> OcaError {
@@ -183,5 +192,34 @@ mod tests {
             body: "temporarily unavailable".to_owned(),
         });
         assert_eq!(error.code(), ErrorCode::ServerUnavailable.as_str());
+    }
+
+    #[test]
+    fn dead_replacement_startup_is_server_unreachable() {
+        for stage in [
+            oca_server::StartupStage::Spawn,
+            oca_server::StartupStage::Readiness,
+        ] {
+            let error =
+                create_session_error(ConnectError::Startup(vec![oca_server::StartupDiagnostic {
+                    port: 4097,
+                    stage,
+                    reason: "replacement stayed unreachable".to_owned(),
+                }]));
+
+            assert_eq!(error.code(), ErrorCode::ServerUnreachable.as_str());
+        }
+    }
+
+    #[test]
+    fn unavailable_ports_without_a_spawn_keep_start_timeout_classification() {
+        let error =
+            create_session_error(ConnectError::Startup(vec![oca_server::StartupDiagnostic {
+                port: 4096,
+                stage: oca_server::StartupStage::Availability,
+                reason: "loopback port is unavailable".to_owned(),
+            }]));
+
+        assert_eq!(error.code(), ErrorCode::ServerStartTimeout.as_str());
     }
 }
