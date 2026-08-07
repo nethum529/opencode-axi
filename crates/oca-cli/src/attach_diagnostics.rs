@@ -105,16 +105,8 @@ pub(crate) fn worker_identity(
     let agent = record.role.as_deref().unwrap_or("unknown-agent");
     let alias = record.alias.as_deref().unwrap_or("unknown-model");
     let effort = record.effort.as_deref().unwrap_or("unknown-variant");
-    let (model, variant) = resolve_model(alias, effort, config.model_catalog()).map_or_else(
-        |_| (alias.to_owned(), effort.to_owned()),
-        |resolved| {
-            (
-                format!("{}/{}", resolved.provider, resolved.model),
-                resolved.variant,
-            )
-        },
-    );
-    let mut identity = format!("{reference} | {agent} | {model} | {variant} | {COMPOSER_GUARD}");
+    let (model, variant) = resolved_model(alias, effort, config);
+    let mut identity = binding_identity(reference, agent, &model, &variant);
     if let Some(status) = probe.status() {
         identity.push_str(" | ");
         identity.push_str(HISTORY_IDENTITY_WARNING);
@@ -123,6 +115,59 @@ pub(crate) fn worker_identity(
         }
     }
     identity
+}
+
+/// Builds the full headed binding shown on oca-owned user-visible surfaces.
+pub(crate) fn binding_identity(reference: &str, agent: &str, model: &str, variant: &str) -> String {
+    format!("{reference} | {agent} | {model} | {variant} | {COMPOSER_GUARD}")
+}
+
+/// Builds a full binding for a persisted headed ref, if it has a headed display.
+pub(crate) fn headed_binding(record: &RefRecord, config: &OcaConfig) -> Option<String> {
+    matches!(record.display.as_deref(), Some("herdr" | "tmux")).then(|| {
+        let agent = record.role.as_deref().unwrap_or("unknown-agent");
+        let alias = record.alias.as_deref().unwrap_or("unknown-model");
+        let effort = record.effort.as_deref().unwrap_or("unknown-variant");
+        let (model, variant) = resolved_model(alias, effort, config);
+        binding_identity(&record.id, agent, &model, &variant)
+    })
+}
+
+/// Builds herdr's compact agent name from the dispatch binding.
+pub(crate) fn herdr_agent_name(reference: &str, record: &RefRecord, config: &OcaConfig) -> String {
+    let agent = record.role.as_deref().unwrap_or("unknown-agent");
+    let model_short = record.alias.as_deref().unwrap_or("unknown-model");
+    let effort = record.effort.as_deref().unwrap_or("unknown-variant");
+    let (_, variant) = resolved_model(model_short, effort, config);
+    agent_name_slug(reference, agent, model_short, &variant)
+}
+
+fn resolved_model(alias: &str, effort: &str, config: &OcaConfig) -> (String, String) {
+    resolve_model(alias, effort, config.model_catalog()).map_or_else(
+        |_| (alias.to_owned(), effort.to_owned()),
+        |resolved| {
+            (
+                format!("{}/{}", resolved.provider, resolved.model),
+                resolved.variant,
+            )
+        },
+    )
+}
+
+fn agent_name_slug(reference: &str, agent: &str, model_short: &str, variant: &str) -> String {
+    let raw = format!("{reference}-{agent}-{model_short}-{variant}");
+    let mut slug = raw
+        .bytes()
+        .map(|byte| match byte.to_ascii_lowercase() {
+            byte @ (b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_') => char::from(byte),
+            _ => '-',
+        })
+        .collect::<String>();
+    if !slug.starts_with(|character: char| character.is_ascii_lowercase()) {
+        slug.insert_str(0, "w-");
+    }
+    slug.truncate(32);
+    slug
 }
 
 #[cfg(test)]
@@ -156,6 +201,40 @@ mod tests {
         );
 
         assert!(identity.contains("HISTORY UNREADABLE: retryCount poisoning"));
+    }
+
+    #[test]
+    fn herdr_agent_slug_lowercases_and_maps_configured_punctuation() {
+        assert_eq!(
+            agent_name_slug("W6H6MN", "Impl/Review", "LUNA@Preview", "LOW!"),
+            "w6h6mn-impl-review-luna-preview-"
+        );
+    }
+
+    #[test]
+    fn herdr_agent_slug_truncates_long_configured_components_to_32_characters() {
+        let slug = agent_name_slug(
+            "w6h6mn",
+            "impl/review",
+            "an-extremely-long-user-model-alias",
+            "extra-high",
+        );
+
+        assert_eq!(slug, "w6h6mn-impl-review-an-extremely-");
+        assert_eq!(slug.len(), 32);
+        assert!(slug.starts_with(char::is_lowercase));
+        assert!(slug.bytes().all(|byte| byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
+            || matches!(byte, b'-' | b'_')));
+    }
+
+    #[test]
+    fn herdr_agent_slug_is_deterministic_and_guarantees_a_lowercase_prefix() {
+        let first = agent_name_slug("7REF", "Impl", "Luna", "Low");
+        let second = agent_name_slug("7REF", "Impl", "Luna", "Low");
+
+        assert_eq!(first, second);
+        assert_eq!(first, "w-7ref-impl-luna-low");
     }
 
     #[test]

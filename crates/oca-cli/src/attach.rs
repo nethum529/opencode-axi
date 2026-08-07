@@ -14,7 +14,7 @@ use url::Url;
 use crate::{
     AttachCommand,
     attach_diagnostics::{
-        HistoryProbe, journal_history_diagnostic, probe_history, worker_identity,
+        HistoryProbe, herdr_agent_name, journal_history_diagnostic, probe_history, worker_identity,
     },
 };
 
@@ -79,6 +79,7 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
     let client = OpenCodeClient::new(base_url.clone());
     let history = probe_history(&client, &command.session_id).await;
     let identity = worker_identity(&command.reference, &record, &config, &history);
+    let agent_name = herdr_agent_name(&command.reference, &record, &config);
 
     match mode {
         DisplayMode::Herdr => {
@@ -89,6 +90,7 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
                 message_id: &message_id,
                 directory: &directory,
                 worker_identity: &identity,
+                agent_name: &agent_name,
                 client: &client,
                 history: &history,
             };
@@ -102,6 +104,7 @@ async fn run_attach(command: &AttachCommand, home: &Path) -> Result<(), String> 
                 message_id: &message_id,
                 directory: &directory,
                 worker_identity: &identity,
+                agent_name: &agent_name,
                 client: &client,
                 history: &history,
             };
@@ -118,6 +121,7 @@ struct AttachTurn<'a> {
     message_id: &'a str,
     directory: &'a str,
     worker_identity: &'a str,
+    agent_name: &'a str,
     client: &'a OpenCodeClient,
     history: &'a HistoryProbe,
 }
@@ -149,11 +153,10 @@ async fn run_herdr_attach(
         .map_err(|error| error.to_string())?;
 
     let launch_result = async {
-        eprintln!("headed worker identity: {}", turn.worker_identity);
         herdr
             .agent_start(
                 &tab,
-                turn.worker_identity,
+                turn.agent_name,
                 opencode_attach_argv(turn.base_url.as_str(), &command.session_id),
             )
             .await

@@ -217,7 +217,7 @@ fn agent_start_decouples_worker_identity_from_executable_kind() {
         1 => created_tab(request),
         2 => {
             assert_request(request, "agent.start");
-            assert_eq!(request["params"]["name"], "wabc12 | impl | openai/gpt-5.6");
+            assert_eq!(request["params"]["name"], "wabc12-impl-luna-low");
             assert_eq!(request["params"]["kind"], "opencode");
             assert_eq!(request["params"]["pane_id"], "p1");
             assert_eq!(request["params"]["args"], json!(["--session", "ses_1"]));
@@ -242,7 +242,7 @@ fn agent_start_decouples_worker_identity_from_executable_kind() {
 
     let agent = run(client.agent_start(
         &tab,
-        "wabc12 | impl | openai/gpt-5.6",
+        "wabc12-impl-luna-low",
         vec!["opencode".into(), "--session".into(), "ses_1".into()],
     ))
     .unwrap();

@@ -18,7 +18,7 @@ use url::Url;
 
 use crate::{
     FollowCommand,
-    attach_diagnostics::{HistoryProbe, journal_history_diagnostic, probe_history},
+    attach_diagnostics::{HistoryProbe, headed_binding, journal_history_diagnostic, probe_history},
     crash_recovery::{ReconcileCommand, event_cursor_failpoint, persist_intent, reconcile_ref},
     worktree_dispatch::finalize_turn,
 };
@@ -70,6 +70,7 @@ pub async fn execute_follow(
             .with_error(format!("failed to load configuration: {error}"))
             .with_help("fix ~/.oca/config.toml and retry")
     })?;
+    let headed_binding = headed_binding(&record, &config);
     let server = ConnectOrStart::from_home(home, &config.server)
         .read_record()
         .map_err(|error| server_unreachable(&command.reference, &error.to_string()))?
@@ -157,7 +158,10 @@ pub async fn execute_follow(
                 },
                 stdout: with_history_warning(
                     &history,
-                    render_terminal(&command.reference, &terminal, command.json),
+                    with_headed_binding(
+                        headed_binding.as_deref(),
+                        render_terminal(&command.reference, &terminal, command.json),
+                    ),
                 ),
             })
         }
@@ -165,13 +169,23 @@ pub async fn execute_follow(
             exit: FollowExit::Timeout,
             stdout: with_history_warning(
                 &history,
-                format!("oca wake ref={} state=timeout\n", command.reference),
+                with_headed_binding(
+                    headed_binding.as_deref(),
+                    format!("oca wake ref={} state=timeout\n", command.reference),
+                ),
             ),
         }),
         FollowOutcome::ServerUnreachable => Err(server_unreachable(
             &command.reference,
             "the OpenCode server could not be reached",
         )),
+    }
+}
+
+fn with_headed_binding(binding: Option<&str>, output: String) -> String {
+    match binding {
+        Some(binding) => format!("headed: {binding}\n{output}"),
+        None => output,
     }
 }
 
