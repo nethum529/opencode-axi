@@ -247,10 +247,22 @@ async fn run_tmux_attach(
             &command.cwd,
         )
         .map_err(|error| error.to_string())?;
-    let mut journal = EventJournal::create(turn.state_directory, turn.reference, turn.message_id)
-        .map_err(|error| format!("could not create event journal: {error}"))?;
-    journal_history_diagnostic(&mut journal, &command.session_id, turn.history)
-        .map_err(|error| format!("could not record history diagnostic: {error}"))?;
+    // The window already exists, so journal setup must not return past the
+    // cleanup arm below or it strands the window it just opened.
+    let mut journal =
+        match EventJournal::create(turn.state_directory, turn.reference, turn.message_id)
+            .map_err(|error| format!("could not create event journal: {error}"))
+            .and_then(|mut journal| {
+                journal_history_diagnostic(&mut journal, &command.session_id, turn.history)
+                    .map(|()| journal)
+                    .map_err(|error| format!("could not record history diagnostic: {error}"))
+            }) {
+            Ok(journal) => journal,
+            Err(error) => {
+                let _ = tmux.close_window(&window);
+                return Err(error);
+            }
+        };
     let target = FollowTarget {
         session_id: command.session_id.clone(),
         message_id: turn.message_id.to_owned(),

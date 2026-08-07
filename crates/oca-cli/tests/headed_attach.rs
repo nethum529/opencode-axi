@@ -1175,6 +1175,13 @@ fn spawn_herdr_lifecycle_with_rename(
             writeln!(stream, "{}", json!({"id":request_id,"result":result})).unwrap();
             calls.lock().unwrap().push(request);
         }
+        // Record anything sent beyond the expected sequence. Without this, a
+        // test asserting oca sent no further call passes merely because the
+        // fixture stopped listening.
+        if let Some(stream) = try_accept_unix(&listener, Duration::from_millis(500)) {
+            let request = read_unix_request(&stream);
+            calls.lock().unwrap().push(request);
+        }
     })
 }
 
@@ -1186,6 +1193,28 @@ fn accept_discovery_probe(listener: &UnixListener) {
         0,
         "herdr discovery probe must not send a protocol request"
     );
+}
+
+/// Accepts a connection the fixture does not expect, so a test asserting that
+/// oca sent nothing further fails when oca in fact sent something.
+fn try_accept_unix(listener: &UnixListener, patience: Duration) -> Option<UnixStream> {
+    listener.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + patience;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_read_timeout(Some(patience)).unwrap();
+                return Some(stream);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("could not accept a herdr socket connection: {error}"),
+        }
+    }
 }
 
 fn accept_unix_with_timeout(listener: &UnixListener) -> UnixStream {
