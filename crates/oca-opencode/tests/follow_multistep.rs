@@ -49,7 +49,10 @@ async fn completed_three_message_turn_uses_reply_from_an_earlier_tool_step() {
         panic!("completed fixture must classify as terminal");
     };
     assert_eq!(terminal.state, WorkerState::Done);
-    assert_eq!(terminal.message.id, "msg_assistant_step_3");
+    assert_eq!(
+        terminal.message.id, "msg_assistant_step_3",
+        "the newest attributed step stays the terminal boundary, not another dispatch's message"
+    );
     assert_eq!(
         terminal.message.reply().unwrap()["files"],
         serde_json::json!(["src/follow.rs"]),
@@ -59,6 +62,7 @@ async fn completed_three_message_turn_uses_reply_from_an_earlier_tool_step() {
 
 #[tokio::test]
 async fn completed_three_message_turn_without_any_reply_is_a_protocol_mismatch() {
+    // The fixture also carries another dispatch's successful reply, which must not be borrowed.
     let error = follow_fixture(include_str!("fixtures/follow_three_message_no_reply.json"))
         .await
         .unwrap_err();

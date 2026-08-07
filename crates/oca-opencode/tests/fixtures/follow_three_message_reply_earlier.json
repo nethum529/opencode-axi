@@ -50,5 +50,21 @@
       { "type": "tool", "tool": "bash" },
       { "type": "step-finish", "reason": "tool-calls" }
     ]
+  },
+  {
+    "info": {
+      "id": "msg_assistant_other_dispatch",
+      "sessionID": "ses_target",
+      "role": "assistant",
+      "parentID": "msg_other_dispatch",
+      "time": { "created": 41, "completed": 50 },
+      "finish": "stop"
+    },
+    "parts": [
+      {
+        "type": "text",
+        "text": "{\"status\":\"blocked\",\"files\":[\"src/other.rs\"],\"note\":\"This reply belongs to a different dispatch in the same session and must never be attributed to this turn.\"}"
+      }
+    ]
   }
 ]

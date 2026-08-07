@@ -854,6 +854,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_multi_step_event_turn_classifies_from_an_earlier_step_reply() {
+        // `message.updated` frames never carry parts, so a live multi-step turn can only expose
+        // its reply through the structured field of the step that emitted it.
+        let step = |id: &str, structured: Option<Value>| FollowMessage {
+            id: id.to_owned(),
+            session_id: "ses_target".to_owned(),
+            parent_id: Some("msg_this_dispatch".to_owned()),
+            role: "assistant".to_owned(),
+            completed: true,
+            structured,
+            parts: Vec::new(),
+            error: None,
+        };
+        let transport = ScriptedTransport {
+            subscriptions: Mutex::new(VecDeque::from([subscription([
+                Ok(Some(event(
+                    "evt-step-1",
+                    "message.updated",
+                    Some(step("msg_step_1", None)),
+                ))),
+                Ok(Some(event(
+                    "evt-step-2",
+                    "message.updated",
+                    Some(step(
+                        "msg_step_2",
+                        Some(serde_json::json!({ "status": "done", "files": ["src/follow.rs"] })),
+                    )),
+                ))),
+                Ok(Some(event(
+                    "evt-step-3",
+                    "message.updated",
+                    Some(step("msg_step_3", None)),
+                ))),
+                Ok(Some(event("evt-idle-own", "session.idle", None))),
+            ])])),
+            reconciliations: Mutex::new(VecDeque::from([Ok(Vec::new())])),
+            cursors: Mutex::new(Vec::new()),
+        };
+
+        let outcome = follow_until_terminal_with_policy::<_, Journal>(
+            &transport,
+            &target(),
+            None,
+            None,
+            test_policy(),
+        )
+        .await
+        .unwrap();
+
+        let FollowOutcome::Terminal(terminal) = outcome else {
+            panic!("a completed multi-step turn must terminate");
+        };
+        assert_eq!(terminal.state, WorkerState::Done);
+        assert_eq!(
+            terminal.message.id, "msg_step_3",
+            "the newest attributed step stays the terminal boundary"
+        );
+        assert_eq!(
+            terminal.message.reply().unwrap()["files"],
+            serde_json::json!(["src/follow.rs"])
+        );
+    }
+
+    #[tokio::test]
     async fn rejected_history_falls_back_to_attributed_terminal_events_and_journals_them() {
         let transport = ScriptedTransport {
             subscriptions: Mutex::new(VecDeque::from([subscription([

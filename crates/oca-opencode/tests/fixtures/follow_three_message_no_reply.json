@@ -46,5 +46,21 @@
       { "type": "tool", "tool": "bash" },
       { "type": "step-finish", "reason": "tool-calls" }
     ]
+  },
+  {
+    "info": {
+      "id": "msg_assistant_other_dispatch",
+      "sessionID": "ses_target",
+      "role": "assistant",
+      "parentID": "msg_other_dispatch",
+      "time": { "created": 41, "completed": 50 },
+      "finish": "stop"
+    },
+    "parts": [
+      {
+        "type": "text",
+        "text": "{\"status\":\"done\",\"files\":[\"src/other.rs\"],\"note\":\"A different dispatch succeeded, which must not rescue this turn from its missing reply.\"}"
+      }
+    ]
   }
 ]
