@@ -29,6 +29,7 @@ use crate::{
     DispatchCommand,
     attach_diagnostics::binding_identity,
     crash_recovery::{RESERVED_SESSION_ID, intent_failpoint, persist_intent, prompt_sha256},
+    preamble::resolve_text_preamble,
     scope::Scope,
     transport::{CreateSessionOperation, create_session_error, open_code_error, prompt_error},
     worktree_dispatch::{WorktreeDispatch, finalize_turn},
@@ -235,6 +236,8 @@ pub(crate) fn prepare_dispatch(
             .with_help("configure the role under [roles] and retry"));
     }
     let contract = ReplyContract::resolve(&command.role)?;
+    let schema_transport = config.dispatch.transport == DispatchTransport::Schema;
+    let text_preamble = resolve_text_preamble(&config, &command.role, home)?;
     let cwd = std::env::current_dir().map_err(io_error)?;
     let scope = crate::scope::current(home, &cwd).map_err(io_error)?;
     let policy = WorkerPolicy::restricted([cwd.clone()]);
@@ -278,7 +281,8 @@ pub(crate) fn prepare_dispatch(
         prompt: command.prompt,
         role: command.role,
         contract,
-        schema_transport: config.dispatch.transport == DispatchTransport::Schema,
+        schema_transport,
+        text_preamble,
         policy,
         cwd,
         display,

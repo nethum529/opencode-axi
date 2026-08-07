@@ -15,6 +15,7 @@ mod events;
 mod follow;
 mod foreground;
 mod list;
+mod preamble;
 mod publish;
 mod pull_request;
 mod scope;

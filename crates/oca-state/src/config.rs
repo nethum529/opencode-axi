@@ -521,7 +521,7 @@ fn default_roles() -> BTreeMap<String, RoleConfig> {
             "impl".to_owned(),
             RoleConfig {
                 schema: "~/.oca/schemas/impl.json".to_owned(),
-                preamble_file: Some("~/.oca/roles/impl.md".to_owned()),
+                preamble_file: None,
                 permission: PermissionMode::Deny,
                 min_words: 25,
             },
@@ -641,6 +641,7 @@ mod tests {
         assert!(config.models.contains_key("flash"));
         assert!(config.roles.contains_key("impl"));
         assert!(config.roles.contains_key("review"));
+        assert!(config.roles["impl"].preamble_file.is_none());
         assert_eq!(config.dispatch.transport, super::DispatchTransport::Text);
         assert!(config.herdr.close_on_done);
         assert!(!config.publish.push);

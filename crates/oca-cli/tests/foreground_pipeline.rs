@@ -92,6 +92,14 @@ fn end_to_end_foreground_has_one_turn_one_terminal_and_one_golden_final_result()
     assert_eq!(prompt["variant"], "high");
     assert_eq!(prompt["agent"], "impl");
     assert_eq!(prompt["parts"].as_array().unwrap().len(), 1);
+    let outgoing_text = prompt["parts"][0]["text"]
+        .as_str()
+        .expect("text prompt body");
+    assert!(outgoing_text.starts_with("# oca impl role\n"));
+    assert!(outgoing_text.contains(
+        "Use the literal opening and closing fence lines shown here:\n```json\n<the contract JSON>\n```\n"
+    ));
+    assert!(outgoing_text.ends_with("\n\nimplement the ticket"));
 
     let stdout = String::from_utf8(output.stdout).expect("UTF-8 output");
     let mut lines = stdout.lines();
@@ -317,6 +325,7 @@ fn request_directory(path: &str) -> std::path::PathBuf {
 fn serve_foreground(listener: TcpListener) -> Vec<CapturedRequest> {
     let mut captured = Vec::new();
     let mut message_id = None;
+    let mut prompt_text = None;
     for index in 0..6 {
         let (mut stream, _) = listener.accept().expect("fake accepts request");
         let request = read_request(&mut stream);
@@ -351,6 +360,9 @@ fn serve_foreground(listener: TcpListener) -> Vec<CapturedRequest> {
             3 => {
                 assert_eq!(request.path, "/session/ses_target/prompt_async");
                 message_id = request.body["messageID"].as_str().map(ToOwned::to_owned);
+                prompt_text = request.body["parts"][0]["text"]
+                    .as_str()
+                    .map(ToOwned::to_owned);
                 write_response(&mut stream, "204 No Content", "text/plain", "");
             }
             4 => {
@@ -361,7 +373,7 @@ fn serve_foreground(listener: TcpListener) -> Vec<CapturedRequest> {
                         "sessionID": "ses_target",
                         "role": "user"
                     },
-                    "parts": [{"type":"text","text":"implement the ticket"}]
+                    "parts": [{"type":"text","text":prompt_text.as_deref().unwrap()}]
                 }]);
                 write_response(&mut stream, "200 OK", "application/json", &body.to_string());
             }
