@@ -178,6 +178,13 @@ fn is_transport_loss(error: &reqwest::Error) -> bool {
 
     let mut source = error.source();
     while let Some(cause) = source {
+        // Abrupt HTTP body loss may stay typed as hyper channel state or be
+        // wrapped as an I/O EOF (for example, between chunk-size lines).
+        if let Some(error) = cause.downcast_ref::<hyper::Error>()
+            && (error.is_incomplete_message() || error.is_closed() || error.is_canceled())
+        {
+            return true;
+        }
         if let Some(error) = cause.downcast_ref::<io::Error>()
             && matches!(
                 error.kind(),
@@ -187,6 +194,7 @@ fn is_transport_loss(error: &reqwest::Error) -> bool {
                     | io::ErrorKind::NotConnected
                     | io::ErrorKind::BrokenPipe
                     | io::ErrorKind::TimedOut
+                    | io::ErrorKind::UnexpectedEof
             )
         {
             return true;

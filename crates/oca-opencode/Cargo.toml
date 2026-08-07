@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+hyper = { version = "1", default-features = false }
 oca-core = { path = "../oca-core" }
 # OpenCode is loopback-only. Avoid initializing and linking an unused TLS backend on
 # every short-lived CLI invocation; reqwest's HTTP transport remains sufficient.
