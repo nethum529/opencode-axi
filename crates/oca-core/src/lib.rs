@@ -11,6 +11,7 @@ pub mod policy;
 pub mod reply;
 pub mod reply_decode;
 pub mod resolver;
+pub mod role_preamble;
 
 pub use background::{BackgroundOutcome, BackgroundRequest, run_background};
 pub use display::DisplayMode;
@@ -42,6 +43,10 @@ pub use reply_decode::{ReplyContract, decode_role_reply};
 pub use resolver::{
     Catalog, DEFAULT_MODEL_DEFINITIONS, DefaultModelDefinition, Effort, EffortInput, ModelCatalog,
     ModelDefinition, ModelEntry, ModelSpec, ResolvedModel, normalize_alias, resolve_model,
+};
+pub use role_preamble::{
+    RolePreamble, STYLE_EXEMPTION, compose_text_prompt, default_role_preamble,
+    render_role_preambles,
 };
 
 /// A canonical short reference used by oca state and worktree operations.

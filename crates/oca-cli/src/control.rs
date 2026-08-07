@@ -7,7 +7,7 @@ use std::{
 
 use oca_core::{
     ErrorCode, MessageIdGenerator, OcaError, RANDOM_SUFFIX_WIDTH, ReplyContract, ResolvedModel,
-    WorkerPolicy, resolve_model,
+    WorkerPolicy, compose_text_prompt, resolve_model,
 };
 use oca_display::{Acknowledgement, HerdrClient};
 use oca_opencode::{OpenCodeClient, PromptRequest, TextPart};
@@ -24,6 +24,7 @@ use crate::{
         ReconcileCommand, persist_intent, prompt_sha256, reconcile_ref, remove_intent,
     },
     foreground::{DispatchSubscription, confirm_prompt_landed},
+    preamble::resolve_text_preamble,
     transport::{open_code_error, prompt_error},
 };
 
@@ -47,8 +48,12 @@ pub async fn execute_message(
     let home = home.as_ref();
     let state_directory = home.join(".oca");
     let _turn_lock = acquire_turn_lock(&state_directory, &command.reference)?;
-    reconcile_ref(home, &command.reference, ReconcileCommand::Message).await?;
     let store = RefStore::with_paths(RefStorePaths::in_directory(&state_directory));
+    let prior_record = resolve_active_ref(&store, &command.reference)?;
+    let config = load_config(home)?;
+    let prior_role = required_metadata(&prior_record, "role")?;
+    let text_preamble = resolve_text_preamble(&config, prior_role, home)?;
+    reconcile_ref(home, &command.reference, ReconcileCommand::Message).await?;
     let record = resolve_active_ref(&store, &command.reference)?;
     let state = required_state(&record, &command.reference)?;
     if state == RefState::Running {
@@ -70,8 +75,8 @@ pub async fn execute_message(
             .with_error("the worker session was aborted"));
     }
 
-    let config = load_config(home)?;
-    let context = ControlContext::from_record(&record, &config, command.effort.as_deref())?;
+    let context = ControlContext::from_record(&record, &config, command.effort.as_deref())?
+        .with_resolved_text_preamble(text_preamble);
     context
         .model
         .validate_tooled()
@@ -88,19 +93,16 @@ pub async fn execute_message(
         .map(DispatchSubscription::new)
         .map_err(|error| open_code_error(error).with_ref(&command.reference))?;
     let message_id = mint_message_id()?;
+    let prompt = context.prompt_request(message_id.clone(), command.message.clone());
+    let prompt_text = prompt.parts[0].text.clone();
     let mut intent = Intent::new(&command.reference, IntentOperation::Message);
     intent.session_id = Some(record.session_id.clone());
     intent.message_id = Some(message_id.clone());
-    intent.prompt_sha256 = Some(prompt_sha256(&command.message));
+    intent.prompt_sha256 = Some(prompt_sha256(&prompt_text));
     intent.set_phase(IntentPhase::PromptUncertain);
     let intents = IntentStore::in_directory(&state_directory);
     persist_intent(&intents, &intent)?;
-    let result = client
-        .prompt_async(
-            &record.session_id,
-            context.prompt_request(message_id.clone(), command.message.clone()),
-        )
-        .await;
+    let result = client.prompt_async(&record.session_id, prompt).await;
     if let Err(error) = result {
         let error = prompt_error(error).with_ref(&command.reference);
         if error.code() != ErrorCode::PromptUncertain.as_str() {
@@ -113,7 +115,7 @@ pub async fn execute_message(
         &mut subscription,
         &record.session_id,
         &message_id,
-        &command.message,
+        &prompt_text,
     )
     .await
     .map_err(|error| error.with_ref(&command.reference))?;
@@ -165,7 +167,8 @@ pub async fn execute_queue(
     }
 
     let config = load_config(home)?;
-    let context = ControlContext::from_record(&record, &config, None)?;
+    let context =
+        ControlContext::from_record(&record, &config, None)?.with_text_preamble(&config, home)?;
     context
         .model
         .validate_tooled()
@@ -264,6 +267,7 @@ struct ControlContext {
     contract: ReplyContract,
     policy: WorkerPolicy,
     schema_transport: bool,
+    text_preamble: Option<String>,
 }
 
 impl ControlContext {
@@ -292,11 +296,26 @@ impl ControlContext {
             contract: ReplyContract::resolve(&role)?,
             policy: WorkerPolicy::restricted([cwd]),
             schema_transport: config.dispatch.transport == DispatchTransport::Schema,
+            text_preamble: None,
             role,
         })
     }
 
+    fn with_text_preamble(mut self, config: &OcaConfig, home: &Path) -> Result<Self, OcaError> {
+        self.text_preamble = resolve_text_preamble(config, &self.role, home)?;
+        Ok(self)
+    }
+
+    fn with_resolved_text_preamble(mut self, preamble: Option<String>) -> Self {
+        self.text_preamble = preamble;
+        self
+    }
+
     fn prompt_request(&self, message_id: String, text: String) -> PromptRequest {
+        let text = match self.text_preamble.as_deref() {
+            Some(preamble) => compose_text_prompt(preamble, &text),
+            None => text,
+        };
         PromptRequest {
             message_id,
             model: self.model.clone(),

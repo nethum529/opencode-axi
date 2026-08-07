@@ -6,7 +6,7 @@ use serde_json::Value;
 
 use crate::{
     DisplayMode, OcaError, PermissionProfile, ReplyContract, ResolvedModel, RoleReply,
-    WorkerPolicy, decode_role_reply, task_display_name, validate_reply_floor,
+    WorkerPolicy, compose_text_prompt, decode_role_reply, task_display_name, validate_reply_floor,
 };
 
 /// A fully locally-resolved foreground dispatch.
@@ -18,6 +18,8 @@ pub struct ForegroundRequest {
     pub contract: ReplyContract,
     /// Whether to retain the legacy JSON-schema output transport for this turn.
     pub schema_transport: bool,
+    /// The role contract prefixed only on text-transport prompts.
+    pub text_preamble: Option<String>,
     pub policy: WorkerPolicy,
     pub cwd: PathBuf,
     pub display: DisplayMode,
@@ -258,12 +260,16 @@ where
         Ok(message_id) => message_id,
         Err(error) => return Err(backend.fail_before_prompt(error)),
     };
+    let prompt_text = request.text_preamble.as_deref().map_or_else(
+        || request.prompt.clone(),
+        |preamble| compose_text_prompt(preamble, &request.prompt),
+    );
     let prompt = DispatchPrompt {
         message_id: message_id.clone(),
         model: request.model.clone(),
         variant: request.model.variant.clone(),
         role: request.role.clone(),
-        text: request.prompt.clone(),
+        text: prompt_text,
         output_schema: request.schema_transport.then(|| request.contract.schema()),
         permission: request.policy.permission_profile(),
     };
@@ -701,6 +707,7 @@ mod tests {
             let mut backend = FakeBackend::normal();
             let mut request = request("luna", "h");
             request.schema_transport = schema_transport;
+            request.text_preamble = (!schema_transport).then(|| "role contract".to_owned());
 
             block_on(run_foreground(&mut backend, request)).unwrap();
 
@@ -716,6 +723,14 @@ mod tests {
             assert!(
                 backend.calls.contains(&"confirm"),
                 "landed-prompt confirmation is transport-independent"
+            );
+            assert_eq!(
+                backend.prompt.as_ref().expect("prompt captured").text,
+                if schema_transport {
+                    "do the work"
+                } else {
+                    "role contract\n\ndo the work"
+                }
             );
         }
     }
@@ -877,6 +892,7 @@ mod tests {
             role: "impl".to_owned(),
             contract: ReplyContract::Impl,
             schema_transport: false,
+            text_preamble: None,
             policy: WorkerPolicy::restricted([cwd.clone()]),
             cwd,
             display: DisplayMode::Herdr,

@@ -1800,6 +1800,7 @@ name = "xtask"
 version = "0.1.0"
 dependencies = [
  "oca-cli",
+ "oca-core",
  "serde",
  "serde_json",
  "sha2",

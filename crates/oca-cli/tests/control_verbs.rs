@@ -92,10 +92,13 @@ fn message_on_terminal_sessions_reuses_the_session_and_sends_full_turn_context()
         assert_eq!(request.body["variant"], "high");
         assert_eq!(request.body["model"]["providerID"], "openai");
         assert_eq!(request.body["model"]["modelID"], "gpt-5.6-luna");
-        assert_eq!(
-            request.body["parts"],
-            serde_json::json!([{ "type": "text", "text": "use the prior analysis" }])
-        );
+        let outgoing_text = request.body["parts"][0]["text"]
+            .as_str()
+            .expect("continuation text prompt");
+        assert!(outgoing_text.contains(
+            "Use the literal opening and closing fence lines shown here:\n```json\n<the contract JSON>\n```\n"
+        ));
+        assert!(outgoing_text.ends_with("\n\nuse the prior analysis"));
         assert!(
             request.body.get("format").is_none(),
             "text transport must omit the poisonable format field"
@@ -126,6 +129,83 @@ fn schema_transport_escape_hatch_keeps_the_continuation_format_field() {
     assert_success(&output);
     assert_eq!(request.body["format"]["type"], "json_schema");
     assert!(request.body["format"]["schema"].is_object());
+    assert_eq!(
+        request.body["parts"],
+        serde_json::json!([{ "type": "text", "text": "continue in schema mode" }])
+    );
+}
+
+#[test]
+fn continuation_preamble_file_fully_replaces_the_compiled_in_default() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
+    let port = listener.local_addr().expect("fake server address").port();
+    let server = thread::spawn(move || serve_confirmed_prompt(&listener));
+    let home = prepared_home(port, RefState::Done, "high");
+    std::fs::write(home.path().join("replacement.md"), "replacement contract")
+        .expect("replacement preamble");
+    std::fs::write(
+        home.path().join(".oca/config.toml"),
+        "[roles.impl]\npreamble_file = \"~/replacement.md\"\n",
+    )
+    .expect("override config");
+
+    let output = run_oca(home.path(), ["m", "w4f2a1", "custom", "continuation"]);
+    let request = server.join().expect("fake server completes");
+
+    assert_success(&output);
+    assert_eq!(
+        request.body["parts"][0]["text"],
+        "replacement contract\n\ncustom continuation"
+    );
+}
+
+#[test]
+fn missing_initial_preamble_override_fails_before_server_discovery() {
+    let home = tempfile::tempdir().expect("temporary home");
+    std::fs::create_dir(home.path().join(".oca")).expect("state directory");
+    std::fs::write(
+        home.path().join(".oca/config.toml"),
+        "[roles.impl]\npreamble_file = \"~/missing.md\"\n",
+    )
+    .expect("missing override config");
+
+    let output = run_oca(home.path(), ["luna:h", "--headless", "do", "the", "work"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).expect("stderr is utf-8");
+    assert!(stderr.contains("code: invalid_usage"), "{stderr}");
+    assert!(stderr.contains("roles.impl.preamble_file"), "{stderr}");
+    assert!(stderr.contains("missing.md"), "{stderr}");
+    assert!(
+        !home.path().join(".oca/server.json").exists(),
+        "local preamble failure must precede server discovery"
+    );
+}
+
+#[test]
+fn missing_message_preamble_override_fails_before_reconciliation_http() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("fake server binds");
+    let port = listener.local_addr().expect("fake server address").port();
+    listener
+        .set_nonblocking(true)
+        .expect("listener becomes nonblocking");
+    let home = prepared_home(port, RefState::Done, "high");
+    std::fs::write(
+        home.path().join(".oca/config.toml"),
+        "[roles.impl]\npreamble_file = \"~/missing.md\"\n",
+    )
+    .expect("missing override config");
+
+    let output = run_oca(home.path(), ["m", "w4f2a1", "do", "more", "work"]);
+
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8(output.stderr).expect("stderr is utf-8");
+    assert!(stderr.contains("code: invalid_usage"), "{stderr}");
+    assert!(stderr.contains("roles.impl.preamble_file"), "{stderr}");
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+        "missing continuation preamble must fail before reconciliation HTTP"
+    );
 }
 
 #[test]
@@ -257,6 +337,13 @@ fn queue_uses_plain_legacy_admission_without_state_or_effort_change() {
     assert_eq!(request.path, "/session/ses_prior_context/prompt_async");
     assert!(request.body.get("delivery").is_none());
     assert_eq!(request.body["variant"], "high");
+    let outgoing_text = request.body["parts"][0]["text"]
+        .as_str()
+        .expect("queued continuation text prompt");
+    assert!(outgoing_text.contains(
+        "Use the literal opening and closing fence lines shown here:\n```json\n<the contract JSON>\n```\n"
+    ));
+    assert!(outgoing_text.ends_with("\n\nafter this turn"));
     assert_eq!(
         String::from_utf8(output.stdout).expect("stdout is utf-8"),
         "w4f2a1 queued openai/gpt-5.6-luna:high\n"
@@ -523,7 +610,11 @@ fn concurrent_messages_are_serialized_and_never_create_parallel_turns() {
     let first_request = server.join().expect("fake server completes");
 
     assert_success(&first);
-    assert_eq!(first_request.body["parts"][0]["text"], "first");
+    assert!(
+        first_request.body["parts"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.ends_with("\n\nfirst"))
+    );
     assert_eq!(second.status.code(), Some(1));
     let stderr = String::from_utf8(second.stderr).expect("stderr is utf-8");
     assert!(stderr.contains("code: worker_busy"), "{stderr}");

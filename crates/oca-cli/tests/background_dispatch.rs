@@ -125,6 +125,7 @@ fn background_then_separate_follow_reconciles_an_already_finished_turn() {
 fn serve_background_then_follow(listener: TcpListener) -> Vec<CapturedRequest> {
     let mut captured = Vec::new();
     let mut message_id = None;
+    let mut prompt_text = None;
     for index in 0..8 {
         let (mut stream, _) = listener.accept().expect("fake accepts request");
         let request = read_request(&mut stream);
@@ -154,6 +155,9 @@ fn serve_background_then_follow(listener: TcpListener) -> Vec<CapturedRequest> {
             3 => {
                 assert_eq!(request.path, "/session/ses_background/prompt_async");
                 message_id = request.body["messageID"].as_str().map(ToOwned::to_owned);
+                prompt_text = request.body["parts"][0]["text"]
+                    .as_str()
+                    .map(ToOwned::to_owned);
                 write_response(&mut stream, "204 No Content", "text/plain", "");
             }
             4 => {
@@ -164,7 +168,7 @@ fn serve_background_then_follow(listener: TcpListener) -> Vec<CapturedRequest> {
                         "sessionID": "ses_background",
                         "role": "user"
                     },
-                    "parts": [{"type":"text","text":"finish immediately"}]
+                    "parts": [{"type":"text","text":prompt_text.as_deref().unwrap()}]
                 }]);
                 write_response(&mut stream, "200 OK", "application/json", &body.to_string());
             }
