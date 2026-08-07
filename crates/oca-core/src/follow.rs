@@ -1340,43 +1340,59 @@ mod tests {
             message: None,
             known: true,
         };
-        let transport = ScriptedTransport {
-            subscriptions: Mutex::new(VecDeque::from([subscription([
-                Ok(Some(event(
-                    "evt-message-start",
-                    "message.updated",
-                    Some(incomplete),
-                ))),
-                Ok(Some(part)),
-                Ok(Some(event(
-                    "evt-message-complete",
-                    "message.updated",
-                    Some(completed),
-                ))),
-                Ok(Some(event("evt-idle", "session.idle", None))),
-            ])])),
-            reconciliations: Mutex::new(VecDeque::from([Ok(Vec::new())])),
-            cursors: Mutex::new(Vec::new()),
-        };
+        // A resumed stream can deliver a part before the frame that introduces
+        // its message, so both orderings must reach the same classification.
+        for part_arrives_first in [false, true] {
+            let start = event(
+                "evt-message-start",
+                "message.updated",
+                Some(incomplete.clone()),
+            );
+            let complete = event(
+                "evt-message-complete",
+                "message.updated",
+                Some(completed.clone()),
+            );
+            let ordered = if part_arrives_first {
+                vec![Ok(Some(part.clone())), Ok(Some(start))]
+            } else {
+                vec![Ok(Some(start)), Ok(Some(part.clone()))]
+            };
+            let transport = ScriptedTransport {
+                subscriptions: Mutex::new(VecDeque::from([subscription(
+                    ordered.into_iter().chain([
+                        Ok(Some(complete)),
+                        Ok(Some(event("evt-idle", "session.idle", None))),
+                    ]),
+                )])),
+                reconciliations: Mutex::new(VecDeque::from([Ok(Vec::new())])),
+                cursors: Mutex::new(Vec::new()),
+            };
 
-        let outcome = follow_until_terminal_with_policy::<_, Journal>(
-            &transport,
-            &target(),
-            None,
-            None,
-            test_policy(),
-        )
-        .await
-        .unwrap();
+            let outcome = follow_until_terminal_with_policy::<_, Journal>(
+                &transport,
+                &target(),
+                None,
+                None,
+                test_policy(),
+            )
+            .await
+            .unwrap();
 
-        let FollowOutcome::Terminal(terminal) = outcome else {
-            panic!("streamed prose turn must classify as terminal");
-        };
-        assert_eq!(terminal.state, WorkerState::Done);
-        assert_eq!(
-            terminal.message.reply().unwrap()["files"],
-            serde_json::json!(["src/follow.rs"])
-        );
+            let FollowOutcome::Terminal(terminal) = outcome else {
+                panic!("streamed prose turn must classify as terminal");
+            };
+            assert_eq!(
+                terminal.state,
+                WorkerState::Done,
+                "part_arrives_first={part_arrives_first}"
+            );
+            assert_eq!(
+                terminal.message.reply().unwrap()["files"],
+                serde_json::json!(["src/follow.rs"]),
+                "part_arrives_first={part_arrives_first}"
+            );
+        }
     }
 
     #[tokio::test]
