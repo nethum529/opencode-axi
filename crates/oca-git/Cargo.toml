@@ -3,6 +3,7 @@ name = "oca-git"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 fs2 = "0.4.3"

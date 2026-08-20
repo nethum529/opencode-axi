@@ -1,6 +1,6 @@
 # oca (opencode-axi)
 
-Rust agent-control surface for OpenCode workers. See design/spec notes in the project's Obsidian vault (OpenCodeAxi/) for the full contract.
+Rust agent-control surface for OpenCode workers. `CONTEXT.md` summarises the contract; the full design and implementation spec is maintained outside this repo.
 
 ## Default catalog provider limitation
 

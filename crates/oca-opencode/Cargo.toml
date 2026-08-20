@@ -3,6 +3,7 @@ name = "oca-opencode"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 oca-core = { path = "../oca-core" }

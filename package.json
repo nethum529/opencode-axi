@@ -1,6 +1,7 @@
 {
   "name": "opencode-axi",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "check:plugin-runtime": "node scripts/check-plugin-runtime.js"
